@@ -6,6 +6,7 @@ from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User
 from .serializers import UserSerializer
+from rest_framework.permissions import IsAuthenticated
 
 # 1. Create user
 class UserCreateView(generics.CreateAPIView):
@@ -22,26 +23,26 @@ from rest_framework import status
 from rest_framework_simplejwt.tokens import RefreshToken
 from authapp.models import User
 
-class LoginView(APIView):
-    def post(self, request):
-        email = request.data.get('email')
-        password = request.data.get('password')
-        print(email, password)
+#class LoginView(APIView):
+#    def post(self, request):
+#        email = request.data.get('email')
+#        password = request.data.get('password')
+#        print(email, password)
 
-        try:
-            user = User.objects.get(email=email)
-            if user.is_active and check_password(password, user.password_hash):
-                refresh = RefreshToken.for_user(user)
-                return Response({
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh),
-                    'user_id': str(user.id),
-                    'role': user.role
-                })
-        except User.DoesNotExist:
-            pass
+#        try:
+#            user = User.objects.get(email=email)
+#            if user.is_active and check_password(password, user.password_hash):
+#                refresh = RefreshToken.for_user(user)
+#                return Response({
+#                    'access': str(refresh.access_token),
+#                    'refresh': str(refresh),
+#                    'user_id': str(user.id),
+#                    'role': user.role
+#               })
+#        except User.DoesNotExist:
+#            pass
 
-        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+#        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
 class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -65,3 +66,6 @@ class UserListView(generics.ListAPIView):
     queryset = User.objects.filter(is_active=True)
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
+    def get(self, request, *args, **kwargs):
+        print("Authorization Header:", request.headers.get('Authorization'))
+        return super().get(request, *args, **kwargs)

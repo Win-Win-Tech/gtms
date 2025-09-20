@@ -34,3 +34,9 @@ class Checkpoint(models.Model):
         ('gps', 'GPS Coordinate'),
     ])
     data = models.TextField()  # QR/NFC code or GPS lat/lng
+
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.label} ({self.type})"
