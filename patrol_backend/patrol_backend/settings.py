@@ -62,6 +62,7 @@ MIDDLEWARE = [
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "http://147.93.27.224:3000",
 ]
 
 ROOT_URLCONF = 'patrol_backend.urls'
