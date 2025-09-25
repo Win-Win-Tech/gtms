@@ -21,3 +21,5 @@ class CheckpointSerializer(serializers.ModelSerializer):
         model = Checkpoint
         fields = '__all__'
 
+        
+
