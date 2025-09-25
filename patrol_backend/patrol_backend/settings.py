@@ -58,13 +58,14 @@ MIDDLEWARE = [
 ]
 
 
-CORS_ALLOW_ALL_ORIGINS = True
+#CORS_ALLOW_ALL_ORIGINS = True
 
-#CORS_ALLOWED_ORIGINS = [
-#     "http://localhost:5173",
-#     "http://localhost:8001",
-#     "http://147.93.27.224:8001",
-# ]
+CORS_ALLOWED_ORIGINS = [
+     "http://localhost:5173",
+     "http://localhost:8001",
+     "http://147.93.27.224:8001",
+     "http://147.93.27.224",
+ ]
 
 ROOT_URLCONF = 'patrol_backend.urls'
 
@@ -154,3 +155,15 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
 }
+
+from datetime import timedelta
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=2),         # ⬅️ Extend as needed
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': False,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'AUTH_HEADER_TYPES': ('Bearer',),
+}
+
+
