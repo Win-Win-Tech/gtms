@@ -8,7 +8,7 @@ from datetime import timedelta
 from datetime import datetime, time
 from .models import CheckIn
 from .serializers import CheckInSerializer
-from scheduler.models import Assignment, Checkpoint, Shift
+from scheduler.models import Assignment, Checkpoint, Shift, SiteSetting
 from django.utils.timezone import make_aware
 
 User = get_user_model()
@@ -21,7 +21,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         try:
             data = request.data
-
+            site_settings = SiteSetting.objects.all()
+            # print(site_settings)
             guard_id = data.get('guard')
             shift_id = data.get('shift')
             checkpoint_id = data.get('checkpoint')
@@ -43,7 +44,14 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 shift_id=shift_id,
                 checkpoints__contains=[{'checkpoint_id': checkpoint_id}]
             ).first()
-
+            # today = now().date()
+            # assignment = Assignment.objects.filter(
+            #     guard=guard,
+            #     shift_id=shift_id,
+            #     start_date__lte=today,
+            #     end_date__gte=today,
+            #     checkpoints__contains=[{'checkpoint_id': checkpoint_id}]
+            # ).first()
         
             if not assignment:
                 return Response({"error": "No matching assignment found for guard, shift, and checkpoint"},
@@ -59,7 +67,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
             user_coords = (latitude, longitude)
             distance = geodesic(checkpoint_coords, user_coords).meters
             print("Line-59")
-            if distance > 50:
+            # if distance > 50:
+            if distance > site_settings.distance:
                 return Response({"error": f"Check-in location is too far from checkpoint (>{int(distance)}m)"},
                                 status=status.HTTP_403_FORBIDDEN)
 
@@ -87,7 +96,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Now subtraction works
             time_diff = abs((checkin_time - shift_start_dt).total_seconds()) / 60
 
-            delayed = time_diff > 15
+            # delayed = time_diff > 15
+            delayed = time_diff > site_settings.time
             print("Line-77")
             print(data)
             # Save the check-in
