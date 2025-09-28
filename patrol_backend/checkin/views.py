@@ -25,6 +25,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # print(site_settings)
             guard_id = data.get('guard')
             shift_id = data.get('shift')
+            assigned_id = data.get('assign_id')
             checkpoint_id = data.get('checkpoint')
             timestamp = data.get('timestamp')
             latitude = float(data.get('latitude'))
@@ -40,6 +41,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
 
             # Rule 2 & 3: Validate assignment with matching guard, shift, and checkpoint
             assignment = Assignment.objects.filter(
+                id=assigned_id,
                 guard=guard,
                 shift_id=shift_id,
                 checkpoints__contains=[{'checkpoint_id': checkpoint_id}]
