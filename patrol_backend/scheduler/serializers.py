@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Location, Shift, Assignment, Checkpoint
+from .models import Location, Shift, Assignment, Checkpoint,SiteSetting
 
 class LocationSerializer(serializers.ModelSerializer):
     class Meta:
@@ -21,5 +21,8 @@ class CheckpointSerializer(serializers.ModelSerializer):
         model = Checkpoint
         fields = '__all__'
 
-        
+class SiteSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteSetting
+        fields = '__all__'        
 
