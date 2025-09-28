@@ -68,7 +68,9 @@ class CheckInViewSet(viewsets.ModelViewSet):
             distance = geodesic(checkpoint_coords, user_coords).meters
             print("Line-59")
             # if distance > 50:
-            if distance > site_settings.distance:
+            settings = list(SiteSetting.objects.all().values())
+            
+            if distance > int(settings[1]['value']):
                 return Response({"error": f"Check-in location is too far from checkpoint (>{int(distance)}m)"},
                                 status=status.HTTP_403_FORBIDDEN)
 
