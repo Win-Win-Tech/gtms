@@ -101,7 +101,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             time_diff = abs((checkin_time - shift_start_dt).total_seconds()) / 60
 
             # delayed = time_diff > 15
-            delayed = time_diff > site_settings.time
+            delayed = time_diff > int(settings[0]['value'])
             print("Line-77")
             print(data)
             # Save the check-in
