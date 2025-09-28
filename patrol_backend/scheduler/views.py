@@ -81,16 +81,16 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 class CheckpointViewSet(viewsets.ModelViewSet):
     queryset = Checkpoint.objects.all()
     serializer_class = CheckpointSerializer
-    @action(detail=False, methods=['get'], url_path='by-guard/(?P<guard_id>[^/.]+)')
-    def by_guard(self, request, guard_id=None):
+
+    @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
+    def by_location(self, request, location_id=None):
         today = now().date()
-        assignments = Assignment.objects.filter(
-            guard_id=guard_id,
-            start_date__gte=today,
-            is_deleted=False
+        checkpoints = Checkpoint.objects.filter(
+            location=location_id,
+             is_deleted=False
         )
-        serializer = self.get_serializer(assignments, many=True)
-        return Response(serializer.data)   
+        serializer = self.get_serializer(checkpoints, many=True)
+        return Response(serializer.data)    
 
 
 class SiteSettingViewSet(viewsets.ModelViewSet):
