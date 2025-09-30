@@ -8,6 +8,7 @@ from django.utils.timezone import now
 from uuid import UUID
 from .models import SiteSetting
 from .serializers import SiteSettingSerializer
+from django.core.exceptions import ValidationError
 
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
@@ -30,6 +31,24 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     queryset = Assignment.objects.all()
     serializer_class = AssignmentSerializer
 
+    def clean(self):
+        super().clean()
+
+        # Validate dates
+        if self.end_date < self.start_date:
+            raise ValidationError("End date cannot be before start date.")
+
+        # Check for overlapping assignments
+        overlapping = Assignment.objects.filter(
+            guard=self.guard,
+            start_date__lte=self.end_date,
+            end_date__gte=self.start_date,
+        ).exclude(id=self.id)  # exclude self for updates
+
+        if overlapping.exists():
+            raise ValidationError(
+                f"Guard {self.guard} already has an overlapping assignment."
+            )
 
 
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
