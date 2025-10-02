@@ -13,7 +13,22 @@ from django.core.exceptions import ValidationError
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
+    def get_queryset(self):
+        """
+        Optionally filter locations by `name` and `address` query params.
+        """
+        queryset = Location.objects.filter(is_deleted=False)
+        name = self.request.query_params.get('name', None)
+        address = self.request.query_params.get('address', None)
 
+        if name:
+            queryset = queryset.filter(name__icontains=name)
+        if address:
+            queryset = queryset.filter(address__icontains=address)
+
+        return queryset
+
+        
 class ShiftViewSet(viewsets.ModelViewSet):
     queryset = Shift.objects.all()
     serializer_class = ShiftSerializer
