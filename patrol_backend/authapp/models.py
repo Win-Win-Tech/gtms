@@ -3,12 +3,12 @@ from django.db import models
 from django.utils.timezone import now
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.conf import settings
+from scheduler.models import Location  
 
 
 class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
-        if not email:
-            raise ValueError("Email is required")
+       
         email = self.normalize_email(email)
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
@@ -26,14 +26,23 @@ class User(AbstractBaseUser, PermissionsMixin):
     ROLE_CHOICES = [
         ('admin', 'Admin'),
         ('guard', 'Guard'),
+        ('so', 'So'),
+        ('fo', 'Fo'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    email = models.EmailField(max_length=255, unique=True)
+    aadhar_no = models.CharField(max_length=20, blank=True, null=True, unique=True)
+    email = models.EmailField(max_length=255, unique=True, null=True)
     name = models.CharField(max_length=255, blank=True)
-    phone_no = models.CharField(max_length=20, blank=True, null=True)
+    phone_no = models.CharField(max_length=20, blank=True, null=True, unique=True)
     role = models.CharField(max_length=32, choices=ROLE_CHOICES, default='guard')
-
+    location = models.ForeignKey(
+        Location,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="users"
+    )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
 
