@@ -1,0 +1,252 @@
+[33mcommit b1652e79b3987479f935439110f11d773c0f7a26[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Merge: 6b29ba5f 6c612f2a
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Tue Sep 30 23:53:07 2025 +0530
+
+    Merge branch 'main' of https://github.com/Win-Win-Tech/gtms
+
+[33mcommit 6b29ba5f0ee56d1af88f4fad523d95b9593908ec[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Tue Sep 30 23:45:21 2025 +0530
+
+    overlap_shift_fix
+
+[33mcommit 6c612f2a7c2121d7a380b1d2af86dd1cf6452260[m
+Merge: c7b3f34b ccb9ef81
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Mon Sep 29 13:41:51 2025 +0530
+
+    Merge pull request #12 from Win-Win-Tech/gtms_sep29
+    
+    checkpointby location
+
+[33mcommit ccb9ef81ee3e0d91bac6fdfd9bc2d3569f83405b[m[33m ([m[1;31morigin/gtms_sep29[m[33m)[m
+Author: PitchaiBabu-M <mbabu2001@gmail.com>
+Date:   Mon Sep 29 02:47:42 2025 +0530
+
+    checkpointby location
+
+[33mcommit c7b3f34b36e65a3cc14373a80471700bbdb2dbe1[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 22:58:43 2025 +0530
+
+    cors_comment
+
+[33mcommit 10035952797a7c51c9a340520e6fa0d737bc03b8[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 20:17:06 2025 +0530
+
+    fix_time
+
+[33mcommit 6ac128541b46751d61222414240b38036ff876f4[m
+Merge: 5462ae94 22f9798f
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 20:07:09 2025 +0530
+
+    Merge branch 'main' of https://github.com/Win-Win-Tech/gtms
+
+[33mcommit 5462ae94b9eaecae642bf7ab69dcd3e3b9364f7b[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 20:05:17 2025 +0530
+
+    fix dist issue
+
+[33mcommit 22f9798f1c9e0d254d9a6cd94e4ec0b299a5b956[m
+Merge: 46ad3f29 6b341530
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 19:38:31 2025 +0530
+
+    Merge pull request #11 from Win-Win-Tech/gtms_sep28
+    
+    Orgin added
+
+[33mcommit 6b341530eab1a6a12126b81dfa267f23005bce4a[m[33m ([m[1;31morigin/gtms_sep28[m[33m)[m
+Author: PitchaiBabu-M <mbabu2001@gmail.com>
+Date:   Sun Sep 28 18:32:29 2025 +0530
+
+    Orgin added
+
+[33mcommit 46ad3f299e3ebbc0f418d9c322dbb824f26672ed[m
+Merge: e028faa1 20d912a1
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 28 06:48:24 2025 +0530
+
+    Merge pull request #10 from Win-Win-Tech/gtms_sep28
+    
+    Api changes
+
+[33mcommit 20d912a10fc5b9f8e394ae74c413ea5f0877a85f[m
+Author: PitchaiBabu-M <mbabu2001@gmail.com>
+Date:   Sun Sep 28 00:27:42 2025 +0530
+
+    Api changes
+
+[33mcommit e028faa110fa04eeb6fdf81c2c3d5aeff957f69d[m
+Merge: cc1adf7e 3837d3a0
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Thu Sep 25 21:58:55 2025 +0530
+
+    Merge pull request #9 from Win-Win-Tech/gms_v0.1
+    
+    commit-2
+
+[33mcommit 3837d3a0ab62452138456ea7b5726c6213b4143b[m[33m ([m[1;31morigin/gms_v0.1[m[33m, [m[1;32mgms_v0.1[m[33m)[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Thu Sep 25 21:57:28 2025 +0530
+
+    commit-2
+
+[33mcommit cc1adf7eaac08082596b13892e2e094427a74575[m
+Merge: 2225fdec 3d1c6733
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Thu Sep 25 21:34:16 2025 +0530
+
+    Merge pull request #8 from Win-Win-Tech/gms_v0.1
+    
+    Gms v0.1
+
+[33mcommit 3d1c6733c0b9d7124a29f3d1f2fdac32dfe8be9f[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Thu Sep 25 21:32:44 2025 +0530
+
+    commit-1
+
+[33mcommit b08b98c6d7c0a0c70f2d0b97566083482edded8e[m[33m ([m[1;31morigin/add_lat_log[m[33m, [m[1;32madd_lat_log[m[33m)[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 20:14:16 2025 +0530
+
+    ok4
+
+[33mcommit 55bd23abb2756c1212c7f64429a6bcb91fa9dfbc[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 18:40:52 2025 +0530
+
+    v_0.1
+
+[33mcommit 0fbdef27b2e04f03239f8ce99ff0e1f66c395fdf[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:56:34 2025 +0530
+
+    ok3
+
+[33mcommit dc37f4382ab94671c854afaf7631e87f76639b2c[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:45:46 2025 +0530
+
+    ok2
+
+[33mcommit 9066492ab3a7d2371c8fe093b16b518027c4f040[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:31:30 2025 +0530
+
+    ok1
+
+[33mcommit 2225fdece2bce1aceb058b28d81f58796834b757[m
+Merge: 5c81397d cd2a3f0f
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:18:18 2025 +0530
+
+    Merge pull request #6 from Win-Win-Tech/add_lat_log
+    
+    Add lat log
+
+[33mcommit cd2a3f0f63161775b148b5a21e5b15cc4c58cdb8[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:16:30 2025 +0530
+
+    ok
+
+[33mcommit 5c81397db48eaf296b945d06968014ce16d0ac85[m
+Merge: 4b097dc3 c55687b5
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:07:36 2025 +0530
+
+    Merge pull request #5 from Win-Win-Tech/add_lat_log
+    
+    Allow_Cors_v0.1
+
+[33mcommit bc2db189547055e414c59957e7e7a1c9640f199e[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 17:05:07 2025 +0530
+
+    corsheaders
+
+[33mcommit c55687b5d1f405ad898f83e5b37f3b64a30e4994[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 11:44:51 2025 +0530
+
+    Allow_Cors_v0.1
+
+[33mcommit 4b097dc3b427c7a417e3836ebcc78f5327c45f20[m
+Merge: b2439340 e07c5a2f
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 08:57:53 2025 +0530
+
+    Merge pull request #4 from Win-Win-Tech/add_lat_log
+    
+    Allow_Cors
+
+[33mcommit e07c5a2f0f3b860efaf48dad2d679062ce0119ed[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sun Sep 21 08:54:32 2025 +0530
+
+    allow_cors
+
+[33mcommit 7bda7dcbd663b5fcad8a50c57ffe7c9746dc63ae[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 14:32:55 2025 +0530
+
+    cors_port_change
+
+[33mcommit b243934065926f4a23d061778b9bf82183f01c9d[m
+Merge: acdf59df 6bdcb83c
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 13:00:18 2025 +0530
+
+    Merge pull request #3 from Win-Win-Tech/add_lat_log
+    
+    add_lat_log_v0.2
+
+[33mcommit 6bdcb83c2b917b73afa97c31bc889d2999491224[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 12:58:10 2025 +0530
+
+    add_lat_log_v0.2
+
+[33mcommit acdf59df2ae7ec60be5ec4d01f2e695ab896bc3c[m
+Merge: 5ab74634 5b851889
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 12:54:01 2025 +0530
+
+    Merge pull request #2 from Win-Win-Tech/add_lat_log
+    
+    add_lat_log_v0.1
+
+[33mcommit 5b8518898b2e6503abf375b03b356e2b832c2f4d[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 12:51:40 2025 +0530
+
+    add_lat_log_v0.1
+
+[33mcommit 5ab74634b5614b4337a227b41fc56d702b79f743[m
+Merge: ede2ee5c 4475b3db
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 12:41:11 2025 +0530
+
+    Merge pull request #1 from Win-Win-Tech/add_lat_log
+    
+    add_lat_log
+
+[33mcommit 4475b3dbaa84348bc4780908de68c732791aa681[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Sat Sep 20 12:36:23 2025 +0530
+
+    add_lat_log
+
+[33mcommit ede2ee5c376ddfaa959e5f394844b0d6ad4527fe[m
+Author: Five Y Technologies <142930108+Win-Win-Tech@users.noreply.github.com>
+Date:   Thu Sep 18 08:29:25 2025 +0530
+
+    first commit
+
+[33mcommit 38e1eab512b4fe2c358
