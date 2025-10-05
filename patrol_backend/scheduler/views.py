@@ -9,22 +9,23 @@ from uuid import UUID
 from .models import SiteSetting
 from .serializers import SiteSettingSerializer
 from django.core.exceptions import ValidationError
+from django.db.models import Q 
 
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
     def get_queryset(self):
         """
-        Optionally filter locations by `name` and `address` query params.
+        Optionally filter locations by `name` or `address` query params.
         """
         queryset = Location.objects.filter(is_deleted=False)
-        name = self.request.query_params.get('name', None)
-        address = self.request.query_params.get('address', None)
+        name = self.request.query_params.get('name', '').strip()
+        address = self.request.query_params.get('address', '').strip()
 
-        if name:
-            queryset = queryset.filter(name__icontains=name)
-        if address:
-            queryset = queryset.filter(address__icontains=address)
+        if name or address:
+            queryset = queryset.filter(
+                Q(name__icontains=name) | Q(address__icontains=address)
+            )
 
         return queryset
 

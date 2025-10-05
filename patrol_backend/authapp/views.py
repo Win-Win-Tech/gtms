@@ -5,6 +5,7 @@ from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User
 from .serializers import UserSerializer
+from django.forms.models import model_to_dict
 
 
 # 1. Create user
@@ -52,20 +53,37 @@ class LoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        email = request.data.get('email')
+        identifier = request.data.get('email') or request.data.get('phone_no')  # can be email or phone_no
         password = request.data.get('password')
-        user = authenticate(request, email=email, password=password)
-        if user:
-            refresh = RefreshToken.for_user(user)
-            return Response({
-                'access': str(refresh.access_token),
-                'refresh': str(refresh),
-                'user_id': str(user.id),
-                'role': user.role,
-                'is_superuser': user.is_superuser,
-                'location_id': str(user.location.id) if user.location else None
-            })
-        return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if not identifier or not password:
+            return Response({'error': 'Email/Phone and password are required.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        # Try finding user by email first, else by phone_no
+        try:
+            user = User.objects.get(email=identifier)
+        except User.DoesNotExist:
+            try:
+                user = User.objects.get(phone_no=identifier)
+            except User.DoesNotExist:
+                return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Check password manually
+        if not user.check_password(password):
+            return Response({'error': 'Invalid credentials'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Success — generate JWT tokens
+        refresh = RefreshToken.for_user(user)
+        return Response({
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+            'user_id': str(user.id),
+            'role': user.role,
+            'user':model_to_dict(user, fields=[field.name for field in user._meta.fields]),
+            'is_superuser': user.is_superuser,
+            'location_id': str(user.location.id) if user.location else None
+        })
 
 
 # 3. List users with search by name or email AND filter by role
