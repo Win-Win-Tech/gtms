@@ -4,11 +4,13 @@ from checkin.models import CheckIn
 from .serializers import LocationSerializer, ShiftSerializer, AssignmentSerializer, CheckpointSerializer
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.utils.timezone import now
+from django.utils.timezone import now, make_aware
 from uuid import UUID
 from .models import SiteSetting
 from .serializers import SiteSettingSerializer
 from django.core.exceptions import ValidationError
+from datetime import datetime, timedelta
+import pytz
 
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
@@ -66,45 +68,169 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             )
 
 
+#     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
+#     def upcoming_checkpoints(self, request, user_id=None):
+#         today = now().date()
+# #        assignments = Assignment.objects.filter(guard_id=user_id, assigned_date=today)
+# #        from django.db.models import Q
+
+# #today = now().date()
+#         assignments = Assignment.objects.filter(guard_id=user_id,start_date__lte=today,end_date__gte=today)
+#         result = []
+
+#         for assignment in assignments:
+#             checkpoint_data = assignment.checkpoints  # [{'checkpoint_id': str, 'time': 'HH:MM'}]
+
+#             completed_ids = set(
+#                 CheckIn.objects.filter(
+#                     guard_id=user_id,
+#                     shift_id=assignment.shift.id,
+#                     checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data]
+#                 ).values_list('checkpoint_id', flat=True)
+#             )
+
+#             for cp in checkpoint_data:
+#                 print(cp['checkpoint_id'])
+#                 print (completed_ids)
+#                 checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
+#                 result.append({
+#                     'assign_id':assignment.id,
+#                     'checkpoint_id': cp['checkpoint_id'],
+#                     'label': checkpoint_obj.label if checkpoint_obj else '',
+#                     'time': cp['time'],
+#                     'lat' : checkpoint_obj.latitude if checkpoint_obj else '',
+#                     'lon' : checkpoint_obj.longitude if checkpoint_obj else '',
+#                     'qr' : checkpoint_obj.data if checkpoint_obj else '',
+#                     'shift_id' : assignment.shift.id,
+#                 #   'status': 'completed' if cp['checkpoint_id'] in completed_ids else 'pending'
+#                     'status' : 'completed' if UUID(cp['checkpoint_id']) in completed_ids else 'pending'
+#                 })
+
+#         return Response(result)
+
+######Code-Starts########
+
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
     def upcoming_checkpoints(self, request, user_id=None):
         today = now().date()
-#        assignments = Assignment.objects.filter(guard_id=user_id, assigned_date=today)
-#        from django.db.models import Q
-
-#today = now().date()
-        assignments = Assignment.objects.filter(guard_id=user_id,start_date__lte=today,end_date__gte=today)
+        assignments = Assignment.objects.filter(guard_id=user_id, start_date__lte=today, end_date__gte=today)
         result = []
 
         for assignment in assignments:
             checkpoint_data = assignment.checkpoints  # [{'checkpoint_id': str, 'time': 'HH:MM'}]
 
+            # completed_ids = set(
+            #     CheckIn.objects.filter(
+            #         guard_id=user_id,
+            #         shift_id=assignment.shift.id,
+            #         checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data]
+            #     ).values_list('checkpoint_id', flat=True)
+            # )
+
+
             completed_ids = set(
                 CheckIn.objects.filter(
                     guard_id=user_id,
                     shift_id=assignment.shift.id,
-                    checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data]
+                    checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data],
+                    synced=True  # only include manually synced check-ins
                 ).values_list('checkpoint_id', flat=True)
             )
 
+
             for cp in checkpoint_data:
-                print(cp['checkpoint_id'])
-                print (completed_ids)
-                checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
-                result.append({
-                    'assign_id':assignment.id,
-                    'checkpoint_id': cp['checkpoint_id'],
+                checkpoint_id = cp['checkpoint_id']
+                checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
+
+                # Parse checkpoint time
+                try:
+                    checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
+                    checkpoint_datetime = make_aware(datetime.combine(today, checkpoint_time))
+                    is_overdue = now() > checkpoint_datetime + timedelta(minutes=15)
+                except Exception:
+                    is_overdue = False
+
+                is_checked_in = UUID(checkpoint_id) in completed_ids
+                status = 'completed' if is_checked_in or is_overdue else 'pending'
+                synced = True if is_checked_in else False if is_overdue else None
+
+                # Auto-create missed check-in if overdue and not already checked in
+                print("aaaaaaaaaaa", assignment.id)
+                if is_overdue and not is_checked_in and checkpoint_obj:
+                    CheckIn.objects.create(
+                        guard_id=user_id,
+                        shift_id=assignment.shift.id,
+                        checkpoint_id=checkpoint_id,
+                        #assign_id=assignment.id,
+                        timestamp=now(),
+                        latitude=checkpoint_obj.latitude,
+                        longitude=checkpoint_obj.longitude,
+                        #data=checkpoint_obj.data,
+                        synced=False
+                    )
+                    completed_ids.add(UUID(checkpoint_id))  # Update local cache
+
+                # # Original UTC time string
+                # utc_time_str = cp['time']  # e.g., '14:00'
+                
+                # print("utc_time_str-1", utc_time_str)
+
+                # # Parse to time object
+                # utc_time = datetime.strptime(utc_time_str, '%H:%M')
+
+                # print("utc_time-2", utc_time)
+
+                # # Attach UTC timezone
+                # utc_time = pytz.utc.localize(utc_time)
+
+                # print("utc_time-3", utc_time)
+
+                # # Convert to IST
+                # ist_time = utc_time.astimezone(pytz.timezone('Asia/Kolkata'))
+
+                # print("ist_time-4", ist_time)
+
+                # # Format back to string
+                # ist_time_str = ist_time.strftime('%H:%M')
+
+                # print("ist_time_str-5", ist_time_str)
+
+
+                # Original UTC time string
+                utc_time_str = cp['time']  # e.g., '19:30'
+
+                # Parse to naive datetime
+                utc_naive = datetime.strptime(utc_time_str, '%H:%M')
+
+                # Attach UTC timezone
+                utc_aware = pytz.utc.localize(utc_naive)
+
+                # Convert to IST
+                ist_time = utc_aware.astimezone(pytz.timezone('Asia/Kolkata'))
+
+                # Format back to string
+                ist_time_str = ist_time.strftime('%H:%M')
+
+                checkpoint_info = {
+                    'assign_id': assignment.id,
+                    'checkpoint_id': checkpoint_id,
                     'label': checkpoint_obj.label if checkpoint_obj else '',
-                    'time': cp['time'],
-                    'lat' : checkpoint_obj.latitude if checkpoint_obj else '',
-                    'lon' : checkpoint_obj.longitude if checkpoint_obj else '',
-                    'qr' : checkpoint_obj.data if checkpoint_obj else '',
-                    'shift_id' : assignment.shift.id,
-                #   'status': 'completed' if cp['checkpoint_id'] in completed_ids else 'pending'
-                    'status' : 'completed' if UUID(cp['checkpoint_id']) in completed_ids else 'pending'
-                })
+                    'time': ist_time_str,
+                    #'time': cp['time'],
+                    'lat': checkpoint_obj.latitude if checkpoint_obj else '',
+                    'lon': checkpoint_obj.longitude if checkpoint_obj else '',
+                    'qr': checkpoint_obj.data if checkpoint_obj else '',
+                    'shift_id': assignment.shift.id,
+                    'status': status
+                }
+
+                if synced is not None:
+                    checkpoint_info['synced'] = synced
+
+                result.append(checkpoint_info)
 
         return Response(result)
+    ######Code-Ends########
     @action(detail=False, methods=['get'], url_path='by-guard/(?P<guard_id>[^/.]+)')
     def by_guard(self, request, guard_id=None):
         assignments = Assignment.objects.filter(guard_id=guard_id, is_deleted=False)

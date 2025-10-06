@@ -51,6 +51,7 @@ class AssignmentSerializer(serializers.ModelSerializer):
             )
 
         result = []
+        
         for cp in obj.checkpoints:
             checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
             result.append({
@@ -63,6 +64,36 @@ class AssignmentSerializer(serializers.ModelSerializer):
                 'status': 'completed' if UUID(cp['checkpoint_id']) in completed_ids else 'pending'
             })
         return result
+        
+
+#############Code-Starts#########
+
+    #from datetime import datetime, timedelta
+
+    # for cp in obj.checkpoints:
+    #     checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
+
+    #     # Parse checkpoint time (assumed format 'HH:MM')
+    #     try:
+    #         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
+    #         checkpoint_datetime = datetime.combine(datetime.today(), checkpoint_time)
+    #         is_overdue = datetime.now() > checkpoint_datetime + timedelta(minutes=15)
+    #     except Exception:
+    #         is_overdue = False  # fallback if time parsing fails
+
+    #     is_completed = UUID(cp['checkpoint_id']) in completed_ids or is_overdue
+
+    #     result.append({
+    #         'checkpoint_id': cp['checkpoint_id'],
+    #         'label': checkpoint_obj.label if checkpoint_obj else '',
+    #         'time': cp['time'],
+    #         'lat': checkpoint_obj.latitude if checkpoint_obj else None,
+    #         'lon': checkpoint_obj.longitude if checkpoint_obj else None,
+    #         'qr': checkpoint_obj.data if checkpoint_obj else None,
+    #         'status': 'completed' if is_completed else 'pending'
+    #     })
+
+#############Code-Ends#########
     def validate(self, data):
         guard = data["guard"]
         start_date = data["start_date"]
