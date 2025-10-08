@@ -16,7 +16,18 @@ from datetime import  datetime, timedelta
 from django.core.serializers import serialize
 import json
 from django.utils.timezone import now
+from scheduler.models import Assignment
+from checkin.models import CheckIn
 import pytz
+
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.utils import timezone
+from datetime import timedelta, datetime
+from checkin.models import CheckIn
+from authapp.models import User
+from scheduler.models import Checkpoint, Assignment
+from .serializers import CheckInReportSerializer
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -231,6 +242,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         #     elif attendance.checkout_time:
         #         message = "Shift completed, already checked out"
 
+        print("location", location)
         # --- Response ---
         return Response({
             "has_shift": True,
@@ -363,3 +375,96 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             })
 
         return Response(data, status=status.HTTP_200_OK)
+    
+
+    # views.py
+
+class DashboardCheckInReportView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # Parse filters
+        filter_type = request.query_params.get('filter', 'today')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+
+        today = timezone.localdate()
+        now = timezone.now()
+
+        if filter_type == 'today':
+            start = datetime.combine(today, datetime.min.time())
+            end = datetime.combine(today, datetime.max.time())
+        elif filter_type == 'this_week':
+            start = today - timedelta(days=today.weekday())
+            end = start + timedelta(days=6)
+            start = datetime.combine(start, datetime.min.time())
+            end = datetime.combine(end, datetime.max.time())
+        elif filter_type == 'this_month':
+            start = datetime(today.year, today.month, 1)
+            next_month = start.replace(day=28) + timedelta(days=4)
+            end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+        elif filter_type == 'custom' and start_date and end_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        else:
+            return Response({"error": "Invalid filter or missing dates"}, status=400)
+
+        assignments = Assignment.objects.filter(
+            start_date__lte=end.date(),
+            end_date__gte=start.date()
+        )
+
+        if user_id:
+            assignments = assignments.filter(guard_id=user_id)
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
+
+        report = []
+
+        for assignment in assignments:
+            guard = assignment.guard
+            shift = assignment.shift
+            for cp in assignment.checkpoints:
+                checkpoint_id = cp.get('checkpoint_id')
+                expected_time_str = cp.get('time')
+                expected_time = datetime.combine(assignment.start_date, datetime.strptime(expected_time_str, "%H:%M").time())
+
+                checkin = CheckIn.objects.filter(
+                    guard=guard,
+                    shift=shift,
+                    checkpoint_id=checkpoint_id,
+                    timestamp__range=(start, end)
+                ).order_by('timestamp').first()
+
+                actual_time = checkin.timestamp if checkin else None
+                delay = None
+                status = "Missed"
+
+                expected_time = make_aware(expected_time)
+
+                if actual_time:
+                    delay = int((actual_time - expected_time).total_seconds() / 60)
+                    if delay <= 15:
+                        status = "On Time"
+                    elif 15 < delay <= 30:
+                        status = "Delayed"
+                    else:
+                        status = "Missed"
+
+                checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
+
+                report.append({
+                    'guard_id': guard.id,
+                    'guard_name': guard.name,
+                    'checkpoint_id': checkpoint_id,
+                    'checkpoint_name': checkpoint_name,
+                    'expected_time': expected_time,
+                    'actual_checkin_time': actual_time,
+                    'status': status,
+                    'delay_minutes': delay
+                })
+
+        serializer = CheckInReportSerializer(report, many=True)
+        return Response(serializer.data)
