@@ -8,7 +8,7 @@ from rest_framework.response import Response
 from geopy.distance import geodesic
 from django.utils import timezone
 from datetime import date, datetime
-from .models import AttendanceCheckin
+from .models import AttendanceCheckin, CheckInLog
 from .serializers import AttendanceCheckinSerializer
 from scheduler.models import Assignment
 from django.utils.timezone import localtime, make_aware
@@ -109,49 +109,27 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             end_date__gte=today
         ).first()        
 
+    
+
     @action(detail=False, methods=["get"])
     def shift_today(self, request):
         """Return today's shift info + flags for checkin/checkout buttons"""
         user = request.user
         user_id = user.id
-        #today = date.today()
-    #   now = timezone.localtime(timezone.now())
 
         now = timezone.now()
         if timezone.is_naive(now):
             now = timezone.make_aware(now, timezone.get_current_timezone())
         now = timezone.localtime(now)
 
-        current_time = now.time()
         today = now.date()
-        #now = localtime()
-        #current_time = localtime().time()
-        #today = localtime().date()
-        print("user", user)
-        print("user.id", user_id)
-        #print(now)
-        print(request)
-        
-        assignments = Assignment.objects.filter(guard_id=user_id,start_date__lte=today,end_date__gte=today)
-        result = []
-        print("asssss",assignments)
-        # Find assignment for today
+
         assignment = Assignment.objects.filter(
             guard_id=user_id,
             start_date__lte=today,
             end_date__gte=today
         ).first()
-        #print("start_date__lte", start_date__lte)
-        #print("end_date__gte", end_date__gte)
-        # .select_related("shift", "location").first()
-        # print("hi")
-        # Assuming 'assignment' is your queryset
-        #json_data = serialize('json', assignment)
 
-        # Optional: pretty-print the JSON
-        #parsed = json.loads(json_data)
-        #print(json.dumps(parsed, indent=4))
-        #print(assignment)
         if not assignment:
             return Response({
                 "has_shift": False,
@@ -162,104 +140,89 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         shift = assignment.shift
         location = assignment.location
-        print("SSSSSSS", shift)
-        print("LLLLLLL",location)
-        # Find existing attendance record
+
         attendance = AttendanceCheckin.objects.filter(
             guard=user, shift=shift, assignment=assignment,
             checkin_time__date=today
         ).first()
 
-        # Default flags
         show_checkin = False
         show_checkout = False
         message = ""
 
-        shift_start = shift.start_time
-        shift_end = shift.end_time
+        # Determine shift window
+        shift_start_dt = make_aware(datetime.combine(today, shift.start_time)) if is_naive(datetime.combine(today, shift.start_time)) else datetime.combine(today, shift.start_time)
+        shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
 
-        # now = localtime()
-        # shift_start_dt = datetime.combine(now.date(), shift.start_time)
-        # shift_end_dt = datetime.combine(now.date(), shift.end_time)
-
-        # now = localtime()
-        # ist = pytz.timezone('Asia/Kolkata')
-        # local_now = localtime()
-        # current_time = local_now.astimezone(ist)
-        # now = current_time
-        
-        #now = timezone.localtime(timezone.now())
-
-        now = timezone.now()
-        if timezone.is_naive(now):
-            now = timezone.make_aware(now, timezone.get_current_timezone())
-        now = timezone.localtime(now)
-       
-        shift_start_dt = make_aware(datetime.combine(now.date(), shift.start_time))
-        shift_end_dt = make_aware(datetime.combine(now.date(), shift.end_time))
-
-        # Define IST timezone
-        ist = pytz.timezone('Asia/Kolkata')
-
-        # Make shift_start_dt and shift_end_dt timezone-aware (assuming they are naive)
-        shift_start_dt = shift_start_dt
-        #.astimezone(ist)
-        shift_end_dt = shift_end_dt
-        #.astimezone(ist)
-
-        # Calculate check-in window
+        # Define check-in and check-out windows
         earliest_checkin = shift_start_dt - timedelta(minutes=30)
         latest_checkin = shift_end_dt
+        earliest_checkout = shift_start_dt
+        latest_checkout = shift_end_dt + timedelta(minutes=30)
 
-        # earliest_checkin = shift_start_dt - timedelta(minutes=30)
-        # latest_checkin = shift_end_dt
-        print("attendance", attendance)
+        # Scenario logic
         if not attendance:
-            earliest_checkin = shift_start_dt - timedelta(minutes=30)
-            latest_checkin = shift_end_dt
-
-            print("now",now)   
-            print("earliest", earliest_checkin) 
-            print("latest",latest_checkin)
-
+            # Scenario 1: No check-in yet
             if earliest_checkin <= now <= latest_checkin:
                 show_checkin = True
                 message = "You can check in"
             elif now < earliest_checkin:
                 message = "Too early to check in"
             else:
-                message = "Shift has ended, you missed check-in"
+                # Scenario 5: Shift ended without check-out
+                message = "Shift ended"
         else:
             if attendance.checkin_time and not attendance.checkout_time:
-                earliest_checkout = shift_start_dt
-                latest_checkout = shift_end_dt + timedelta(minutes=30)
-
-                if earliest_checkout <= now <= latest_checkout:
+                if now <= shift_end_dt:
+                    # Scenario 2: Checked in, not yet checked out
                     show_checkout = True
-                    message = "You are checked in, please checkout when done"
-                elif now < earliest_checkout:
-                    message = "Too early to checkout"
+                    message = "You are checked in, checkout when done"
                 else:
-                    message = "Checkout window closed"
-            elif attendance.checkout_time:
-                message = "Shift completed, already checked out"
+                    # Scenario 5: Shift ended, no checkout
+                    message = "Shift ended"
+            elif attendance.checkin_time and attendance.checkout_time:
+                if now <= shift_end_dt:
+                    # Check if user has checked in again after checkout
+                    latest_checkin = CheckInLog.objects.filter(
+                        guard=user,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=location,
+                        type="checkin",
+                        timestamp__date=today,
+                        timestamp__gt=attendance.checkout_time
+                    ).order_by("-timestamp").first()
 
-        print("location", location)
-        # --- Response ---
+                    if latest_checkin:
+                        show_checkin = False
+                        show_checkout = True
+                        message = "You have checked-in. You can check-out"
+                    else:
+                        show_checkin = True
+                        show_checkout = False
+                        message = "You are checked out already but can check in again"
+   
+                else:
+                    # Scenario 5: Shift ended
+                    message = "Shift ended"
+
+    # Optional: Scenario 4 — checked in again after checkout
+    # If you track multiple check-ins via a log, you can detect this and show:
+    # show_checkout = True
+    # message = "You can check out"
+
         return Response({
-            "has_shift": True,
-            "shift_id": str(shift.id),
-            "shift_start": shift.start_time,
-            "shift_end": shift.end_time,
-            "location_name": location.name,
-            #"location_lat": location.latitude,
-            #"location_lon": location.longitude,
-            "show_checkin": show_checkin,
-            "show_checkout": show_checkout,
-            "message": message
-        }, status=status.HTTP_200_OK)
+                "has_shift": True,
+                "shift_id": str(shift.id),
+                "shift_start": shift.start_time,
+                "shift_end": shift.end_time,
+                "location_name": location.name,
+                "show_checkin": show_checkin,
+                "show_checkout": show_checkout,
+                "message": message
+            }, status=status.HTTP_200_OK)
 
-    
+  
     @action(detail=False, methods=["post"])
     def checkin(self, request):
         user = request.user
@@ -270,36 +233,49 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         shift = assignment.shift
         org_location = assignment.location
-        print(vars(org_location))
-        print("org_location", org_location)    
-        print("assignment", assignment)
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
         distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-        if distance > 50:
-            return Response({"error": "Not within 50m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
-        attendance, created = AttendanceCheckin.objects.get_or_create(
+        if distance > 100:
+            return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Log this check-in
+        CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            checkin_time__date=date.today()
+            type="checkin",
+            latitude=lat,
+            longitude=lon
         )
 
-        if attendance.checkin_time:
-            return Response({"message": "Already checked in"}, status=status.HTTP_400_BAD_REQUEST)
+        # Update or create attendance record
+        attendance, _ = AttendanceCheckin.objects.get_or_create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            created_on__date=date.today()
+        )
 
-        attendance.checkin_time = timezone.now()
-        attendance.latitude = lat
-        attendance.longitude = lon
+        earliest_checkin = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            timestamp__date=date.today()
+        ).order_by("timestamp").first()
+
+        attendance.checkin_time = earliest_checkin.timestamp
+        attendance.latitude = earliest_checkin.latitude
+        attendance.longitude = earliest_checkin.longitude
         attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_201_CREATED)
 
-    # ----------------------
-    # CHECK-OUT
-    # ----------------------
     @action(detail=False, methods=["post"])
     def checkout(self, request):
         user = request.user
@@ -310,25 +286,45 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         shift = assignment.shift
         org_location = assignment.location
+        lat = float(request.data.get("latitude"))
+        lon = float(request.data.get("longitude"))
 
         attendance = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            checkin_time__date=date.today()
+            created_on__date=date.today()
         ).first()
 
         if not attendance or not attendance.checkin_time:
             return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if attendance.checkout_time:
-            return Response({"message": "Already checked out"}, status=status.HTTP_400_BAD_REQUEST)
+        # Log this checkout
+        CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            latitude=lat,
+            longitude=lon
+        )
 
-        attendance.checkout_time = timezone.now()
+        latest_checkout = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            timestamp__date=date.today()
+        ).order_by("-timestamp").first()
+
+        attendance.checkout_time = latest_checkout.timestamp
         attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
+
 
     # ----------------------
     # DASHBOARD (with date range filter)

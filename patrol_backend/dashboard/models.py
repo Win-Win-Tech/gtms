@@ -69,3 +69,16 @@ class AttendanceCheckin(models.Model):
 
     def _str_(self):
         return f"{self.guard} - {self.shift} [{self.status}]"
+    
+class CheckInLog(models.Model):
+    guard = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    assignment = models.ForeignKey("scheduler.Assignment", on_delete=models.CASCADE)
+    shift = models.ForeignKey("scheduler.Shift", on_delete=models.CASCADE)
+    org_location = models.ForeignKey("scheduler.Location", on_delete=models.CASCADE)
+    timestamp = models.DateTimeField(auto_now_add=True)
+    type = models.CharField(max_length=10, choices=[("checkin", "Check-In"), ("checkout", "Check-Out")])
+    latitude = models.DecimalField(max_digits=9, decimal_places=6)
+    longitude = models.DecimalField(max_digits=9, decimal_places=6)
+
+    def __str__(self):
+        return f"{self.guard} - {self.type} @ {self.timestamp}"
