@@ -42,7 +42,9 @@ class Location(models.Model):
         null=True,
         blank=True,
         related_name="location_deleted"
-    )
+        )
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
 
     # Managers
     objects = ActiveManager()        # default: only active

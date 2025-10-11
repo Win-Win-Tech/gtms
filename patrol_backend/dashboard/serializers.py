@@ -6,7 +6,7 @@ class AttendanceCheckinSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AttendanceCheckin
-        fields = "_all_"
+        fields = "__all__"
 
         # serializers.py
 

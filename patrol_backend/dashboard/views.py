@@ -19,6 +19,7 @@ from django.utils.timezone import now
 from scheduler.models import Assignment
 from checkin.models import CheckIn
 import pytz
+from django.utils.timezone import is_aware, is_naive
 
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -96,29 +97,52 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     queryset = AttendanceCheckin.objects.all()
     serializer_class = AttendanceCheckinSerializer
 
+    def get_today_assignment(self, user):
+#       today = timezone.localtime(timezone.now()).date()
+        now = timezone.now()
+        if timezone.is_naive(now):
+            now = timezone.make_aware(now, timezone.get_current_timezone())
+        today = timezone.localtime(now).date()
+        return Assignment.objects.filter(
+            guard_id=user.id,
+            start_date__lte=today,
+            end_date__gte=today
+        ).first()        
+
     @action(detail=False, methods=["get"])
     def shift_today(self, request):
         """Return today's shift info + flags for checkin/checkout buttons"""
         user = request.user
         user_id = user.id
-        # today = date.today()
-        now = localtime()
-        current_time = localtime().time()
-        today = localtime().date()
-        print(user)
-        print(user.id)
+        #today = date.today()
+    #   now = timezone.localtime(timezone.now())
+
+        now = timezone.now()
+        if timezone.is_naive(now):
+            now = timezone.make_aware(now, timezone.get_current_timezone())
+        now = timezone.localtime(now)
+
+        current_time = now.time()
+        today = now.date()
+        #now = localtime()
+        #current_time = localtime().time()
+        #today = localtime().date()
+        print("user", user)
+        print("user.id", user_id)
         #print(now)
         print(request)
         
         assignments = Assignment.objects.filter(guard_id=user_id,start_date__lte=today,end_date__gte=today)
         result = []
         print("asssss",assignments)
-                # Find assignment for today
+        # Find assignment for today
         assignment = Assignment.objects.filter(
             guard_id=user_id,
             start_date__lte=today,
             end_date__gte=today
         ).first()
+        #print("start_date__lte", start_date__lte)
+        #print("end_date__gte", end_date__gte)
         # .select_related("shift", "location").first()
         # print("hi")
         # Assuming 'assignment' is your queryset
@@ -158,14 +182,19 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # shift_start_dt = datetime.combine(now.date(), shift.start_time)
         # shift_end_dt = datetime.combine(now.date(), shift.end_time)
 
-        now = localtime()
+        # now = localtime()
+        # ist = pytz.timezone('Asia/Kolkata')
+        # local_now = localtime()
+        # current_time = local_now.astimezone(ist)
+        # now = current_time
+        
+        #now = timezone.localtime(timezone.now())
 
-        ist = pytz.timezone('Asia/Kolkata')
-        local_now = localtime()
-        current_time = local_now.astimezone(ist)
-
-        now = current_time
-
+        now = timezone.now()
+        if timezone.is_naive(now):
+            now = timezone.make_aware(now, timezone.get_current_timezone())
+        now = timezone.localtime(now)
+       
         shift_start_dt = make_aware(datetime.combine(now.date(), shift.start_time))
         shift_end_dt = make_aware(datetime.combine(now.date(), shift.end_time))
 
@@ -173,8 +202,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         ist = pytz.timezone('Asia/Kolkata')
 
         # Make shift_start_dt and shift_end_dt timezone-aware (assuming they are naive)
-        shift_start_dt = shift_start_dt.astimezone(ist)
-        shift_end_dt = shift_end_dt.astimezone(ist)
+        shift_start_dt = shift_start_dt
+        #.astimezone(ist)
+        shift_end_dt = shift_end_dt
+        #.astimezone(ist)
 
         # Calculate check-in window
         earliest_checkin = shift_start_dt - timedelta(minutes=30)
@@ -182,14 +213,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         # earliest_checkin = shift_start_dt - timedelta(minutes=30)
         # latest_checkin = shift_end_dt
-
+        print("attendance", attendance)
         if not attendance:
             earliest_checkin = shift_start_dt - timedelta(minutes=30)
             latest_checkin = shift_end_dt
 
-            print("NNNNN",now)   
-            print("ECCCC", earliest_checkin) 
-            print("LLLLCCCC",latest_checkin)
+            print("now",now)   
+            print("earliest", earliest_checkin) 
+            print("latest",latest_checkin)
 
             if earliest_checkin <= now <= latest_checkin:
                 show_checkin = True
@@ -213,35 +244,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             elif attendance.checkout_time:
                 message = "Shift completed, already checked out"
 
-        # --- CHECKIN / CHECKOUT LOGIC ---
-        # if not attendance:
-        #     # No checkin yet
-        #     earliest_checkin = (datetime.combine(today, shift_start) - timedelta(minutes=30)).time()
-        #     latest_checkin = shift_end
-
-        #     if earliest_checkin <= now <= latest_checkin:
-        #         show_checkin = True
-        #         message = "You can check in"
-        #     elif now < earliest_checkin:
-        #         message = "Too early to check in"
-        #     else:
-        #         message = "Shift has ended, you missed check-in"
-        # else:
-        #     # Already checked in
-        #     if attendance.checkin_time and not attendance.checkout_time:
-        #         earliest_checkout = shift_start
-        #         latest_checkout = (datetime.combine(today, shift_end) + timedelta(minutes=30)).time()
-
-        #         if earliest_checkout <= now <= latest_checkout:
-        #             show_checkout = True
-        #             message = "You are checked in, please checkout when done"
-        #         elif now < earliest_checkout:
-        #             message = "Too early to checkout"
-        #         else:
-        #             message = "Checkout window closed"
-        #     elif attendance.checkout_time:
-        #         message = "Shift completed, already checked out"
-
         print("location", location)
         # --- Response ---
         return Response({
@@ -257,17 +259,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "message": message
         }, status=status.HTTP_200_OK)
 
-    # def get_today_assignment(self, user):
-    #     today = date.today()
-    #     return Assignment.objects.filter(
-    #         guard=user,
-    #         start_date__lte=today,
-    #         end_date__gte=today
-    #     ).first()
-
-    # ----------------------
-    # CHECK-IN
-    # ----------------------
+    
     @action(detail=False, methods=["post"])
     def checkin(self, request):
         user = request.user
@@ -278,7 +270,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         shift = assignment.shift
         org_location = assignment.location
-
+        print(vars(org_location))
+        print("org_location", org_location)    
+        print("assignment", assignment)
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
         distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
@@ -390,7 +384,10 @@ class DashboardCheckInReportView(APIView):
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
 
-        today = timezone.localdate()
+        #today = timezone.localdate()
+        #now = timezone.now()
+
+        today = timezone.now().date()
         now = timezone.now()
 
         if filter_type == 'today':
@@ -444,7 +441,14 @@ class DashboardCheckInReportView(APIView):
 
                 expected_time = make_aware(expected_time)
 
-                if actual_time:
+                if actual_time and expected_time:
+                    # Convert aware datetime to naive if needed
+                    if is_aware(actual_time):
+                        actual_time = actual_time.replace(tzinfo=None)
+                    if is_aware(expected_time):
+                        expected_time = expected_time.replace(tzinfo=None)
+
+                #if actual_time:
                     delay = int((actual_time - expected_time).total_seconds() / 60)
                     if delay <= 15:
                         status = "On Time"

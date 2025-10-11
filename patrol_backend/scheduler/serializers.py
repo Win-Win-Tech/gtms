@@ -9,9 +9,16 @@ class LocationSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ShiftSerializer(serializers.ModelSerializer):
+    # start_time = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S')
+    # end_time = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S')
+
+    start_time = serializers.TimeField(input_formats=['%I:%M %p'], format='%I:%M %p')
+    end_time = serializers.TimeField(input_formats=['%I:%M %p'], format='%I:%M %p')
+
     class Meta:
         model = Shift
         fields = '__all__'
+
 
 # class AssignmentSerializer(serializers.ModelSerializer):
 #     class Meta:

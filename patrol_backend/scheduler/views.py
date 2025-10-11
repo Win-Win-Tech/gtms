@@ -85,7 +85,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             today = now().date()
             assignments = Assignment.objects.filter(guard_id=user_id, start_date__lte=today, end_date__gte=today)
             result = []
-
+            print("assignnnnnnnnn", assignments)
             for assignment in assignments:
                 checkpoint_data = assignment.checkpoints
                 completed_ids = set(
@@ -93,7 +93,8 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                         guard_id=user_id,
                         shift_id=assignment.shift.id,
                         checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data],
-                        synced=True
+                        synced=True,
+                        timestamp__date=today  # ✅ Only include check-ins from today
                     ).values_list('checkpoint_id', flat=True)
                 )
 
@@ -128,9 +129,11 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                             logger.warning(f"Failed to auto-create missed check-in: {e}")
 
                     try:
-                        utc_naive = datetime.strptime(cp['time'], '%H:%M')
-                        utc_aware = pytz.utc.localize(utc_naive)
-                        ist_time = utc_aware.astimezone(pytz.timezone('Asia/Kolkata'))
+                        # utc_naive = datetime.strptime(cp['time'], '%H:%M')
+                        # utc_aware = pytz.utc.localize(utc_naive)
+                        # ist_time = utc_aware.astimezone(pytz.timezone('Asia/Kolkata'))
+                        # ist_time = utc_aware.astimezone(pytz.timezone('Asia/Kolkata'))
+                        ist_time = cp['time']
                     except Exception:
                         ist_time = cp['time']
 

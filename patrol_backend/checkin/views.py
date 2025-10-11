@@ -4,6 +4,8 @@ from rest_framework import viewsets
 from .models import CheckIn
 from .serializers import CheckInSerializer
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
             latitude = float(data.get('latitude'))
             longitude = float(data.get('longitude'))
             qr_data = data.get('data')
+
+            print("data", data)
 
             # Rule 1: Validate guard
             try:
@@ -95,7 +99,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             time_diff = abs((checkin_time - shift_start_dt).total_seconds()) / 60
             delayed = time_diff > max_delay
 
-            if delayed:
+            if delayed:         
                 return Response({"error": "Check-in not allowed. Delayed."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Save check-in
