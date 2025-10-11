@@ -1,5 +1,5 @@
 from .views import *
-from .views import AttendanceCheckinViewSet
+from .views import AttendanceCheckinViewSet, AttendanceCheckinListView
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import DashboardCheckInReportView
@@ -15,6 +15,7 @@ urlpatterns = [
     path('routes/<uuid:guard_id>/', PatrolRouteView.as_view()),
     path('', include(router.urls)),
     path('dashboard-checkin-report/', DashboardCheckInReportView.as_view(), name='dashboard-checkin-report'),
+    path("api/attendance/", AttendanceCheckinListView.as_view(), name="attendance-api"),
    
 ]
 

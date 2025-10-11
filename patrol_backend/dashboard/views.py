@@ -20,7 +20,6 @@ from scheduler.models import Assignment
 from checkin.models import CheckIn
 import pytz
 from django.utils.timezone import is_aware, is_naive
-
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.utils import timezone
@@ -29,6 +28,7 @@ from checkin.models import CheckIn
 from authapp.models import User
 from scheduler.models import Checkpoint, Assignment
 from .serializers import CheckInReportSerializer
+from rest_framework import generics
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -329,42 +329,42 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     # ----------------------
     # DASHBOARD (with date range filter)
     # ----------------------
-    @action(detail=False, methods=["get"])
-    def dashboard(self, request):
-        start_date = request.query_params.get("start_date")
-        end_date = request.query_params.get("end_date")
+    # @action(detail=False, methods=["get"])
+    # def dashboard(self, request):
+    #     start_date = request.query_params.get("start_date")
+    #     end_date = request.query_params.get("end_date")
 
-        # Default: today
-        if not start_date:
-            start_date = date.today().strftime("%Y-%m-%d")
-        if not end_date:
-            end_date = date.today().strftime("%Y-%m-%d")
+    #     # Default: today
+    #     if not start_date:
+    #         start_date = date.today().strftime("%Y-%m-%d")
+    #     if not end_date:
+    #         end_date = date.today().strftime("%Y-%m-%d")
 
-        try:
-            start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
-            end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-        except ValueError:
-            return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+    #     try:
+    #         start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    #         end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    #     except ValueError:
+    #         return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
 
-        records = AttendanceCheckin.objects.filter(
-            checkin_time_date_gte=start_date,
-            checkin_time_date_lte=end_date
-        ).select_related("guard", "shift", "assignment")
+    #     records = AttendanceCheckin.objects.filter(
+    #         checkin_time_date_gte=start_date,
+    #         checkin_time_date_lte=end_date
+    #     ).select_related("guard", "shift", "assignment")
 
-        data = []
-        for record in records:
-            data.append({
-                "name": record.guard.get_full_name() or record.guard.username,
-                "date": record.checkin_time.date() if record.checkin_time else record.assignment.start_date,
-                "shift_time": f"{record.shift.start_time} - {record.shift.end_time}",
-                "checkin_time": record.checkin_time,
-                "checkout_time": record.checkout_time,
-                "status": record.status,
-                "remarks": record.remarks,
-                "od_remarks": record.od_remarks
-            })
+    #     data = []
+    #     for record in records:
+    #         data.append({
+    #             "name": record.guard.get_full_name() or record.guard.username,
+    #             "date": record.checkin_time.date() if record.checkin_time else record.assignment.start_date,
+    #             "shift_time": f"{record.shift.start_time} - {record.shift.end_time}",
+    #             "checkin_time": record.checkin_time,
+    #             "checkout_time": record.checkout_time,
+    #             "status": record.status,
+    #             "remarks": record.remarks,
+    #             "od_remarks": record.od_remarks
+    #         })
 
-        return Response(data, status=status.HTTP_200_OK)
+    #     return Response(data, status=status.HTTP_200_OK)
     
 
     # views.py
@@ -468,3 +468,48 @@ class DashboardCheckInReportView(APIView):
 
         serializer = CheckInReportSerializer(report, many=True)
         return Response(serializer.data)
+
+class AttendanceCheckinListView(generics.ListAPIView):
+    serializer_class = AttendanceCheckinSerializer
+
+    def get_queryset(self):
+        queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
+
+        #today = timezone.localdate()
+        date_filter = self.request.query_params.get("date_filter", "today")
+
+        naive_dt = datetime.now()  # Naive datetime
+        aware_dt = make_aware(naive_dt)  # Convert to aware
+        today = localtime(aware_dt)   # Now it's safe to use
+
+        if date_filter == "today":
+            queryset = queryset.filter(checkin_time__date=today)
+        elif date_filter == "week":
+            start_week = today - timezone.timedelta(days=today.weekday())
+            end_week = start_week + timezone.timedelta(days=6)
+            queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
+        elif date_filter == "month":
+            queryset = queryset.filter(checkin_time__date__month=today.month)
+
+        # Additional filters
+        guard_id = self.request.query_params.get("guard")
+        if guard_id:
+            queryset = queryset.filter(guard_id=guard_id)
+
+        location_id = self.request.query_params.get("location")
+        if location_id:
+            queryset = queryset.filter(org_location_id=location_id)
+
+        shift_id = self.request.query_params.get("shift")
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+
+        status = self.request.query_params.get("status")
+        if status:
+            queryset = queryset.filter(status=status)
+
+        defaulters = self.request.query_params.get("defaulters")
+        if defaulters == "true":
+            queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
+
+        return queryset
