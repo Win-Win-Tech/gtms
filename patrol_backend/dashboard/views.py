@@ -152,8 +152,13 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         # Determine shift window
         shift_start_dt = make_aware(datetime.combine(today, shift.start_time)) if is_naive(datetime.combine(today, shift.start_time)) else datetime.combine(today, shift.start_time)
-        shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
 
+        if shift.end_time <= shift.start_time:
+            shift_end_dt = make_aware(datetime.combine(today + timedelta(days=1), shift.end_time)) if is_naive(datetime.combine(today + timedelta(days=1), shift.end_time)) else datetime.combine(today + timedelta(days=1), shift.end_time)
+        else:
+            shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
+        #shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
+        
         # Define check-in and check-out windows
         earliest_checkin = shift_start_dt - timedelta(minutes=30)
         latest_checkin = shift_end_dt
