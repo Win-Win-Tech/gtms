@@ -9,7 +9,7 @@ from geopy.distance import geodesic
 from django.utils import timezone
 from datetime import date, datetime
 from .models import AttendanceCheckin, CheckInLog
-from .serializers import AttendanceCheckinSerializer
+from .serializers import AttendanceCheckinSerializer, AttendanceCheckinDashboardSerializer
 from scheduler.models import Assignment
 from django.utils.timezone import localtime, make_aware
 from datetime import  datetime, timedelta
@@ -236,6 +236,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
         distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+        print("request.data", request.data)
 
         if distance > 100:
             return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
@@ -470,7 +471,7 @@ class DashboardCheckInReportView(APIView):
         return Response(serializer.data)
 
 class AttendanceCheckinListView(generics.ListAPIView):
-    serializer_class = AttendanceCheckinSerializer
+    serializer_class = AttendanceCheckinDashboardSerializer
 
     def get_queryset(self):
         queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")

@@ -6,6 +6,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User
 from .serializers import UserSerializer
 from patrol_backend.utils.response import api_response
+from django.forms.models import model_to_dict 
 
 # 1. Create user
 class UserCreateView(generics.CreateAPIView):
@@ -91,9 +92,11 @@ class LoginView(APIView):
             user = authenticate(request, email=email, password=password)
             if user:
                 refresh = RefreshToken.for_user(user)
+                
                 return Response(api_response("success", "Login successful", {
                     'access': str(refresh.access_token),
                     'refresh': str(refresh),
+                    'user':model_to_dict(user, fields=[field.name for field in user._meta.fields]),
                     'user_id': str(user.id),
                     'role': user.role,
                     'is_superuser': user.is_superuser,

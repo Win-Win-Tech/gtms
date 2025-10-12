@@ -10,20 +10,35 @@ class AttendanceCheckinSerializer(serializers.ModelSerializer):
 
         # serializers.py
 
+# class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
+#     guard_name = serializers.CharField(source="guard.get_full_name", read_only=True)
+#     shift_time = serializers.SerializerMethodField()
+
+#     class Meta:
+#         model = AttendanceCheckin
+#         fields = [
+#             "id", "guard_name", "checkin_time", "checkout_time", "status",
+#             "remarks", "od_remarks", "org_location", "shift", "assignment", "shift_time"
+#         ]
+
+#     def get_shift_time(self, obj):
+#         return f"{obj.shift.start_time}–{obj.shift.end_time}"
+
 class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
-    guard_name = serializers.CharField(source="guard.get_full_name", read_only=True)
+    guard_name = serializers.CharField(source="guard.name", read_only=True)
+    shift_name = serializers.CharField(source="shift.name", read_only=True)
+    location_name = serializers.CharField(source="org_location.name", read_only=True)
     shift_time = serializers.SerializerMethodField()
 
     class Meta:
         model = AttendanceCheckin
         fields = [
             "id", "guard_name", "checkin_time", "checkout_time", "status",
-            "remarks", "od_remarks", "org_location", "shift", "assignment", "shift_time"
+            "remarks", "od_remarks", "location_name", "shift_name", "assignment", "shift_time"
         ]
 
     def get_shift_time(self, obj):
         return f"{obj.shift.start_time}–{obj.shift.end_time}"
-
 
 class CheckInReportSerializer(serializers.Serializer):
     guard_id = serializers.UUIDField()

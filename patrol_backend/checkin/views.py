@@ -169,6 +169,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
 
             response_data = serializer.data
             response_data['delayed'] = delayed
+            response_data['message'] = "Checkpoint Successfully Scanned"
+            response_data['success'] = True
             response_data['distance_from_checkpoint_m'] = round(distance, 2)
 
             return Response(
