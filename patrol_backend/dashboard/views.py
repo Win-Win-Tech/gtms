@@ -29,6 +29,9 @@ from authapp.models import User
 from scheduler.models import Checkpoint, Assignment
 from .serializers import CheckInReportSerializer
 from rest_framework import generics
+import os
+from django.conf import settings
+from django.utils.timezone import make_aware, is_aware, get_current_timezone
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -152,7 +155,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         # Determine shift window
         shift_start_dt = make_aware(datetime.combine(today, shift.start_time)) if is_naive(datetime.combine(today, shift.start_time)) else datetime.combine(today, shift.start_time)
-
+  
         if shift.end_time <= shift.start_time:
             shift_end_dt = make_aware(datetime.combine(today + timedelta(days=1), shift.end_time)) if is_naive(datetime.combine(today + timedelta(days=1), shift.end_time)) else datetime.combine(today + timedelta(days=1), shift.end_time)
         else:
@@ -443,12 +446,31 @@ class DashboardCheckInReportView(APIView):
 
                 expected_time = make_aware(expected_time)
 
+                # if actual_time and expected_time:
+                #     # Convert aware datetime to naive if needed
+                #     if is_aware(actual_time):
+                #         actual_time = actual_time.replace(tzinfo=None)
+                #     if is_aware(expected_time):
+                #         expected_time = expected_time.replace(tzinfo=None)
+
                 if actual_time and expected_time:
-                    # Convert aware datetime to naive if needed
-                    if is_aware(actual_time):
-                        actual_time = actual_time.replace(tzinfo=None)
-                    if is_aware(expected_time):
-                        expected_time = expected_time.replace(tzinfo=None)
+                    # Convert to aware IST if naive
+                    if not is_aware(actual_time):
+                        actual_time = make_aware(actual_time, get_current_timezone())
+                    if not is_aware(expected_time):
+                        expected_time = make_aware(expected_time, get_current_timezone())
+
+                    # Convert both to UTC
+
+                    # Convert both to IST for display
+                    ist = timezone.get_current_timezone()
+                    actual_time = actual_time.astimezone(ist)
+                    expected_time = expected_time.astimezone(ist)
+
+#                    actual_time = actual_time.astimezone(timezone.utc)
+#                    expected_time = expected_time.astimezone(timezone.utc)
+                    print("EXPECTED TIME", expected_time)
+                    print("ACT TIME", actual_time)
 
                 #if actual_time:
                     delay = int((actual_time - expected_time).total_seconds() / 60)
@@ -466,8 +488,10 @@ class DashboardCheckInReportView(APIView):
                     'guard_name': guard.name,
                     'checkpoint_id': checkpoint_id,
                     'checkpoint_name': checkpoint_name,
-                    'expected_time': expected_time,
+#                    'expected_time': expected_time,
+                    'expected_time': expected_time.strftime('%Y-%m-%d %H:%M:%S'),
                     'actual_checkin_time': actual_time,
+#                    'actual_checkin_time': actual_time.strftime('%Y-%m-%d %H:%M:%S'),
                     'status': status,
                     'delay_minutes': delay
                 })
@@ -519,3 +543,132 @@ class AttendanceCheckinListView(generics.ListAPIView):
             queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
 
         return queryset
+    
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from django.utils.timezone import make_aware, is_aware
+from django.http import HttpResponse
+from datetime import datetime, timedelta
+from openpyxl import Workbook
+from io import BytesIO
+
+class DashboardCheckInReportExcelView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # Parse filters
+        filter_type = request.query_params.get('filter', 'today')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+
+        today = timezone.now().date()
+        now = timezone.now()
+
+        if filter_type == 'today':
+            start = datetime.combine(today, datetime.min.time())
+            end = datetime.combine(today, datetime.max.time())
+        elif filter_type == 'this_week':
+            start = today - timedelta(days=today.weekday())
+            end = start + timedelta(days=6)
+            start = datetime.combine(start, datetime.min.time())
+            end = datetime.combine(end, datetime.max.time())
+        elif filter_type == 'this_month':
+            start = datetime(today.year, today.month, 1)
+            next_month = start.replace(day=28) + timedelta(days=4)
+            end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+        elif filter_type == 'custom' and start_date and end_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+        else:
+            return Response({"error": "Invalid filter or missing dates"}, status=400)
+
+        assignments = Assignment.objects.filter(
+            start_date__lte=end.date(),
+            end_date__gte=start.date()
+        )
+
+        if user_id:
+            assignments = assignments.filter(guard_id=user_id)
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
+
+        # Create Excel workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Check-In Report"
+
+        # Header row
+        headers = [
+            'Guard ID', 'Guard Name', 'Checkpoint ID', 'Checkpoint Name',
+            'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)'
+        ]
+        ws.append(headers)
+
+        for assignment in assignments:
+            guard = assignment.guard
+            shift = assignment.shift
+            for cp in assignment.checkpoints:
+                checkpoint_id = cp.get('checkpoint_id')
+                expected_time_str = cp.get('time')
+                expected_time = datetime.combine(assignment.start_date, datetime.strptime(expected_time_str, "%H:%M").time())
+
+                checkin = CheckIn.objects.filter(
+                    guard=guard,
+                    shift=shift,
+                    checkpoint_id=checkpoint_id,
+                    timestamp__range=(start, end)
+                ).order_by('timestamp').first()
+
+                actual_time = checkin.timestamp if checkin else None
+                delay = None
+                status = "Missed"
+
+                expected_time = make_aware(expected_time)
+
+                if actual_time and expected_time:
+                    if is_aware(actual_time):
+                        actual_time = actual_time.replace(tzinfo=None)
+                    if is_aware(expected_time):
+                        expected_time = expected_time.replace(tzinfo=None)
+
+                    delay = int((actual_time - expected_time).total_seconds() / 60)
+                    if delay <= 15:
+                        status = "On Time"
+                    elif 15 < delay <= 30:
+                        status = "Delayed"
+                    else:
+                        status = "Missed"
+
+                checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
+
+                ws.append([
+                    str(guard.id),
+                    guard.name,
+                    str(checkpoint_id),
+                    checkpoint_name,
+                    expected_time.strftime("%Y-%m-%d %H:%M"),
+                    actual_time.strftime("%Y-%m-%d %H:%M") if actual_time else "",
+                    status,
+                    delay if delay is not None else ""
+                ])
+
+        # Save to in-memory buffer
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+
+        # Define file path
+        filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        file_path = os.path.join(settings.MEDIA_ROOT, filename)
+
+        # Save file to MEDIA directory
+        with open(file_path, 'wb') as f:
+            f.write(buffer.getvalue())
+
+        # Build downloadable URL
+        file_url = request.build_absolute_uri(os.path.join(settings.MEDIA_URL, filename))
+
+        return Response({"download_url": file_url})

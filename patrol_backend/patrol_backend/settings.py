@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,6 +45,7 @@ INSTALLED_APPS = [
     'tourlog',
     'dashboard',
     'corsheaders',
+    'incident',
 ]
 
 MIDDLEWARE = [
@@ -169,4 +171,18 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
+# Twilio credentials
+TWILIO_SID = 'AC2f6c622ec954be8536e4b4ae1a913e90'
+
+TWILIO_AUTH_TOKEN = '8c0b864a3d79371cbbdb9571c4c8964b'
+
+# Twilio phone numbers
+TWILIO_PHONE = '+12543453221'  # Twilio voice-enabled number
+TWILIO_WHATSAPP_NUMBER = '+14155238886'  # Twilio sandbox WhatsApp number
+
+# Admin contact
+ADMIN_PHONE = '+918940996408'  # Admin's mobile number for voice call
+ADMIN_WHATSAPP = '+918940996408'  # Admin's WhatsApp number

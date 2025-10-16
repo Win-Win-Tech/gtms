@@ -2,8 +2,7 @@ from .views import *
 from .views import AttendanceCheckinViewSet, AttendanceCheckinListView
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import DashboardCheckInReportView
-
+from .views import DashboardCheckInReportView, DashboardCheckInReportExcelView
 
 router = DefaultRouter()
 router.register(r'attendance', AttendanceCheckinViewSet, basename="attendance")
@@ -16,6 +15,7 @@ urlpatterns = [
     path('', include(router.urls)),
     path('dashboard-checkin-report/', DashboardCheckInReportView.as_view(), name='dashboard-checkin-report'),
     path("api/attendance/", AttendanceCheckinListView.as_view(), name="attendance-api"),
+    path('dashboard-checkin-report-excel/', DashboardCheckInReportExcelView.as_view(), name='dashboard-checkin-report-excel'),
    
 ]
 
