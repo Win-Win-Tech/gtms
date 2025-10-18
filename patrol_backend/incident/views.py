@@ -12,6 +12,7 @@ class IncidentReportView(APIView):
     def post(self, request):
         data = request.data.copy()
         data['created_by'] = request.user.id
+        data['location'] = request.user.location_id
         serializer = IncidentSerializer(data=data)
         if serializer.is_valid():
             incident = serializer.save()
@@ -32,18 +33,31 @@ class IncidentReportView(APIView):
             # Media URLs (must be HTTPS and publicly accessible)
             media_urls = []
             if incident.photo:
-                media_urls.append(incident.photo)  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
+                media_urls=[incident.photo]  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
+            else:
+                media_urls = None 
             #if incident.video:
             #    media_urls.append(incident.video)  # e.g., 'https://yourdomain.com/path/to/video.mp4'
 
+            #media_url = incident.photo.url if incident.photo else None
+            #print ("media_urls:", media_urls)
 
-            # client.messages.create(
+            # message = client.messages.create(
             #     body=whatsapp_body,
             #     from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-            #     to='whatsapp:' + settings.ADMIN_WHATSAPP
+            #     to='whatsapp:' + settings.ADMIN_WHATSAPP,
+            #     media_url=['http://localhost:8000/media/incidents/EAF399B3-396/1.jpg']                
             # )
+            # # Print response details
+            # print("Message SID:", message.sid)
+            # print("Status:", message.status)
+            # print("To:", message.to)
+            # print("From:", message.from_)
+            # print("Date Created:", message.date_created)
+            # print("Media:", message.media)
 
-            #Trigger phone call
+
+            # #Trigger phone call
 
             # client.calls.create(
             #     twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
@@ -90,15 +104,62 @@ from .models import incidentreport
 from .serializers import IncidentSerializer
 import datetime
 
+# class IncidentFilterView(APIView):
+#     def get(self, request):
+#         # Get query parameters
+#         date_filter = request.query_params.get('date_filter', '').lower()
+#         #status_filter = request.query_params.get('status', '').capitalize()
+#         status_filter = request.query_params.get('status', '').title()
+#         severity_filter = request.query_params.get('severity', '').capitalize()
+#         start_date = request.query_params.get('start_date')
+#         end_date = request.query_params.get('end_date')
+
+#                 # Base queryset
+#         queryset = incidentreport.objects.all()
+
+#         # Apply status filter
+#         if status_filter in ['Open', 'In-Progress', 'Closed']:
+#             queryset = queryset.filter(status=status_filter)
+
+#         if severity_filter in ['Low', 'Medium', 'High']:
+#             queryset = queryset.filter(severity=severity_filter)
+
+#         # Apply date filter
+#         now = timezone.now()
+#         if date_filter == 'today':
+#             queryset = queryset.filter(created_on__date=now.date())
+#         elif date_filter == 'this_week':
+#             start_of_week = now - datetime.timedelta(days=now.weekday())
+#             queryset = queryset.filter(created_on__date__gte=start_of_week.date())
+#         elif date_filter == 'this_month':
+#             queryset = queryset.filter(created_on__year=now.year, created_on__month=now.month)
+#         elif date_filter == 'custom' and start_date and end_date:
+#             try:
+#                 start = datetime.datetime.strptime(start_date, '%Y-%m-%d')
+#                 end = datetime.datetime.strptime(end_date, '%Y-%m-%d') + datetime.timedelta(days=1)
+#                 queryset = queryset.filter(created_on__range=(start, end))
+#             except ValueError:
+#                 return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+#         # Serialize and return
+#         serializer = IncidentSerializer(queryset, many=True)
+#         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
 class IncidentFilterView(APIView):
     def get(self, request):
         # Get query parameters
         date_filter = request.query_params.get('date_filter', '').lower()
-        #status_filter = request.query_params.get('status', '').capitalize()
         status_filter = request.query_params.get('status', '').title()
         severity_filter = request.query_params.get('severity', '').capitalize()
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
+
+        # New filters
+        location_id = request.query_params.get('location_id')
+        assigned_to_id = request.query_params.get('assigned_to')
+        created_by_id = request.query_params.get('created_by')
+        checkpoint_id = request.query_params.get('checkpoint_id')
 
         # Base queryset
         queryset = incidentreport.objects.all()
@@ -107,6 +168,7 @@ class IncidentFilterView(APIView):
         if status_filter in ['Open', 'In-Progress', 'Closed']:
             queryset = queryset.filter(status=status_filter)
 
+        # Apply severity filter
         if severity_filter in ['Low', 'Medium', 'High']:
             queryset = queryset.filter(severity=severity_filter)
 
@@ -126,6 +188,16 @@ class IncidentFilterView(APIView):
                 queryset = queryset.filter(created_on__range=(start, end))
             except ValueError:
                 return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Apply new filters
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
+        if assigned_to_id:
+            queryset = queryset.filter(assigned_to_id=assigned_to_id)
+        if created_by_id:
+            queryset = queryset.filter(created_by_id=created_by_id)
+        if checkpoint_id:
+            queryset = queryset.filter(checkpoint_id=checkpoint_id)
 
         # Serialize and return
         serializer = IncidentSerializer(queryset, many=True)

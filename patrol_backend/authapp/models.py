@@ -80,6 +80,10 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     objects = UserManager()
 
+    @classmethod
+    def get_by_roles(cls, roles):
+        return cls.objects.filter(role__in=roles, is_deleted=False)
+
     def delete(self, user=None, using=None, keep_parents=False):
         """Override delete method for soft delete"""
         self.is_deleted = True

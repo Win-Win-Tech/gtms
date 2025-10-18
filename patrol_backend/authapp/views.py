@@ -134,3 +134,32 @@ class UserListView(generics.ListAPIView):
             return Response(api_response("success", "Users fetched", serializer.data, status.HTTP_200_OK))
         except Exception as e:
             return Response(api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR))
+        
+
+
+from django.http import JsonResponse
+from django.views import View
+from .models import User
+
+class UserByRoleView(View):
+    def get(self, request):
+        roles = request.GET.getlist('roles')
+        valid_roles = dict(User.ROLE_CHOICES).keys()
+        # Filter out invalid roles
+        roles = [role for role in roles if role in valid_roles]
+        print("roles:", roles )
+        if not roles:
+            return JsonResponse({'error': 'No valid roles provided.'}, status=400)
+        users = User.get_by_roles(roles)
+        data = [
+            {
+                'id': str(user.id),
+                'email': user.email,
+                'name': user.name,
+                'role': user.role,
+                'phone_no': user.phone_no,
+            }
+            for user in users
+        ]
+        return JsonResponse(data, safe=False)
+    
