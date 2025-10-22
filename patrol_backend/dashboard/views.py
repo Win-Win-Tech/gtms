@@ -464,13 +464,12 @@ class DashboardCheckInReportView(APIView):
 
                     # Convert both to IST for display
                     ist = timezone.get_current_timezone()
-                    actual_time = actual_time.astimezone(ist)
+                    #actual_time = actual_time.astimezone(ist)
                     expected_time = expected_time.astimezone(ist)
 
 #                    actual_time = actual_time.astimezone(timezone.utc)
 #                    expected_time = expected_time.astimezone(timezone.utc)
-                    print("EXPECTED TIME", expected_time)
-                    print("ACT TIME", actual_time)
+
 
                 #if actual_time:
                     delay = int((actual_time - expected_time).total_seconds() / 60)
@@ -482,6 +481,13 @@ class DashboardCheckInReportView(APIView):
                         status = "Missed"
 
                 checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
+                print("EXPECTED TIME", expected_time)
+                print("ACT TIME", actual_time)
+
+                if actual_time:
+                    formatted_time = actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    formatted_time = None
 
                 report.append({
                     'guard_id': guard.id,
@@ -490,8 +496,9 @@ class DashboardCheckInReportView(APIView):
                     'checkpoint_name': checkpoint_name,
 #                    'expected_time': expected_time,
                     'expected_time': expected_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'actual_checkin_time': actual_time,
-#                    'actual_checkin_time': actual_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    #'actual_checkin_time': actual_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    'actual_checkin_time': formatted_time,
+#                    'actual_checkin_time': actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S'),
                     'status': status,
                     'delay_minutes': delay
                 })

@@ -92,7 +92,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
             if not shift:
                 return Response({"error": "Shift not found"}, status=status.HTTP_400_BAD_REQUEST)
 
-            checkin_time = now() if not timestamp else shift.timezone.localize(now()) if hasattr(shift, 'timezone') else now()
+            checkin_time = now() 
+            #if not timestamp else shift.timezone.localize(now()) if hasattr(shift, 'timezone') else now()
             shift_start = shift.start_time
             shift_start=get_checkpoint_time(assignment,checkpoint_id)
             
