@@ -31,39 +31,41 @@ class IncidentReportView(APIView):
             )
 
             # Media URLs (must be HTTPS and publicly accessible)
-            media_urls = []
-            if incident.photo:
-                media_urls=[incident.photo]  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
-            else:
-                media_urls = None 
+            #media_urls = []
+            #if incident.photo:
+            #    media_urls=[incident.photo]  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
+            #else:
+            #    media_urls = None 
             #if incident.video:
             #    media_urls.append(incident.video)  # e.g., 'https://yourdomain.com/path/to/video.mp4'
 
             #media_url = incident.photo.url if incident.photo else None
+            #media_url = [request.build_absolute_uri(incident.photo.url)] if incident.photo else None
+
             #print ("media_urls:", media_urls)
 
-            # message = client.messages.create(
-            #     body=whatsapp_body,
-            #     from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-            #     to='whatsapp:' + settings.ADMIN_WHATSAPP,
-            #     media_url=['http://localhost:8000/media/incidents/EAF399B3-396/1.jpg']                
-            # )
+            message = client.messages.create(
+                 body=whatsapp_body,
+                 from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                 to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                 #media_url=media_url                
+            )
             # # Print response details
-            # print("Message SID:", message.sid)
-            # print("Status:", message.status)
-            # print("To:", message.to)
-            # print("From:", message.from_)
-            # print("Date Created:", message.date_created)
-            # print("Media:", message.media)
+            print("Message SID:", message.sid)
+            print("Status:", message.status)
+            print("To:", message.to)
+            print("From:", message.from_)
+            print("Date Created:", message.date_created)
+            print("Media:", message.media)
 
 
-            # #Trigger phone call
+            #Trigger phone call
 
-            # client.calls.create(
-            #     twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
-            #     to=settings.ADMIN_PHONE,
-            #     from_=settings.TWILIO_PHONE
-            # )
+            client.calls.create(
+                 twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
+                 to=settings.ADMIN_PHONE,
+                 from_=settings.TWILIO_PHONE
+            )
 
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

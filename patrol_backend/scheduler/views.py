@@ -104,9 +104,11 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                     try:
                         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
-                        checkpoint_datetime = make_aware(datetime.combine(today, checkpoint_time))
+                        #checkpoint_datetime = make_aware(datetime.combine(today, checkpoint_time))
+                        checkpoint_datetime = datetime.combine(today, checkpoint_time)
                         is_overdue = now() > checkpoint_datetime + timedelta(minutes=15)
-                    except Exception:
+                    except Exception as e:
+                        print("eeee",e)
                         is_overdue = False
 
                     is_checked_in = UUID(checkpoint_id) in completed_ids
