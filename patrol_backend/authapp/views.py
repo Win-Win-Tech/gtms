@@ -144,12 +144,16 @@ from .models import User
 class UserByRoleView(View):
     def get(self, request):
         roles = request.GET.getlist('roles')
+        location_id = request.GET.get('location_id', None)
         valid_roles = dict(User.ROLE_CHOICES).keys()
         # Filter out invalid roles
         roles = [role for role in roles if role in valid_roles]
         print("roles:", roles )
         if not roles:
             return JsonResponse({'error': 'No valid roles provided.'}, status=400)
+        if location_id:
+            users = users.filter(location_id=location_id)
+            
         users = User.get_by_roles(roles)
         data = [
             {
