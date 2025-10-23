@@ -442,9 +442,10 @@ class DashboardCheckInReportView(APIView):
 
                 actual_time = checkin.timestamp if checkin else None
                 delay = None
-                status = "Missed"
-
+                status = "-"
+                print("checkin.synced", checkin.synced)
                 expected_time = make_aware(expected_time)
+                formatted_time = None
 
                 # if actual_time and expected_time:
                 #     # Convert aware datetime to naive if needed
@@ -452,8 +453,11 @@ class DashboardCheckInReportView(APIView):
                 #         actual_time = actual_time.replace(tzinfo=None)
                 #     if is_aware(expected_time):
                 #         expected_time = expected_time.replace(tzinfo=None)
-
-                if actual_time and expected_time:
+                if checkin and not checkin.synced:
+                    status = "Missed"
+                    formatted_time = "-"
+                    delay = 0
+                elif actual_time and expected_time:
                     # Convert to aware IST if naive
                     if not is_aware(actual_time):
                         actual_time = make_aware(actual_time, get_current_timezone())
@@ -484,6 +488,9 @@ class DashboardCheckInReportView(APIView):
                 print("EXPECTED TIME", expected_time)
                 print("ACT TIME", actual_time)
 
+                if checkin.synced is False:
+                    actual_time=None
+                    
                 if actual_time:
                     formatted_time = actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S')
                 else:
