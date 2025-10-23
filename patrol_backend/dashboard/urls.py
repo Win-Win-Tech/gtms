@@ -16,7 +16,8 @@ urlpatterns = [
     path('dashboard-checkin-report/', DashboardCheckInReportView.as_view(), name='dashboard-checkin-report'),
     path("api/attendance/", AttendanceCheckinListView.as_view(), name="attendance-api"),
     path('dashboard-checkin-report-excel/', DashboardCheckInReportExcelView.as_view(), name='dashboard-checkin-report-excel'),
-   
+    path("api/attendance/export/", AttendanceCheckinExportView.as_view(), name="attendance-export-api"),
+  
 ]
 
 

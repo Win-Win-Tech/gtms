@@ -490,7 +490,7 @@ class DashboardCheckInReportView(APIView):
 
                 if checkin.synced is False:
                     actual_time=None
-                    
+
                 if actual_time:
                     formatted_time = actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S')
                 else:
@@ -686,3 +686,79 @@ class DashboardCheckInReportExcelView(APIView):
         file_url = request.build_absolute_uri(os.path.join(settings.MEDIA_URL, filename))
 
         return Response({"download_url": file_url})
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from django.utils.timezone import make_aware, localtime
+from datetime import datetime
+import os
+from django.conf import settings
+from openpyxl import Workbook
+from .models import AttendanceCheckin
+from .serializers import AttendanceCheckinDashboardSerializer
+
+class AttendanceCheckinExportView(APIView):
+    def get(self, request):
+        queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
+
+        date_filter = request.query_params.get("date_filter", "today")
+        naive_dt = datetime.now()
+        aware_dt = make_aware(naive_dt)
+        today = localtime(aware_dt)
+
+        if date_filter == "today":
+            queryset = queryset.filter(checkin_time__date=today)
+        elif date_filter == "week":
+            start_week = today - timezone.timedelta(days=today.weekday())
+            end_week = start_week + timezone.timedelta(days=6)
+            queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
+        elif date_filter == "month":
+            queryset = queryset.filter(checkin_time__date__month=today.month)
+
+        # Additional filters
+        guard_id = request.query_params.get("guard")
+        if guard_id:
+            queryset = queryset.filter(guard_id=guard_id)
+
+        location_id = request.query_params.get("location")
+        if location_id:
+            queryset = queryset.filter(org_location_id=location_id)
+
+        shift_id = request.query_params.get("shift")
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+
+        status = request.query_params.get("status")
+        if status:
+            queryset = queryset.filter(status=status)
+
+        defaulters = request.query_params.get("defaulters")
+        if defaulters == "true":
+            queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
+
+        # Create Excel
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Attendance Checkins"
+
+        # Header
+        ws.append(["Guard", "Shift", "Location", "Checkin Time", "Checkout Time", "Status"])
+
+        for obj in queryset:
+            ws.append([
+                obj.guard.name,
+                obj.shift.name if obj.shift else "",
+                obj.org_location.name if obj.org_location else "",
+                obj.checkin_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkin_time else "",
+                obj.checkout_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkout_time else "",
+                obj.status
+            ])
+
+        # Save file
+        filename = f"attendance_export_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        filepath = os.path.join(settings.MEDIA_ROOT, filename)
+        wb.save(filepath)
+
+        # Return URL
+        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+        return Response({"file_url": file_url})
