@@ -443,7 +443,7 @@ class DashboardCheckInReportView(APIView):
                 actual_time = checkin.timestamp if checkin else None
                 delay = None
                 status = "-"
-                print("checkin.synced", checkin.synced)
+                #print("checkin.synced", checkin.synced)
                 expected_time = make_aware(expected_time)
                 formatted_time = None
 
@@ -485,11 +485,15 @@ class DashboardCheckInReportView(APIView):
                         status = "Missed"
 
                 checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
-                print("EXPECTED TIME", expected_time)
-                print("ACT TIME", actual_time)
+                #print("EXPECTED TIME", expected_time)
+                #print("ACT TIME", actual_time)
+                print("checkin", checkin)
 
-                if checkin.synced is False:
-                    actual_time=None
+                try:
+                    if checkin.synced is False:
+                        actual_time=None
+                except Exception as e:
+                    print("eeeeeee", e)
 
                 if actual_time:
                     formatted_time = actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S')
@@ -568,7 +572,7 @@ from openpyxl import Workbook
 from io import BytesIO
 
 class DashboardCheckInReportExcelView(APIView):
-    permission_classes = [IsAuthenticated]
+#    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         # Parse filters
