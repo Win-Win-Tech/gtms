@@ -385,3 +385,57 @@ class SiteSetting(models.Model):
         indexes = [
             models.Index(fields=["is_deleted"]),
         ]
+
+
+import uuid
+from django.db import models
+from django.conf import settings
+from django.utils import timezone
+
+class CheckpointTemplate(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shift = models.ForeignKey('Shift', on_delete=models.CASCADE, related_name='templates')
+    location = models.ForeignKey('Location', on_delete=models.CASCADE, related_name='checkpoint_templates', null=True, blank=True)
+    template_name = models.CharField(max_length=100)
+
+    # JSON field to store checkpoint ID and time pairs
+    checkpoints = models.JSONField(default=list)  # Example: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
+
+    # Audit fields
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checkpointtemplate_created"
+    )
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checkpointtemplate_modified"
+    )
+
+    # Soft delete
+    is_deleted = models.BooleanField(default=False)
+    deleted_on = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checkpointtemplate_deleted"
+    )
+
+    def delete(self, user=None, using=None, keep_parents=False):
+        self.is_deleted = True
+        self.deleted_on = timezone.now()
+        if user:
+            self.deleted_by = user
+        self.save()
+
+    def __str__(self):
+        return self.template_name

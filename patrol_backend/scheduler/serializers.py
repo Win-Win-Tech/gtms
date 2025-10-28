@@ -133,3 +133,12 @@ class SiteSettingSerializer(serializers.ModelSerializer):
         model = SiteSetting
         fields = '__all__'        
 
+
+from rest_framework import serializers
+from .models import CheckpointTemplate
+
+class CheckpointTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CheckpointTemplate
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_on', 'deleted_by', 'is_deleted']

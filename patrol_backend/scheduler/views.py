@@ -242,3 +242,150 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
         ids = request.data.get('ids', [])
         if not isinstance(ids, list):
            return Response({'detail': 'Expected a list of UUIDs in "ids".'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+from rest_framework import viewsets, permissions
+from rest_framework.response import Response
+from rest_framework import status
+from .models import CheckpointTemplate
+from .serializers import CheckpointTemplateSerializer
+
+class CheckpointTemplateViewSet(viewsets.ModelViewSet):
+
+    queryset = CheckpointTemplate.objects.filter(is_deleted=False)
+    serializer_class = CheckpointTemplateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    @action(detail=False, methods=['get'], url_path='all')
+    def get_all_templates(self, request):
+        templates = CheckpointTemplate.objects.filter(is_deleted=False)
+        result = [self._enrich_template(template) for template in templates]
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='by-shift-location/(?P<shift_id>[^/.]+)/(?P<location_id>[^/.]+)')
+    def by_shift_and_location(self, request, shift_id=None, location_id=None):
+        templates = CheckpointTemplate.objects.filter(
+            shift_id=shift_id,
+            location_id=location_id,
+            is_deleted=False
+        )
+        if not templates.exists():
+            return Response({"detail": "No templates found for this shift and location."}, status=status.HTTP_404_NOT_FOUND)
+
+        result = [self._enrich_template(template) for template in templates]
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='by-shift/(?P<shift_id>[^/.]+)')
+    def by_shift(self, request, shift_id=None):
+        templates = CheckpointTemplate.objects.filter(shift_id=shift_id, is_deleted=False)
+        if not templates.exists():
+            return Response({"detail": "No templates found for this shift."}, status=status.HTTP_404_NOT_FOUND)
+
+        result = []
+        for template in templates:
+            enriched_checkpoints = []
+            for item in template.checkpoints:
+                checkpoint_id = item.get("checkpoint_id")
+                time = item.get("time")
+                checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+                if checkpoint:
+                    enriched_checkpoints.append({
+                        "time": time,
+                        "checkpoint": {
+                            "id": str(checkpoint.id),
+                            "label": checkpoint.label,
+                            "type": checkpoint.type,
+                            "data": checkpoint.data,
+                            "latitude": checkpoint.latitude,
+                            "longitude": checkpoint.longitude,
+                            "location_id": checkpoint.location_id,
+                        }
+                    })
+            result.append({
+                "template_id": str(template.id),
+                "template_name": template.template_name,
+                "shift_id": str(template.shift_id),
+                "checkpoints": enriched_checkpoints
+            })
+
+        return Response(result, status=status.HTTP_200_OK)
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+    
+    def _enrich_template(self, template):
+        enriched_checkpoints = []
+        for item in template.checkpoints:
+            checkpoint_id = item.get("checkpoint_id")
+            time = item.get("time")
+            checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+            if checkpoint:
+                enriched_checkpoints.append({
+                    "time": time,
+                    "checkpoint": {
+                        "id": str(checkpoint.id),
+                        "label": checkpoint.label,
+                        "type": checkpoint.type,
+                        "data": checkpoint.data,
+                        "latitude": checkpoint.latitude,
+                        "longitude": checkpoint.longitude,
+                        "location_id": checkpoint.location_id,
+                    }
+                })
+        return {
+            "template_id": str(template.id),
+            "template_name": template.template_name,
+            "shift_id": str(template.shift_id),
+            "location_id": str(template.location_id),
+            "checkpoints": enriched_checkpoints
+        }
+
+    def perform_update(self, serializer):
+        serializer.save(modified_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        instance.delete(user=self.request.user)
+
+# from rest_framework.views import APIView
+# from rest_framework.response import Response
+# from rest_framework import status, permissions
+# from .models import CheckpointTemplate, Checkpoint
+# from .serializers import CheckpointTemplateSerializer
+# from django.shortcuts import get_object_or_404
+
+# class CheckpointTemplateByShiftView(APIView):
+#     permission_classes = [permissions.IsAuthenticated]
+
+#     def get(self, request, shift_id):
+#         templates = CheckpointTemplate.objects.filter(shift_id=shift_id, is_deleted=False)
+#         if not templates.exists():
+#             return Response({"detail": "No templates found for this shift."}, status=status.HTTP_404_NOT_FOUND)
+
+#         result = []
+#         for template in templates:
+#             enriched_checkpoints = []
+#             for item in template.checkpoints:
+#                 checkpoint_id = item.get("checkpoint_id")
+#                 time = item.get("time")
+#                 checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+#                 if checkpoint:
+#                     enriched_checkpoints.append({
+#                         "time": time,
+#                         "checkpoint": {
+#                             "id": str(checkpoint.id),
+#                             "label": checkpoint.label,
+#                             "type": checkpoint.type,
+#                             "data": checkpoint.data,
+#                             "latitude": checkpoint.latitude,
+#                             "longitude": checkpoint.longitude,
+#                             "location_id": checkpoint.location_id,
+#                         }
+#                     })
+#             result.append({
+#                 "template_id": str(template.id),
+#                 "template_name": template.template_name,
+#                 "shift_id": str(template.shift_id),
+#                 "checkpoints": enriched_checkpoints
+#             })
+
+#         return Response(result, status=status.HTTP_200_OK)
