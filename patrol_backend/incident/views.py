@@ -7,59 +7,71 @@ from .serializers import IncidentSerializer
 from twilio.rest import Client
 from django.utils import timezone
 import os
+import cloudinary
+import cloudinary.uploader
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.parsers import MultiPartParser
+from twilio.rest import Client
+from django.conf import settings
+
+# Cloudinary configuration (can also be placed in settings.py)
+# cloudinary.config(
+#     cloud_name=settings.CLOUDINARY_CLOUD_NAME,
+#     api_key=settings.CLOUDINARY_API_KEY,
+#     api_secret=settings.CLOUDINARY_API_SECRET
+# )
 
 class IncidentReportView(APIView):
+    parser_classes = [MultiPartParser]
+
     def post(self, request):
         data = request.data.copy()
         data['created_by'] = request.user.id
         data['location'] = request.user.location_id
         serializer = IncidentSerializer(data=data)
+
         if serializer.is_valid():
             incident = serializer.save()
 
+            # Upload media to Cloudinary
+            media_urls = []
+
+            if incident.photo:
+                upload_result = cloudinary.uploader.upload(incident.photo.path)
+                photo_url = upload_result.get('secure_url')
+                media_urls.append(photo_url)
+            else:
+                photo_url = "N/A"
+
+            if incident.video:
+                upload_result = cloudinary.uploader.upload(incident.video.path, resource_type="video")
+                video_url = upload_result.get('secure_url')
+                media_urls.append(video_url)
+
             # Twilio client setup
             client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
-            photo_filename = os.path.basename(incident.photo.name) if incident.photo else "N/A"            #Send WhatsApp message
+
             whatsapp_body = (
                 f"🚨 Incident Alert 🚨\n"
                 f"Severity: {incident.severity}\n"
                 f"Description: {incident.incident_description}\n"
                 f"Ticket: {incident.ticket_number}\n"
                 f"Status: {incident.status}\n"
-                f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}"
-                f"Photo: {photo_filename}"
+                f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
             )
 
-            # Media URLs (must be HTTPS and publicly accessible)
-            #media_urls = []
-            #if incident.photo:
-            #    media_urls=[incident.photo]  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
-            #else:
-            #    media_urls = None 
-            #if incident.video:
-            #    media_urls.append(incident.video)  # e.g., 'https://yourdomain.com/path/to/video.mp4'
-
-            #media_url = incident.photo.url if incident.photo else None
-            #media_url = [request.build_absolute_uri(incident.photo.url)] if incident.photo else None
-
-            #print ("media_urls:", media_urls)
-
+            # Send WhatsApp message
             message = client.messages.create(
-                 body=whatsapp_body,
-                 from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                 to='whatsapp:' + settings.ADMIN_WHATSAPP,
-                 #media_url=media_url                
+                body=whatsapp_body,
+                from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                media_url=media_urls if media_urls else None
             )
-            # # Print response details
-            print("Message SID:", message.sid)
-            print("Status:", message.status)
-            print("To:", message.to)
-            print("From:", message.from_)
-            print("Date Created:", message.date_created)
-            print("Media:", message.media)
 
-
-            #Trigger phone call
+            #         #Trigger phone call
 
             client.calls.create(
                  twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
@@ -67,8 +79,80 @@ class IncidentReportView(APIView):
                  from_=settings.TWILIO_PHONE
             )
 
+            # Log message details
+            print("Message SID:", message.sid)
+            print("Status:", message.status)
+            print("To:", message.to)
+            print("From:", message.from_)
+            print("Date Created:", message.date_created)
+            print("Media:", message.media)
+
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    #/////////////29-Oct/////////////
+    # def post(self, request):
+    #     data = request.data.copy()
+    #     data['created_by'] = request.user.id
+    #     data['location'] = request.user.location_id
+    #     serializer = IncidentSerializer(data=data)
+    #     if serializer.is_valid():
+    #         incident = serializer.save()
+
+    #         # Twilio client setup
+    #         client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
+    #         photo_filename = os.path.basename(incident.photo.name) if incident.photo else "N/A"            #Send WhatsApp message
+    #         whatsapp_body = (
+    #             f"🚨 Incident Alert 🚨\n"
+    #             f"Severity: {incident.severity}\n"
+    #             f"Description: {incident.incident_description}\n"
+    #             f"Ticket: {incident.ticket_number}\n"
+    #             f"Status: {incident.status}\n"
+    #             f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}"
+    #             f"Photo: {photo_filename}"
+    #         )
+
+    #         # Media URLs (must be HTTPS and publicly accessible)
+    #         media_urls = []
+    #         if incident.photo:
+    #            media_urls=[incident.photo]  # e.g., 'http://localhost:8000/media/incidents/EAF399B3-396/1.jpg'
+    #         else:
+    #            media_urls = None 
+    #         if incident.video:
+    #            media_urls.append(incident.video)  # e.g., 'https://yourdomain.com/path/to/video.mp4'
+
+    #         #media_url = incident.photo.url if incident.photo else None
+    #         #media_url = [request.build_absolute_uri(incident.photo.url)] if incident.photo else None
+
+    #         #print ("media_urls:", media_urls)
+
+    #         message = client.messages.create(
+    #              body=whatsapp_body,
+    #              from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+    #              to='whatsapp:' + settings.ADMIN_WHATSAPP,
+    #              media_url=media_urls                
+    #         )
+    #         # # Print response details
+    #         print("Message SID:", message.sid)
+    #         print("Status:", message.status)
+    #         print("To:", message.to)
+    #         print("From:", message.from_)
+    #         print("Date Created:", message.date_created)
+    #         print("Media:", message.media)
+
+
+    #         #Trigger phone call
+
+    #         # client.calls.create(
+    #         #      twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
+    #         #      to=settings.ADMIN_PHONE,
+    #         #      from_=settings.TWILIO_PHONE
+    #         # )
+
+    #         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    #     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    #/////////////29-Oct/////////////
+
 
 class IncidentAssignView(APIView):
     def post(self, request, ticket_number):

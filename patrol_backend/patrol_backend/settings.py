@@ -46,7 +46,8 @@ INSTALLED_APPS = [
     'dashboard',
     'corsheaders',
     'incident',
-]
+    'django_celery_beat',
+    ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -185,3 +186,15 @@ TWILIO_WHATSAPP_NUMBER = '+14155238886'  # Twilio sandbox WhatsApp number
 # Admin contact
 ADMIN_PHONE = '+918946066577'  # Admin's mobile number for voice call
 ADMIN_WHATSAPP = '+918946066577'  # Admin's WhatsApp number
+
+#DEFAULT_FROM_EMAIL='ravee.t@gmail.com'
+
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
+cloudinary.config( 
+  cloud_name = 'dtinhrjd1', 
+  api_key = '255461719934117', 
+  api_secret = 'DB1glK8yEP0nmpH9nCO8UFt-BOQ' 
+)
