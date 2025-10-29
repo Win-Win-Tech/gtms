@@ -39,7 +39,8 @@ class IncidentReportView(APIView):
             media_urls = []
 
             if incident.photo:
-                upload_result = cloudinary.uploader.upload(incident.photo.path)
+#               upload_result = cloudinary.uploader.upload(incident.photo.path)
+                upload_result = cloudinary.uploader.upload(incident.photo.file)
                 photo_url = upload_result.get('secure_url')
                 media_urls.append(photo_url)
             else:
