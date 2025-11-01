@@ -24,73 +24,152 @@ from django.conf import settings
 # )
 
 class IncidentReportView(APIView):
-    parser_classes = [MultiPartParser]
+        parser_classes = [MultiPartParser]
 
-    def post(self, request):
-        data = request.data.copy()
-        data['created_by'] = request.user.id
-        data['location'] = request.user.location_id
-        serializer = IncidentSerializer(data=data)
+        def post(self, request):
+            data = request.data.copy()
+            data['created_by'] = request.user.id
+            data['location'] = request.user.location_id
+            serializer = IncidentSerializer(data=data)
 
-        if serializer.is_valid():
-            incident = serializer.save()
+            if serializer.is_valid():
+                incident = serializer.save()
 
-            # Upload media to Cloudinary
-            media_urls = []
+                # Upload media to Cloudinary
+                media_urls = []
+                photo_url = None
+                video_url = None
 
-            if incident.photo:
-#               upload_result = cloudinary.uploader.upload(incident.photo.path)
-                upload_result = cloudinary.uploader.upload(incident.photo.file)
-                photo_url = upload_result.get('secure_url')
-                media_urls.append(photo_url)
-            else:
-                photo_url = "N/A"
+                if incident.photo:
+                    upload_result = cloudinary.uploader.upload(incident.photo.file)
+                    photo_url = upload_result.get('secure_url')
+                    media_urls.append(photo_url)
 
-            if incident.video:
-                upload_result = cloudinary.uploader.upload(incident.video.path, resource_type="video")
-                video_url = upload_result.get('secure_url')
-                media_urls.append(video_url)
+                if incident.video:
+                    upload_result = cloudinary.uploader.upload(
+                        incident.video.file,
+                        resource_type="video"
+                    )
+                    video_url = upload_result.get('secure_url')
+                    media_urls.append(video_url)
 
-            # Twilio client setup
-            client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
+                # Twilio client setup
+                client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
 
-            whatsapp_body = (
-                f"🚨 Incident Alert 🚨\n"
-                f"Severity: {incident.severity}\n"
-                f"Description: {incident.incident_description}\n"
-                f"Ticket: {incident.ticket_number}\n"
-                f"Status: {incident.status}\n"
-                f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
-            )
+                whatsapp_body = (
+                    f"🚨 Incident Alert 🚨\n"
+                    f"Severity: {incident.severity}\n"
+                    f"Description: {incident.incident_description}\n"
+                    f"Ticket: {incident.ticket_number}\n"
+                    f"Status: {incident.status}\n"
+                    f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
+                )
 
-            # Send WhatsApp message
-            message = client.messages.create(
-                body=whatsapp_body,
-                from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                to='whatsapp:' + settings.ADMIN_WHATSAPP,
-                media_url=media_urls if media_urls else None
-            )
+                # Send WhatsApp message with photo or text
+                if photo_url:
+                    client.messages.create(
+                        body=whatsapp_body,
+                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                        to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                        media_url=[photo_url]
+                    )
+                else:
+                    client.messages.create(
+                        body=whatsapp_body,
+                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                        to='whatsapp:' + settings.ADMIN_WHATSAPP
+                    )
 
-            #         #Trigger phone call
+                # Send video separately if present
+                if video_url:
+                    client.messages.create(
+                        body=f"🎥 Incident Video for Ticket {incident.ticket_number}",
+                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                        to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                        media_url=[video_url]
+                    )
 
-            client.calls.create(
-                 twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
-                 to=settings.ADMIN_PHONE,
-                 from_=settings.TWILIO_PHONE
-            )
+                # Trigger phone call
+                client.calls.create(
+                    twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
+                    to=settings.ADMIN_PHONE,
+                    from_=settings.TWILIO_PHONE
+                )
 
-            # Log message details
-            print("Message SID:", message.sid)
-            print("Status:", message.status)
-            print("To:", message.to)
-            print("From:", message.from_)
-            print("Date Created:", message.date_created)
-            print("Media:", message.media)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+# class IncidentReportView(APIView):
+#     parser_classes = [MultiPartParser]
+
+#     def post(self, request):
+#         data = request.data.copy()
+#         data['created_by'] = request.user.id
+#         data['location'] = request.user.location_id
+#         serializer = IncidentSerializer(data=data)
+
+#         if serializer.is_valid():
+#             incident = serializer.save()
+
+#             # Upload media to Cloudinary
+#             media_urls = []
+
+#             if incident.photo:
+# #               upload_result = cloudinary.uploader.upload(incident.photo.path)
+#                 upload_result = cloudinary.uploader.upload(incident.photo.file)
+#                 photo_url = upload_result.get('secure_url')
+#                 media_urls.append(photo_url)
+#             else:
+#                 photo_url = "N/A"
+
+#             if incident.video:
+#                 upload_result = cloudinary.uploader.upload(incident.video.path, resource_type="video")
+#                 video_url = upload_result.get('secure_url')
+#                 media_urls.append(video_url)
+
+#             # Twilio client setup
+#             client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
+
+#             whatsapp_body = (
+#                 f"🚨 Incident Alert 🚨\n"
+#                 f"Severity: {incident.severity}\n"
+#                 f"Description: {incident.incident_description}\n"
+#                 f"Ticket: {incident.ticket_number}\n"
+#                 f"Status: {incident.status}\n"
+#                 f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}\n"
+#                 f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
+#             )
+
+#             # Send WhatsApp message
+#             message = client.messages.create(
+#                 body=whatsapp_body,
+#                 from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+#                 to='whatsapp:' + settings.ADMIN_WHATSAPP,
+#                 media_url=media_urls if media_urls else None
+#             )
+
+#             #         #Trigger phone call
+
+#             client.calls.create(
+#                  twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
+#                  to=settings.ADMIN_PHONE,
+#                  from_=settings.TWILIO_PHONE
+#             )
+
+#             # Log message details
+#             print("Message SID:", message.sid)
+#             print("Status:", message.status)
+#             print("To:", message.to)
+#             print("From:", message.from_)
+#             print("Date Created:", message.date_created)
+#             print("Media:", message.media)
+
+#             return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     #/////////////29-Oct/////////////
     # def post(self, request):
     #     data = request.data.copy()

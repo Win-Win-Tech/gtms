@@ -32,6 +32,7 @@ from rest_framework import generics
 import os
 from django.conf import settings
 from django.utils.timezone import make_aware, is_aware, get_current_timezone
+from rest_framework.permissions import AllowAny
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -572,8 +573,9 @@ from openpyxl import Workbook
 from io import BytesIO
 
 class DashboardCheckInReportExcelView(APIView):
+    
 #    permission_classes = [IsAuthenticated]
-
+    permission_classes = [AllowAny]
     def get(self, request):
         # Parse filters
         filter_type = request.query_params.get('filter', 'today')
@@ -718,6 +720,17 @@ class AttendanceCheckinExportView(APIView):
             queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
         elif date_filter == "month":
             queryset = queryset.filter(checkin_time__date__month=today.month)
+        elif date_filter == "custom":
+            # Handle custom date range
+            start_date_str = request.query_params.get("start_date")
+            end_date_str = request.query_params.get("end_date")
+            try:
+                if start_date_str and end_date_str:
+                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+                    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+                    queryset = queryset.filter(checkin_time__date__range=(start_date, end_date))
+            except ValueError:
+                return Response({"error": "Invalid custom date format. Use YYYY-MM-DD."}, status=400)
 
         # Additional filters
         guard_id = request.query_params.get("guard")
@@ -745,17 +758,105 @@ class AttendanceCheckinExportView(APIView):
         ws = wb.active
         ws.title = "Attendance Checkins"
 
-        # Header
-        ws.append(["Guard", "Shift", "Location", "Checkin Time", "Checkout Time", "Status"])
+        # # Header
+        # ws.append(["Guard", "Shift", "Location", "Checkin Time", "Checkout Time", "Status"])
+
+        # for obj in queryset:
+        #     ws.append([
+        #         obj.guard.name,
+        #         obj.shift.name if obj.shift else "",
+        #         obj.org_location.name if obj.org_location else "",
+        #         obj.checkin_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkin_time else "",
+        #         obj.checkout_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkout_time else "",
+        #         obj.status
+        #     ])
+
+
+        # Header with reordered columns and added Date + Duration
+        ws.append(["Date", "Name", "Shift", "Location", "Checkin Time", "Checkout Time", "Duration (HH:MM)","Status", "Remarks"])
+
+        # for obj in queryset:
+        #     checkin = obj.checkin_time
+        #     checkout = obj.checkout_time
+        #     duration = ""
+        #     if checkin and checkout:
+        #         delta = checkout - checkin
+        #         hours, remainder = divmod(delta.total_seconds(), 3600)
+        #         minutes = remainder // 60
+        #         duration = f"{int(hours):02}:{int(minutes):02}"
+
+        #     ws.append([
+        #         checkin.strftime('%Y-%m-%d') if checkin else "",
+        #         obj.shift.name if obj.shift else "",
+        #         obj.guard.name,
+        #         obj.org_location.name if obj.org_location else "",
+        #         checkin.strftime('%Y-%m-%d %H:%M:%S') if checkin else "",
+        #         checkout.strftime('%Y-%m-%d %H:%M:%S') if checkout else "",
+        #         obj.status,
+        #         duration
+        #     ])
 
         for obj in queryset:
+            checkin = obj.checkin_time
+            checkout = obj.checkout_time
+            shift = obj.shift
+            attendance_status = ""
+            other_statuses = []
+            duration = ""
+
+            if shift:
+                shift_start = datetime.combine(checkin.date(), shift.start_time) if checkin else None
+                shift_end = datetime.combine(checkin.date(), shift.end_time)
+
+            if checkin and checkout:
+                # Duration
+                delta = checkout - checkin
+                total_hours = delta.total_seconds() / 3600
+                hours, remainder = divmod(delta.total_seconds(), 3600)
+                minutes = remainder // 60
+                duration = f"{int(hours):02}:{int(minutes):02}"
+
+                # Attendance Status
+                if total_hours <= 6:
+                    attendance_status = "Absent"
+                elif 6 < total_hours <= 8:
+                    attendance_status = "Present"
+                elif total_hours >= 8:
+                    attendance_status = "Overtime"
+
+                # Check-in Timing
+                if shift_start:
+                    checkin_diff = abs((checkin - shift_start).total_seconds()) / 60
+                    if checkin_diff <= 30:
+                        other_statuses.append("On-time Checked-in")
+                    elif checkin > shift_start + timedelta(minutes=30):
+                        other_statuses.append("Delay Checked-in")
+
+                # Check-out Timing
+                checkout_diff = abs((checkout - shift_end).total_seconds()) / 60
+                if checkout_diff <= 30:
+                    other_statuses.append("On-time Checked-out")
+                elif checkout < shift_end and checkout_diff < 30:
+                    other_statuses.append("Early Checked-out")
+
+            elif checkin and not checkout:
+                attendance_status = ""
+                other_statuses.append("Missed Checked-out")
+            elif not checkin and shift:
+                attendance_status = ""
+                other_statuses.append("Missed Check-in")
+
             ws.append([
+                checkin.strftime('%Y-%m-%d') if checkin else "",
                 obj.guard.name,
-                obj.shift.name if obj.shift else "",
+                shift.name if shift else "",
                 obj.org_location.name if obj.org_location else "",
-                obj.checkin_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkin_time else "",
-                obj.checkout_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkout_time else "",
-                obj.status
+                checkin.strftime('%Y-%m-%d %H:%M:%S') if checkin else "",
+                checkout.strftime('%Y-%m-%d %H:%M:%S') if checkout else "",
+                duration,
+                attendance_status,
+                ", ".join(other_statuses)
+             
             ])
 
         # Save file
