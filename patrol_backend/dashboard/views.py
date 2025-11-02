@@ -572,6 +572,124 @@ from datetime import datetime, timedelta
 from openpyxl import Workbook
 from io import BytesIO
 
+
+def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None):
+    """
+    Internal helper function to generate check-in Excel report.
+    This contains the business logic that both the API endpoint and Celery tasks can use.
+    
+    Returns: dict with 'file_path' and 'download_url'
+    """
+    today = timezone.now().date()
+
+    if filter_type == 'today':
+        start = datetime.combine(today, datetime.min.time())
+        end = datetime.combine(today, datetime.max.time())
+    elif filter_type == 'this_week':
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        start = datetime.combine(start, datetime.min.time())
+        end = datetime.combine(end, datetime.max.time())
+    elif filter_type == 'this_month':
+        start = datetime(today.year, today.month, 1)
+        next_month = start.replace(day=28) + timedelta(days=4)
+        end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+    elif filter_type == 'custom' and start_date and end_date:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    else:
+        raise ValueError("Invalid filter or missing dates")
+
+    assignments = Assignment.objects.filter(
+        start_date__lte=end.date(),
+        end_date__gte=start.date()
+    )
+
+    if user_id:
+        assignments = assignments.filter(guard_id=user_id)
+    if location_id:
+        assignments = assignments.filter(location_id=location_id)
+
+    # Create Excel workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Check-In Report"
+
+    # Header row
+    headers = [
+        'Guard ID', 'Guard Name', 'Checkpoint ID', 'Checkpoint Name',
+        'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)'
+    ]
+    ws.append(headers)
+
+    for assignment in assignments:
+        guard = assignment.guard
+        shift = assignment.shift
+        for cp in assignment.checkpoints:
+            checkpoint_id = cp.get('checkpoint_id')
+            expected_time_str = cp.get('time')
+            expected_time = datetime.combine(assignment.start_date, datetime.strptime(expected_time_str, "%H:%M").time())
+
+            checkin = CheckIn.objects.filter(
+                guard=guard,
+                shift=shift,
+                checkpoint_id=checkpoint_id,
+                timestamp__range=(start, end)
+            ).order_by('timestamp').first()
+
+            actual_time = checkin.timestamp if checkin else None
+            delay = None
+            status = "Missed"
+
+            expected_time = make_aware(expected_time)
+
+            if actual_time and expected_time:
+                if is_aware(actual_time):
+                    actual_time = actual_time.replace(tzinfo=None)
+                if is_aware(expected_time):
+                    expected_time = expected_time.replace(tzinfo=None)
+
+                delay = int((actual_time - expected_time).total_seconds() / 60)
+                if delay <= 15:
+                    status = "On Time"
+                elif 15 < delay <= 30:
+                    status = "Delayed"
+                else:
+                    status = "Missed"
+
+            checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
+
+            ws.append([
+                str(guard.id),
+                guard.name,
+                str(checkpoint_id),
+                checkpoint_name,
+                expected_time.strftime("%Y-%m-%d %H:%M"),
+                actual_time.strftime("%Y-%m-%d %H:%M") if actual_time else "",
+                status,
+                delay if delay is not None else ""
+            ])
+
+    # Save to in-memory buffer
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    # Define file path
+    filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+
+    # Save file to MEDIA directory
+    with open(file_path, 'wb') as f:
+        f.write(buffer.getvalue())
+
+    return {
+        'file_path': file_path,
+        'filename': filename
+    }
+
+
+
 class DashboardCheckInReportExcelView(APIView):
     
 #    permission_classes = [IsAuthenticated]
