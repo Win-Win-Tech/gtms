@@ -1,39 +1,53 @@
-from rest_framework.views import APIView
-from tourlog.models import TourLog
-from authapp.models import User
-from django.db.models import Count, Avg
-from rest_framework import viewsets, status
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from geopy.distance import geodesic
-from django.utils import timezone
-from datetime import date, datetime
-from .models import AttendanceCheckin, CheckInLog
-from .serializers import AttendanceCheckinSerializer, AttendanceCheckinDashboardSerializer
-from scheduler.models import Assignment
-from django.utils.timezone import localtime, make_aware
-from datetime import  datetime, timedelta
-from django.core.serializers import serialize
+# Standard library imports
+import csv
 import json
-from django.utils.timezone import now
-from scheduler.models import Assignment
-from checkin.models import CheckIn
-import pytz
-from django.utils.timezone import is_aware, is_naive
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from django.utils import timezone
-from datetime import timedelta, datetime
-from checkin.models import CheckIn
-from authapp.models import User
-from scheduler.models import Checkpoint, Assignment
-from .serializers import CheckInReportSerializer
-from rest_framework import generics
 import os
-from django.conf import settings
-from django.utils.timezone import make_aware, is_aware, get_current_timezone
-from rest_framework.permissions import AllowAny
+from calendar import monthrange
 from collections import defaultdict
+from datetime import date, datetime, timedelta
+from io import BytesIO
+
+# Third-party imports
+import pytz
+from geopy.distance import geodesic
+from openpyxl import Workbook
+
+# Django imports
+from django.conf import settings
+from django.core.serializers import serialize
+from django.db.models import Avg, Count, Q
+from django.http import HttpResponse
+from django.utils import timezone
+from django.utils.dateparse import parse_date
+from django.utils.timezone import (
+    get_current_timezone,
+    is_aware,
+    is_naive,
+    localtime,
+    make_aware,
+    now,
+)
+
+# Django REST Framework imports
+from rest_framework import generics, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.viewsets import ViewSet
+
+# Local app imports
+from authapp.models import User
+from checkin.models import CheckIn
+from scheduler.models import Assignment, Checkpoint, Location
+from tourlog.models import TourLog
+
+from .models import AttendanceCheckin, CheckInLog
+from .serializers import (
+    AttendanceCheckinDashboardSerializer,
+    AttendanceCheckinSerializer,
+    CheckInReportSerializer,
+)
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -67,8 +81,6 @@ class TourStatsView(APIView):
             "completion_rate": round((completed / total) * 100, 2) if total else 0
         })
 
-import csv
-from django.http import HttpResponse
 
 class ExportTourLogsCSV(APIView):
     def get(self, request):
@@ -87,7 +99,6 @@ class ExportTourLogsCSV(APIView):
             ])
         return response
 
-from checkin.models import CheckIn
 
 class PatrolRouteView(APIView):
     def get(self, request, guard_id):
@@ -380,144 +391,230 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
     # views.py
 
+# ============================================================================
+# CORE FUNCTION: Shared business logic for check-in reports
+# ============================================================================
+
+def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None):
+    """
+    Internal helper function that contains ALL business logic for check-in reports.
+    This ensures consistency across JSON API, Excel exports, and Celery tasks.
+    
+    Args:
+        filter_type: 'today', 'this_week', 'this_month', or 'custom'
+        start_date_str: For custom filter (YYYY-MM-DD string)
+        end_date_str: For custom filter (YYYY-MM-DD string)
+        user_id: Optional UUID string to filter by guard
+        location_id: Optional UUID string to filter by location
+    
+    Returns:
+        List of dicts with report data:
+        [{
+            'date': '2025-11-05',
+            'guard_id': UUID,
+            'guard_name': str,
+            'location_id': str,
+            'location_name': str,
+            'shift_id': str,
+            'shift_name': str,
+            'checkpoint_id': str,
+            'checkpoint_name': str,
+            'expected_time': datetime,
+            'actual_checkin_time': datetime or None,
+            'status': 'On Time' | 'Delayed' | 'Missed',
+            'delay_minutes': int or None
+        }, ...]
+    """
+    from django.utils.timezone import now as django_now
+    
+    today = timezone.now().date()
+    
+    # Parse filter and determine date range
+    if filter_type == 'today':
+        start = datetime.combine(today, datetime.min.time())
+        end = datetime.combine(today, datetime.max.time())
+    elif filter_type == 'this_week':
+        start = today - timedelta(days=today.weekday())
+        end = start + timedelta(days=6)
+        start = datetime.combine(start, datetime.min.time())
+        end = datetime.combine(end, datetime.max.time())
+    elif filter_type == 'this_month':
+        start = datetime(today.year, today.month, 1)
+        next_month = start.replace(day=28) + timedelta(days=4)
+        end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+    elif filter_type == 'custom' and start_date_str and end_date_str:
+        try:
+            start = datetime.strptime(start_date_str, "%Y-%m-%d")
+            end = datetime.strptime(end_date_str, "%Y-%m-%d")
+            end = datetime.combine(end.date(), datetime.max.time())
+        except ValueError as e:
+            raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
+    else:
+        raise ValueError("Invalid filter or missing dates")
+    
+    # Get assignments that overlap with the date range
+    assignments = Assignment.objects.filter(
+        start_date__lte=end.date(),
+        end_date__gte=start.date()
+    ).select_related('guard', 'location', 'shift')
+    
+    if user_id:
+        assignments = assignments.filter(guard_id=user_id)
+    if location_id:
+        assignments = assignments.filter(location_id=location_id)
+    
+    report = []
+    
+    # Generate date range for the filter period
+    date_range = []
+    current_date = start.date()
+    while current_date <= end.date():
+        date_range.append(current_date)
+        current_date += timedelta(days=1)
+    
+    for assignment in assignments:
+        guard = assignment.guard
+        shift = assignment.shift
+        location = assignment.location
+        
+        # For each checkpoint in the assignment
+        for cp in assignment.checkpoints:
+            checkpoint_id = cp.get('checkpoint_id')
+            expected_time_str = cp.get('time')
+            
+            # Validate checkpoint data
+            if not checkpoint_id or not expected_time_str:
+                continue  # Skip invalid checkpoint entries
+            
+            try:
+                expected_time_obj = datetime.strptime(expected_time_str, "%H:%M").time()
+            except ValueError:
+                continue  # Skip invalid time format
+            
+            # Get checkpoint name (with error handling)
+            try:
+                checkpoint = Checkpoint.objects.get(id=checkpoint_id)
+                checkpoint_name = checkpoint.label
+            except Checkpoint.DoesNotExist:
+                checkpoint_name = "Unknown Checkpoint"
+                continue  # Skip if checkpoint doesn't exist
+            
+            # For each date in the range where the assignment is active
+            for check_date in date_range:
+                # Only process if assignment is active on this date
+                if not (assignment.start_date <= check_date <= assignment.end_date):
+                    continue
+                
+                # Calculate expected time for this specific date
+                expected_datetime = datetime.combine(check_date, expected_time_obj)
+                
+                # Define the search window for this specific date's check-in
+                day_start = datetime.combine(check_date, datetime.min.time())
+                day_end = datetime.combine(check_date, datetime.max.time())
+                
+                # Query for check-ins on this specific date
+                checkin = CheckIn.objects.filter(
+                    guard=guard,
+                    shift=shift,
+                    checkpoint_id=checkpoint_id,
+                    timestamp__gte=day_start,
+                    timestamp__lte=day_end
+                ).order_by('timestamp').first()
+                
+                actual_time = None
+                delay = None
+                status = "Missed"
+                
+                # Process check-in if found
+                if checkin:
+                    # Check if it's synced
+                    if not checkin.synced:
+                        # Unsynced check-in (offline mode) - treat as missed
+                        status = "Missed"
+                        actual_time = None
+                        delay = None
+                    else:
+                        # Valid synced check-in
+                        actual_time = checkin.timestamp
+                        
+                        # Calculate delay in minutes
+                        delay = int((actual_time - expected_datetime).total_seconds() / 60)
+                        
+                        # Determine status based on delay
+                        if delay <= 15:
+                            status = "On Time"
+                        elif 15 < delay <= 30:
+                            status = "Delayed"
+                        else:
+                            status = "Missed"
+                
+                # Add to report
+                report.append({
+                    'date': check_date.strftime('%Y-%m-%d'),
+                    'guard_id': str(guard.id),
+                    'guard_name': guard.name,
+                    'location_id': str(location.id) if location else None,
+                    'location_name': location.name if location else "",
+                    'shift_id': str(shift.id) if shift else None,
+                    'shift_name': shift.name if shift else "",
+                    'checkpoint_id': str(checkpoint_id),
+                    'checkpoint_name': checkpoint_name,
+                    'expected_time': expected_datetime,
+                    'actual_checkin_time': actual_time,
+                    'status': status,
+                    'delay_minutes': delay
+                })
+    
+    return report
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
 class DashboardCheckInReportView(APIView):
+    """
+    API endpoint that returns check-in report data as JSON.
+    Used by the frontend dashboard for real-time display.
+    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        # Parse filters
+        # Parse filters from request
         filter_type = request.query_params.get('filter', 'today')
         start_date = request.query_params.get('start_date')
         end_date = request.query_params.get('end_date')
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
-
-        #today = timezone.localdate()
-        #now = timezone.now()
-
-        today = timezone.now().date()
-        now = timezone.now()
-
-        if filter_type == 'today':
-            start = datetime.combine(today, datetime.min.time())
-            end = datetime.combine(today, datetime.max.time())
-        elif filter_type == 'this_week':
-            start = today - timedelta(days=today.weekday())
-            end = start + timedelta(days=6)
-            start = datetime.combine(start, datetime.min.time())
-            end = datetime.combine(end, datetime.max.time())
-        elif filter_type == 'this_month':
-            start = datetime(today.year, today.month, 1)
-            next_month = start.replace(day=28) + timedelta(days=4)
-            end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
-        elif filter_type == 'custom' and start_date and end_date:
-            start = datetime.strptime(start_date, "%Y-%m-%d")
-            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-        else:
-            return Response({"error": "Invalid filter or missing dates"}, status=400)
-
-        assignments = Assignment.objects.filter(
-            start_date__lte=end.date(),
-            end_date__gte=start.date()
-        )
-
-        if user_id:
-            assignments = assignments.filter(guard_id=user_id)
-        if location_id:
-            assignments = assignments.filter(location_id=location_id)
-
-        report = []
-
-        for assignment in assignments:
-            guard = assignment.guard
-            shift = assignment.shift
-            for cp in assignment.checkpoints:
-                checkpoint_id = cp.get('checkpoint_id')
-                expected_time_str = cp.get('time')
-                expected_time = datetime.combine(assignment.start_date, datetime.strptime(expected_time_str, "%H:%M").time())
-
-                checkin = CheckIn.objects.filter(
-                    guard=guard,
-                    shift=shift,
-                    checkpoint_id=checkpoint_id,
-                    timestamp__range=(start, end)
-                ).order_by('timestamp').first()
-
-                actual_time = checkin.timestamp if checkin else None
-                delay = None
-                status = "-"
-                #print("checkin.synced", checkin.synced)
-                expected_time = make_aware(expected_time)
-                formatted_time = None
-
-                # if actual_time and expected_time:
-                #     # Convert aware datetime to naive if needed
-                #     if is_aware(actual_time):
-                #         actual_time = actual_time.replace(tzinfo=None)
-                #     if is_aware(expected_time):
-                #         expected_time = expected_time.replace(tzinfo=None)
-                if checkin and not checkin.synced:
-                    status = "Missed"
-                    formatted_time = "-"
-                    delay = 0
-                elif actual_time and expected_time:
-                    # Convert to aware IST if naive
-                    if not is_aware(actual_time):
-                        actual_time = make_aware(actual_time, get_current_timezone())
-                    if not is_aware(expected_time):
-                        expected_time = make_aware(expected_time, get_current_timezone())
-
-                    # Convert both to UTC
-
-                    # Convert both to IST for display
-                    ist = timezone.get_current_timezone()
-                    #actual_time = actual_time.astimezone(ist)
-                    expected_time = expected_time.astimezone(ist)
-
-#                    actual_time = actual_time.astimezone(timezone.utc)
-#                    expected_time = expected_time.astimezone(timezone.utc)
-
-
-                #if actual_time:
-                    delay = int((actual_time - expected_time).total_seconds() / 60)
-                    if delay <= 15:
-                        status = "On Time"
-                    elif 15 < delay <= 30:
-                        status = "Delayed"
-                    else:
-                        status = "Missed"
-
-                checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
-                #print("EXPECTED TIME", expected_time)
-                #print("ACT TIME", actual_time)
-                print("checkin", checkin)
-
-                try:
-                    if checkin.synced is False:
-                        actual_time=None
-                except Exception as e:
-                    print("eeeeeee", e)
-
-                if actual_time:
-                    formatted_time = actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S')
-                else:
-                    formatted_time = None
-
-                report.append({
-                    'guard_id': guard.id,
-                    'guard_name': guard.name,
-                    'checkpoint_id': checkpoint_id,
-                    'checkpoint_name': checkpoint_name,
-#                    'expected_time': expected_time,
-                    'expected_time': expected_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    #'actual_checkin_time': actual_time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'actual_checkin_time': formatted_time,
-#                    'actual_checkin_time': actual_time.astimezone(timezone.get_current_timezone()).strftime('%Y-%m-%d %H:%M:%S'),
-                    'status': status,
-                    'delay_minutes': delay
-                })
-
-        serializer = CheckInReportSerializer(report, many=True)
-        return Response(serializer.data)
+        
+        try:
+            # Get report data using shared core function
+            report_data = _get_checkin_report_data(
+                filter_type=filter_type,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                user_id=user_id,
+                location_id=location_id
+            )
+            
+            # Format datetime fields for JSON response
+            for item in report_data:
+                if item['expected_time']:
+                    item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
+                if item['actual_checkin_time']:
+                    item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Serialize and return
+            serializer = CheckInReportSerializer(report_data, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while generating the report: {str(e)}"}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 class AttendanceCheckinListView(generics.ListAPIView):
     serializer_class = AttendanceCheckinDashboardSerializer
@@ -528,9 +625,7 @@ class AttendanceCheckinListView(generics.ListAPIView):
         #today = timezone.localdate()
         date_filter = self.request.query_params.get("date_filter", "today")
 
-        naive_dt = datetime.now()  # Naive datetime
-        aware_dt = make_aware(naive_dt)  # Convert to aware
-        today = localtime(aware_dt)   # Now it's safe to use
+        today = datetime.now().date()
 
         if date_filter == "today":
             queryset = queryset.filter(checkin_time__date=today)
@@ -563,20 +658,86 @@ class AttendanceCheckinListView(generics.ListAPIView):
             queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
 
         return queryset
+
+
+def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None):
+    """
+    Internal helper function to generate check-in Excel report.
+    Used by both the API endpoint and Celery tasks.
     
-from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from django.utils.timezone import make_aware, is_aware
-from django.http import HttpResponse
-from datetime import datetime, timedelta
-from openpyxl import Workbook
-from io import BytesIO
+    Args:
+        filter_type: 'today', 'this_week', 'this_month', or 'custom'
+        start_date: For custom filter (YYYY-MM-DD string)
+        end_date: For custom filter (YYYY-MM-DD string)
+        user_id: Optional UUID string to filter by guard
+        location_id: Optional UUID string to filter by location
+    
+    Returns:
+        dict with 'file_path', 'filename', and 'row_count'
+    """
+    # Get report data using shared core function
+    report_data = _get_checkin_report_data(
+        filter_type=filter_type,
+        start_date_str=start_date,
+        end_date_str=end_date,
+        user_id=user_id,
+        location_id=location_id
+    )
+    
+    # Create Excel workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Check-In Report"
+
+    # Header row
+    headers = [
+        'Shift Date', 'Guard', 'Shift Name', 'Checkpoint Name',
+        'Scheduled', 'Scanned', 'Status', 'Delay (minutes)'
+    ]
+    ws.append(headers)
+
+    row_count = 0
+    for item in report_data:
+        ws.append([
+            item['date'],
+            item['guard_name'],
+            item['shift_name'],
+            item['checkpoint_name'],
+            item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
+            item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
+            item['status'],
+            item['delay_minutes'] if item['delay_minutes'] is not None else ""
+        ])
+        row_count += 1
+
+    # Save to in-memory buffer
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    # Define file path
+    filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+
+    # Save file to MEDIA directory
+    with open(file_path, 'wb') as f:
+        f.write(buffer.getvalue())
+
+    return {
+        'file_path': file_path,
+        'filename': filename,
+        'row_count': row_count
+    }
+
+
 
 class DashboardCheckInReportExcelView(APIView):
+    """
+    API endpoint that generates and returns an Excel file download URL.
+    Used by the frontend for exporting check-in reports.
+    """
+    permission_classes = [IsAuthenticated]  # Fixed: Added authentication requirement
     
-#    permission_classes = [IsAuthenticated]
-    permission_classes = [AllowAny]
     def get(self, request):
         # Parse filters
         filter_type = request.query_params.get('filter', 'today')
@@ -584,385 +745,451 @@ class DashboardCheckInReportExcelView(APIView):
         end_date = request.query_params.get('end_date')
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
+        
+        try:
+            # Get report data using shared core function
+            report_data = _get_checkin_report_data(
+                filter_type=filter_type,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                user_id=user_id,
+                location_id=location_id
+            )
+            
+            # Create Excel workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Check-In Report"
 
-        today = timezone.now().date()
-        now = timezone.now()
+            # Header row
+            headers = [
+                'Date', 'Guard', 'Shift Name', 'Checkpoint Name',
+                'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)'
+            ]
+            ws.append(headers)
 
-        if filter_type == 'today':
-            start = datetime.combine(today, datetime.min.time())
-            end = datetime.combine(today, datetime.max.time())
-        elif filter_type == 'this_week':
-            start = today - timedelta(days=today.weekday())
-            end = start + timedelta(days=6)
-            start = datetime.combine(start, datetime.min.time())
-            end = datetime.combine(end, datetime.max.time())
-        elif filter_type == 'this_month':
-            start = datetime(today.year, today.month, 1)
-            next_month = start.replace(day=28) + timedelta(days=4)
-            end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
-        elif filter_type == 'custom' and start_date and end_date:
-            start = datetime.strptime(start_date, "%Y-%m-%d")
-            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
-        else:
-            return Response({"error": "Invalid filter or missing dates"}, status=400)
-
-        assignments = Assignment.objects.filter(
-            start_date__lte=end.date(),
-            end_date__gte=start.date()
-        )
-
-        if user_id:
-            assignments = assignments.filter(guard_id=user_id)
-        if location_id:
-            assignments = assignments.filter(location_id=location_id)
-
-        # Create Excel workbook
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Check-In Report"
-
-        # Header row
-        headers = [
-            'Guard ID', 'Guard Name', 'Checkpoint ID', 'Checkpoint Name',
-            'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)'
-        ]
-        ws.append(headers)
-
-        for assignment in assignments:
-            guard = assignment.guard
-            shift = assignment.shift
-            for cp in assignment.checkpoints:
-                checkpoint_id = cp.get('checkpoint_id')
-                expected_time_str = cp.get('time')
-                expected_time = datetime.combine(assignment.start_date, datetime.strptime(expected_time_str, "%H:%M").time())
-
-                checkin = CheckIn.objects.filter(
-                    guard=guard,
-                    shift=shift,
-                    checkpoint_id=checkpoint_id,
-                    timestamp__range=(start, end)
-                ).order_by('timestamp').first()
-
-                actual_time = checkin.timestamp if checkin else None
-                delay = None
-                status = "Missed"
-
-                expected_time = make_aware(expected_time)
-
-                if actual_time and expected_time:
-                    if is_aware(actual_time):
-                        actual_time = actual_time.replace(tzinfo=None)
-                    if is_aware(expected_time):
-                        expected_time = expected_time.replace(tzinfo=None)
-
-                    delay = int((actual_time - expected_time).total_seconds() / 60)
-                    if delay <= 15:
-                        status = "On Time"
-                    elif 15 < delay <= 30:
-                        status = "Delayed"
-                    else:
-                        status = "Missed"
-
-                checkpoint_name = Checkpoint.objects.get(id=checkpoint_id).label
-
+            # Add data rows
+            for item in report_data:
                 ws.append([
-                    str(guard.id),
-                    guard.name,
-                    str(checkpoint_id),
-                    checkpoint_name,
-                    expected_time.strftime("%Y-%m-%d %H:%M"),
-                    actual_time.strftime("%Y-%m-%d %H:%M") if actual_time else "",
-                    status,
-                    delay if delay is not None else ""
+                    item['date'],
+                    item['guard_name'],
+                    item['shift_name'],
+                    item['checkpoint_name'],
+                    item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
+                    item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
+                    item['status'],
+                    item['delay_minutes'] if item['delay_minutes'] is not None else ""
                 ])
 
-        # Save to in-memory buffer
-        buffer = BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
+            # Save to in-memory buffer
+            buffer = BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
 
-        # Define file path
-        filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
-        file_path = os.path.join(settings.MEDIA_ROOT, filename)
+            # Define file path
+            filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+            file_path = os.path.join(settings.MEDIA_ROOT, filename)
 
-        # Save file to MEDIA directory
-        with open(file_path, 'wb') as f:
-            f.write(buffer.getvalue())
+            # Save file to MEDIA directory
+            with open(file_path, 'wb') as f:
+                f.write(buffer.getvalue())
 
-        # Build downloadable URL
-        file_url = request.build_absolute_uri(os.path.join(settings.MEDIA_URL, filename))
+            # Build downloadable URL
+            file_url = request.build_absolute_uri(os.path.join(settings.MEDIA_URL, filename))
 
-        return Response({"download_url": file_url})
+            return Response({"download_url": file_url}, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while generating the Excel report: {str(e)}"}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from django.utils.timezone import make_aware, localtime
-from datetime import datetime
-import os
-from django.conf import settings
-from openpyxl import Workbook
-from .models import AttendanceCheckin
-from .serializers import AttendanceCheckinDashboardSerializer
+
+def generate_attendance_excel_report_internal(date_filter='today', start_date=None, end_date=None, guard_id=None, location_id=None, shift_id=None, status_filter=None, defaulters=False):
+    """
+    Internal helper function to generate attendance check-in Excel report.
+    This contains the business logic that both the API endpoint and Celery tasks can use.
+    
+    Args:
+        date_filter: 'today', 'week', 'month', or 'custom'
+        start_date: For custom filter (YYYY-MM-DD string)
+        end_date: For custom filter (YYYY-MM-DD string)
+        guard_id: Optional UUID string to filter by guard
+        location_id: Optional UUID string to filter by location
+        shift_id: Optional UUID string to filter by shift
+        status_filter: Optional status string
+        defaulters: Boolean to filter only defaulters
+    
+    Returns: dict with 'file_path' and 'filename'
+    """
+    queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
+
+    today = datetime.now().date()
+
+    if date_filter == "today":
+        queryset = queryset.filter(checkin_time__date=today)
+    elif date_filter == "week":
+        start_week = today - timezone.timedelta(days=today.weekday())
+        end_week = start_week + timezone.timedelta(days=6)
+        queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
+    elif date_filter == "month":
+        queryset = queryset.filter(checkin_time__date__month=today.month)
+    elif date_filter == "custom" and start_date and end_date:
+        try:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+            queryset = queryset.filter(checkin_time__date__range=(start_date_obj, end_date_obj))
+        except ValueError:
+            raise ValueError("Invalid custom date format. Use YYYY-MM-DD.")
+
+    # Additional filters
+    if guard_id:
+        queryset = queryset.filter(guard_id=guard_id)
+
+    if location_id:
+        queryset = queryset.filter(org_location_id=location_id)
+
+    if shift_id:
+        queryset = queryset.filter(shift_id=shift_id)
+
+    if status_filter:
+        queryset = queryset.filter(status=status_filter)
+
+    if defaulters:
+        queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
+
+    # Create Excel
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance Checkins"
+
+    # Header with reordered columns and added Date + Duration
+    ws.append(["Shift Date", "Name", "Shift", "Location", "Checkin Time", "Checkout Time", "Duration (HH:MM)", "Status", "Remarks"])
+
+    row_count = 0  # Track number of data rows
+    for obj in queryset:
+        checkin = obj.checkin_time
+        checkout = obj.checkout_time
+        shift = obj.shift
+        attendance_status = ""
+        other_statuses = []
+        duration = ""
+
+        if shift:
+            shift_start = datetime.combine(checkin.date(), shift.start_time) if checkin else None
+            shift_end = datetime.combine(checkin.date(), shift.end_time)
+
+        if checkin and checkout:
+            # Duration
+            delta = checkout - checkin
+            total_hours = delta.total_seconds() / 3600
+            hours, remainder = divmod(delta.total_seconds(), 3600)
+            minutes = remainder // 60
+            duration = f"{int(hours):02}:{int(minutes):02}"
+
+            # Attendance Status
+            if total_hours <= 6:
+                attendance_status = "Absent"
+            elif 6 < total_hours <= 8:
+                attendance_status = "Present"
+            elif total_hours >= 8:
+                attendance_status = "Overtime"
+
+            # Check-in Timing
+            if shift_start:
+                checkin_diff = (checkin - shift_start).total_seconds() / 60  # Removed abs() to detect early vs late
+                if -30 <= checkin_diff <= 30:
+                    other_statuses.append("On-time Checked-in")
+                elif checkin_diff < -30:
+                    other_statuses.append("Early Checked-in")
+                elif checkin_diff > 30:
+                    other_statuses.append("Delay Checked-in")
+
+            # Check-out Timing
+            checkout_diff = abs((checkout - shift_end).total_seconds()) / 60
+            if checkout_diff <= 30:
+                other_statuses.append("On-time Checked-out")
+            elif checkout < shift_end and checkout_diff < 30:
+                other_statuses.append("Early Checked-out")
+
+        elif checkin and not checkout:
+            attendance_status = ""
+            other_statuses.append("Missed Checked-out")
+        elif not checkin and shift:
+            attendance_status = ""
+            other_statuses.append("Missed Check-in")
+
+        ws.append([
+            checkin.strftime('%Y-%m-%d') if checkin else "",
+            obj.guard.name,
+            shift.name if shift else "",
+            obj.org_location.name if obj.org_location else "",
+            checkin.strftime('%Y-%m-%d %H:%M:%S') if checkin else "",
+            checkout.strftime('%Y-%m-%d %H:%M:%S') if checkout else "",
+            duration,
+            attendance_status,
+            ", ".join(other_statuses)
+        ])
+        row_count += 1  # Increment row count
+
+    # Save to in-memory buffer
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    # Define file path
+    filename = f"attendance_export_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+
+    # Save file to MEDIA directory
+    with open(file_path, 'wb') as f:
+        f.write(buffer.getvalue())
+
+    return {
+        'file_path': file_path,
+        'filename': filename,
+        'row_count': row_count  # Return the number of data rows
+    }
+
 
 class AttendanceCheckinExportView(APIView):
     def get(self, request):
-        queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
-
+        # Parse filters
         date_filter = request.query_params.get("date_filter", "today")
-        naive_dt = datetime.now()
-        aware_dt = make_aware(naive_dt)
-        today = localtime(aware_dt)
-
-        if date_filter == "today":
-            queryset = queryset.filter(checkin_time__date=today)
-        elif date_filter == "week":
-            start_week = today - timezone.timedelta(days=today.weekday())
-            end_week = start_week + timezone.timedelta(days=6)
-            queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
-        elif date_filter == "month":
-            queryset = queryset.filter(checkin_time__date__month=today.month)
-        elif date_filter == "custom":
-            # Handle custom date range
-            start_date_str = request.query_params.get("start_date")
-            end_date_str = request.query_params.get("end_date")
-            try:
-                if start_date_str and end_date_str:
-                    start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-                    end_date = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-                    queryset = queryset.filter(checkin_time__date__range=(start_date, end_date))
-            except ValueError:
-                return Response({"error": "Invalid custom date format. Use YYYY-MM-DD."}, status=400)
-
-        # Additional filters
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
         guard_id = request.query_params.get("guard")
-        if guard_id:
-            queryset = queryset.filter(guard_id=guard_id)
-
         location_id = request.query_params.get("location")
-        if location_id:
-            queryset = queryset.filter(org_location_id=location_id)
-
         shift_id = request.query_params.get("shift")
-        if shift_id:
-            queryset = queryset.filter(shift_id=shift_id)
-
-        status = request.query_params.get("status")
-        if status:
-            queryset = queryset.filter(status=status)
-
-        defaulters = request.query_params.get("defaulters")
-        if defaulters == "true":
-            queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
-
-        # Create Excel
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Attendance Checkins"
-
-        # # Header
-        # ws.append(["Guard", "Shift", "Location", "Checkin Time", "Checkout Time", "Status"])
-
-        # for obj in queryset:
-        #     ws.append([
-        #         obj.guard.name,
-        #         obj.shift.name if obj.shift else "",
-        #         obj.org_location.name if obj.org_location else "",
-        #         obj.checkin_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkin_time else "",
-        #         obj.checkout_time.strftime('%Y-%m-%d %H:%M:%S') if obj.checkout_time else "",
-        #         obj.status
-        #     ])
+        status_filter = request.query_params.get("status")
+        defaulters = request.query_params.get("defaulters") == "true"
+        
+        try:
+            # Use internal helper function to avoid code duplication
+            result = generate_attendance_excel_report_internal(
+                date_filter=date_filter,
+                start_date=start_date,
+                end_date=end_date,
+                guard_id=guard_id,
+                location_id=location_id,
+                shift_id=shift_id,
+                status_filter=status_filter,
+                defaulters=defaulters
+            )
+            
+            filename = result['filename']
+            file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
+            return Response({"file_url": file_url})
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            return Response({"error": f"Failed to generate report: {str(e)}"}, status=500)
 
 
-        # Header with reordered columns and added Date + Duration
-        ws.append(["Date", "Name", "Shift", "Location", "Checkin Time", "Checkout Time", "Duration (HH:MM)","Status", "Remarks"])
+def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None):
+    """
+    Internal helper function to generate monthly attendance summary data.
+    This contains the business logic shared by both JSON and Excel endpoints.
+    
+    Args:
+        month: Optional string in YYYY-MM format
+        start_date_str: Optional string in YYYY-MM-DD format (for custom range)
+        end_date_str: Optional string in YYYY-MM-DD format (for custom range)
+        location_id: Optional UUID string to filter by location
+        user_id: Optional UUID string to filter by guard
+    
+    Returns:
+        dict with 'summary_data' (list of dicts), 'date_range' (list of dates), 
+        'start_date', and 'end_date'
+    """
+    # Parse and validate date range
+    if month:
+        try:
+            year, month_num = map(int, month.split("-"))
+            if not (1 <= month_num <= 12):
+                raise ValueError("Month must be between 1 and 12")
+            start_date = datetime(year, month_num, 1).date()
+            end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
+        except (ValueError, AttributeError) as e:
+            raise ValueError(f"Invalid month format. Use YYYY-MM. Error: {e}")
+    elif start_date_str and end_date_str:
+        start_date = parse_date(start_date_str)
+        end_date = parse_date(end_date_str)
+        if not start_date or not end_date:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD")
+    else:
+        today = now().date()
+        start_date = today.replace(day=1)
+        end_date = today
 
-        # for obj in queryset:
-        #     checkin = obj.checkin_time
-        #     checkout = obj.checkout_time
-        #     duration = ""
-        #     if checkin and checkout:
-        #         delta = checkout - checkin
-        #         hours, remainder = divmod(delta.total_seconds(), 3600)
-        #         minutes = remainder // 60
-        #         duration = f"{int(hours):02}:{int(minutes):02}"
+    # Get assignments within date range
+    assignments = Assignment.objects.filter(
+        start_date__lte=end_date,
+        end_date__gte=start_date,
+        is_deleted=False
+    )
 
-        #     ws.append([
-        #         checkin.strftime('%Y-%m-%d') if checkin else "",
-        #         obj.shift.name if obj.shift else "",
-        #         obj.guard.name,
-        #         obj.org_location.name if obj.org_location else "",
-        #         checkin.strftime('%Y-%m-%d %H:%M:%S') if checkin else "",
-        #         checkout.strftime('%Y-%m-%d %H:%M:%S') if checkout else "",
-        #         obj.status,
-        #         duration
-        #     ])
+    if location_id:
+        assignments = assignments.filter(location_id=location_id)
+    if user_id:
+        assignments = assignments.filter(guard_id=user_id)
 
-        for obj in queryset:
-            checkin = obj.checkin_time
-            checkout = obj.checkout_time
-            shift = obj.shift
-            attendance_status = ""
-            other_statuses = []
-            duration = ""
+    # Generate date range
+    date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
-            if shift:
-                shift_start = datetime.combine(checkin.date(), shift.start_time) if checkin else None
-                shift_end = datetime.combine(checkin.date(), shift.end_time)
+    # Group assignments by guard + location
+    grouped = defaultdict(lambda: {
+        "guard": None,
+        "location": None,
+        "assignments": []
+    })
 
-            if checkin and checkout:
-                # Duration
-                delta = checkout - checkin
-                total_hours = delta.total_seconds() / 3600
-                hours, remainder = divmod(delta.total_seconds(), 3600)
-                minutes = remainder // 60
-                duration = f"{int(hours):02}:{int(minutes):02}"
+    for assignment in assignments.select_related("guard", "location"):
+        key = (assignment.guard.id, assignment.location.id if assignment.location else None)
+        grouped[key]["guard"] = assignment.guard
+        grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
+        grouped[key]["assignments"].append(assignment)
 
-                # Attendance Status
-                if total_hours <= 6:
-                    attendance_status = "Absent"
-                elif 6 < total_hours <= 8:
-                    attendance_status = "Present"
-                elif total_hours >= 8:
-                    attendance_status = "Overtime"
+    summary_data = []
 
-                # Check-in Timing
-                if shift_start:
-                    checkin_diff = abs((checkin - shift_start).total_seconds()) / 60
-                    if checkin_diff <= 30:
-                        other_statuses.append("On-time Checked-in")
-                    elif checkin > shift_start + timedelta(minutes=30):
-                        other_statuses.append("Delay Checked-in")
+    # Build summary for each guard-location combination
+    for (guard_id, loc_id), data in grouped.items():
+        guard = data["guard"]
+        location = data["location"]
+        row = {
+            "name": guard.name,
+            "location": location
+        }
 
-                # Check-out Timing
-                checkout_diff = abs((checkout - shift_end).total_seconds()) / 60
-                if checkout_diff <= 30:
-                    other_statuses.append("On-time Checked-out")
-                elif checkout < shift_end and checkout_diff < 30:
-                    other_statuses.append("Early Checked-out")
+        # Check attendance for each date
+        for date in date_range:
+            active_assignments = [
+                a for a in data["assignments"]
+                if a.start_date <= date <= a.end_date
+            ]
 
-            elif checkin and not checkout:
-                attendance_status = ""
-                other_statuses.append("Missed Checked-out")
-            elif not checkin and shift:
-                attendance_status = ""
-                other_statuses.append("Missed Check-in")
+            if not active_assignments:
+                row[date.strftime("%d-%b")] = "-"
+                continue
 
-            ws.append([
-                checkin.strftime('%Y-%m-%d') if checkin else "",
-                obj.guard.name,
-                shift.name if shift else "",
-                obj.org_location.name if obj.org_location else "",
-                checkin.strftime('%Y-%m-%d %H:%M:%S') if checkin else "",
-                checkout.strftime('%Y-%m-%d %H:%M:%S') if checkout else "",
-                duration,
-                attendance_status,
-                ", ".join(other_statuses)
-             
-            ])
+            has_checkin = AttendanceCheckin.objects.filter(
+                guard=guard,
+                assignment__in=active_assignments,
+                checkin_time__date=date
+            ).exists()
 
-        # Save file
-        filename = f"attendance_export_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
-        filepath = os.path.join(settings.MEDIA_ROOT, filename)
-        wb.save(filepath)
+            row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
 
-        # Return URL
-        file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
-        return Response({"file_url": file_url})
+        summary_data.append(row)
+
+    return {
+        'summary_data': summary_data,
+        'date_range': date_range,
+        'start_date': start_date,
+        'end_date': end_date
+    }
 
 
-from rest_framework.viewsets import ViewSet
-from rest_framework.response import Response
-from rest_framework.decorators import action
-from django.db.models import Q
-from django.utils.dateparse import parse_date
-from django.utils.timezone import now
-from calendar import monthrange
-from datetime import datetime, timedelta
-from scheduler.models import Assignment, Location
-from dashboard.models import AttendanceCheckin
-from authapp.models import User
+def generate_monthly_attendance_summary_excel_internal(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None):
+    """
+    Internal helper function to generate monthly attendance summary Excel report.
+    This contains the business logic that both the API endpoint and Celery tasks can use.
+    
+    Args:
+        month: Optional string in YYYY-MM format
+        start_date_str: Optional string in YYYY-MM-DD format (for custom range)
+        end_date_str: Optional string in YYYY-MM-DD format (for custom range)
+        location_id: Optional UUID string to filter by location
+        user_id: Optional UUID string to filter by guard
+    
+    Returns: dict with 'file_path', 'filename', 'start_date', 'end_date', 'row_count'
+    """
+    # Get summary data using core helper
+    result = _get_monthly_attendance_summary_data(
+        month=month,
+        start_date_str=start_date_str,
+        end_date_str=end_date_str,
+        location_id=location_id,
+        user_id=user_id
+    )
+    
+    summary_data = result['summary_data']
+    date_range = result['date_range']
+    start_date = result['start_date']
+    end_date = result['end_date']
+    
+    # Create Excel workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Monthly Attendance Summary"
+    
+    # Header row
+    headers = ["Name", "Location"] + [date.strftime("%d-%b") for date in date_range]
+    ws.append(headers)
+    
+    # Data rows
+    row_count = 0
+    for row_data in summary_data:
+        row = [row_data["name"], row_data["location"]]
+        # Add attendance for each date
+        for date in date_range:
+            row.append(row_data.get(date.strftime("%d-%b"), "-"))
+        ws.append(row)
+        row_count += 1
+    
+    # Save to in-memory buffer
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    
+    # Define file path
+    filename = f"attendance_summary_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+    
+    # Save file to MEDIA directory
+    with open(file_path, 'wb') as f:
+        f.write(buffer.getvalue())
+    
+    return {
+        'file_path': file_path,
+        'filename': filename,
+        'start_date': start_date,
+        'end_date': end_date,
+        'row_count': row_count  # Number of guards in the report
+    }
 
-from collections import defaultdict
 
 class MonthlyAttendanceSummaryViewSet(ViewSet):
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
+        # Parse filters
         location_id = request.query_params.get("location_id")
         user_id = request.query_params.get("user_id")
         month = request.query_params.get("month")
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 
-        if month:
-            year, month_num = map(int, month.split("-"))
-            start_date = datetime(year, month_num, 1).date()
-            end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
-        elif start_date and end_date:
-            start_date = parse_date(start_date)
-            end_date = parse_date(end_date)
-        else:
-            today = now().date()
-            start_date = today.replace(day=1)
-            end_date = today
-
-        assignments = Assignment.objects.filter(
-            start_date__lte=end_date,
-            end_date__gte=start_date,
-            is_deleted=False
-        )
-
-        if location_id:
-            assignments = assignments.filter(location_id=location_id)
-        if user_id:
-            assignments = assignments.filter(guard_id=user_id)
-
-        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-
-        # Group assignments by guard + location
-        grouped = defaultdict(lambda: {
-            "guard": None,
-            "location": None,
-            "assignments": []
-        })
-
-        for assignment in assignments.select_related("guard", "location"):
-            key = (assignment.guard.id, assignment.location.id if assignment.location else None)
-            grouped[key]["guard"] = assignment.guard
-            grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
-            grouped[key]["assignments"].append(assignment)
-
-        summary = []
-
-        for (guard_id, location_id), data in grouped.items():
-            guard = data["guard"]
-            location = data["location"]
-            row = {
-                "name": guard.name,
-                "location": location
-            }
-
-            for date in date_range:
-                active_assignments = [
-                    a for a in data["assignments"]
-                    if a.start_date <= date <= a.end_date
-                ]
-
-                if not active_assignments:
-                    row[date.strftime("%d-%b")] = "-"
-                    continue
-
-                has_checkin = AttendanceCheckin.objects.filter(
-                    guard=guard,
-                    assignment__in=active_assignments,
-                    checkin_time__date=date
-                ).exists()
-
-                row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
-
-            summary.append(row)
-
-        return Response(summary)
+        try:
+            # Use internal helper function
+            result = _get_monthly_attendance_summary_data(
+                month=month,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                location_id=location_id,
+                user_id=user_id
+            )
+            
+            return Response(result['summary_data'])
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            return Response({"error": f"Failed to generate summary: {str(e)}"}, status=500)
 
 
 # class MonthlyAttendanceSummaryViewSet(ViewSet):
@@ -1099,102 +1326,47 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
 #         return Response(summary)
 
 
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework import status
-from django.http import HttpResponse
-from openpyxl import Workbook
-from datetime import datetime, timedelta
-from calendar import monthrange
-from django.utils.dateparse import parse_date
-from django.utils.timezone import now
-
 class MonthlyAttendanceExcelViewSet(ViewSet):
 
     @action(detail=False, methods=["get"])
-
     def export_excel(self, request):
+        # Parse filters
         location_id = request.query_params.get("location_id")
         user_id = request.query_params.get("user_id")
         month = request.query_params.get("month")
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 
-        if month:
-            year, month_num = map(int, month.split("-"))
-            start_date = datetime(year, month_num, 1).date()
-            end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
-        elif start_date and end_date:
-            start_date = parse_date(start_date)
-            end_date = parse_date(end_date)
-        else:
-            today = now().date()
-            start_date = today.replace(day=1)
-            end_date = today
-
-        assignments = Assignment.objects.filter(
-            start_date__lte=end_date,
-            end_date__gte=start_date,
-            is_deleted=False
-        )
-
-        if location_id:
-            assignments = assignments.filter(location_id=location_id)
-        if user_id:
-            assignments = assignments.filter(guard_id=user_id)
-
-        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-
-        # Group assignments by guard + location
-        grouped = defaultdict(lambda: {
-            "guard": None,
-            "location": None,
-            "assignments": []
-        })
-
-        for assignment in assignments.select_related("guard", "location"):
-            key = (assignment.guard.id, assignment.location.id if assignment.location else None)
-            grouped[key]["guard"] = assignment.guard
-            grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
-            grouped[key]["assignments"].append(assignment)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Attendance Summary"
-
-        headers = ["Name", "Location"] + [date.strftime("%d-%b") for date in date_range]
-        ws.append(headers)
-
-        for (guard_id, location_id), data in grouped.items():
-            guard = data["guard"]
-            location = data["location"]
-            row = [guard.name, location]
-
-            for date in date_range:
-                active_assignments = [
-                    a for a in data["assignments"]
-                    if a.start_date <= date <= a.end_date
-                ]
-
-                if not active_assignments:
-                    row.append("-")
-                    continue
-
-                has_checkin = AttendanceCheckin.objects.filter(
-                    guard=guard,
-                    assignment__in=active_assignments,
-                    checkin_time__date=date
-                ).exists()
-
-                row.append("P" if has_checkin else "A")
-
-            ws.append(row)
-
-        response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
-        response["Content-Disposition"] = f'attachment; filename="{filename}"'
-        wb.save(response)
-        return response
+        try:
+            # Use Excel helper function (consistent with daily reports pattern)
+            result = generate_monthly_attendance_summary_excel_internal(
+                month=month,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                location_id=location_id,
+                user_id=user_id
+            )
+            
+            file_path = result['file_path']
+            start_date_obj = result['start_date']
+            end_date_obj = result['end_date']
+            
+            # Return Excel file as HTTP response
+            with open(file_path, 'rb') as f:
+                excel_content = f.read()
+            
+            response = HttpResponse(
+                excel_content,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            filename = f"attendance_summary_{start_date_obj.strftime('%Y%m%d')}_{end_date_obj.strftime('%Y%m%d')}.xlsx"
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            return Response({"error": f"Failed to generate Excel: {str(e)}"}, status=500)
 
     # def export_excel(self, request):
     #     location_id = request.query_params.get("location_id")

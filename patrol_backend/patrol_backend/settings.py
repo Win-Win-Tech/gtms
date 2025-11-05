@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'checkin',
     'tourlog',
     'dashboard',
+    'reports',  # Added for Celery tasks
     'corsheaders',
     'incident',
     'django_celery_beat',
@@ -139,7 +140,7 @@ TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
-USE_TZ = False
+USE_TZ = False  # Keep as False to avoid timezone issues
 TIME_ZONE = 'Asia/Kolkata'
 
 # Static files (CSS, JavaScript, Images)
@@ -187,7 +188,17 @@ TWILIO_WHATSAPP_NUMBER = '+14155238886'  # Twilio sandbox WhatsApp number
 ADMIN_PHONE = '+918946066577'  # Admin's mobile number for voice call
 ADMIN_WHATSAPP = '+918946066577'  # Admin's WhatsApp number
 
-#DEFAULT_FROM_EMAIL='ravee.t@gmail.com'
+# Email Configuration - Hostinger SMTP
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.hostinger.com'
+EMAIL_PORT = 465
+EMAIL_USE_SSL = True  # Use SSL for port 465
+EMAIL_HOST_USER = 'ravit@cloudgentechnologies.com'
+EMAIL_HOST_PASSWORD = 'Yayaya#143'
+DEFAULT_FROM_EMAIL = 'ravit@cloudgentechnologies.com'
+
+# For development/testing, you can use console backend instead:
+# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
 import cloudinary
 import cloudinary.uploader
@@ -198,3 +209,40 @@ cloudinary.config(
   api_key = '255461719934117', 
   api_secret = 'DB1glK8yEP0nmpH9nCO8UFt-BOQ' 
 )
+
+# =====================================================
+# CELERY CONFIGURATION
+# =====================================================
+CELERY_BROKER_URL = 'redis://localhost:6379/0'  # Using Redis as message broker
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'  # Store task results in Redis
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'Asia/Kolkata'  # Match your TIME_ZONE
+CELERY_ENABLE_UTC = False
+
+# Celery Beat Schedule Configuration
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    'send-daily-checkin-report': {
+        'task': 'reports.tasks.email_daily_checkin_report',
+        # 'schedule': crontab(hour=8, minute=0),  # Run every day at 8:00 AM
+        # Alternative schedules:
+        'schedule': crontab(hour=23, minute=59),  # Daily at 11:59 PM
+        # 'schedule': crontab(minute='*/2'),  # Every 5 minutes (for testing)
+        # 'schedule': crontab(hour='*/2'),  # Every 2 hours
+        # 'schedule': crontab(day_of_week='monday', hour=9, minute=0),  # Every Monday at 9 AM
+    },
+    'send-monthly-attendance-summary': {
+        'task': 'reports.tasks.email_monthly_attendance_summary',
+        'schedule': crontab(day_of_month=1, hour=0, minute=30),  # 1st of every month at 12:30 AM
+        # This runs on the 1st day of each month and reports on the previous month
+        # Alternative schedules:
+        # 'schedule': crontab(day_of_month=1, hour=9, minute=0),  # 1st of month at 9:00 AM
+        # 'schedule': crontab(minute='*/5'),  # Every 5 minutes (for testing)
+    },
+}
+
+# Use Django DB backend for Celery Beat schedule (recommended for production)
+# CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'  # Commented out to use simple scheduler
