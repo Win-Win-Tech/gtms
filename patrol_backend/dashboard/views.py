@@ -33,6 +33,7 @@ import os
 from django.conf import settings
 from django.utils.timezone import make_aware, is_aware, get_current_timezone
 from rest_framework.permissions import AllowAny
+from collections import defaultdict
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -867,3 +868,400 @@ class AttendanceCheckinExportView(APIView):
         # Return URL
         file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
         return Response({"file_url": file_url})
+
+
+from rest_framework.viewsets import ViewSet
+from rest_framework.response import Response
+from rest_framework.decorators import action
+from django.db.models import Q
+from django.utils.dateparse import parse_date
+from django.utils.timezone import now
+from calendar import monthrange
+from datetime import datetime, timedelta
+from scheduler.models import Assignment, Location
+from dashboard.models import AttendanceCheckin
+from authapp.models import User
+
+from collections import defaultdict
+
+class MonthlyAttendanceSummaryViewSet(ViewSet):
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        location_id = request.query_params.get("location_id")
+        user_id = request.query_params.get("user_id")
+        month = request.query_params.get("month")
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        if month:
+            year, month_num = map(int, month.split("-"))
+            start_date = datetime(year, month_num, 1).date()
+            end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
+        elif start_date and end_date:
+            start_date = parse_date(start_date)
+            end_date = parse_date(end_date)
+        else:
+            today = now().date()
+            start_date = today.replace(day=1)
+            end_date = today
+
+        assignments = Assignment.objects.filter(
+            start_date__lte=end_date,
+            end_date__gte=start_date,
+            is_deleted=False
+        )
+
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
+        if user_id:
+            assignments = assignments.filter(guard_id=user_id)
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+        # Group assignments by guard + location
+        grouped = defaultdict(lambda: {
+            "guard": None,
+            "location": None,
+            "assignments": []
+        })
+
+        for assignment in assignments.select_related("guard", "location"):
+            key = (assignment.guard.id, assignment.location.id if assignment.location else None)
+            grouped[key]["guard"] = assignment.guard
+            grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
+            grouped[key]["assignments"].append(assignment)
+
+        summary = []
+
+        for (guard_id, location_id), data in grouped.items():
+            guard = data["guard"]
+            location = data["location"]
+            row = {
+                "name": guard.name,
+                "location": location
+            }
+
+            for date in date_range:
+                active_assignments = [
+                    a for a in data["assignments"]
+                    if a.start_date <= date <= a.end_date
+                ]
+
+                if not active_assignments:
+                    row[date.strftime("%d-%b")] = "-"
+                    continue
+
+                has_checkin = AttendanceCheckin.objects.filter(
+                    guard=guard,
+                    assignment__in=active_assignments,
+                    checkin_time__date=date
+                ).exists()
+
+                row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
+
+            summary.append(row)
+
+        return Response(summary)
+
+
+# class MonthlyAttendanceSummaryViewSet(ViewSet):
+#     @action(detail=False, methods=["get"])
+#     def summary(self, request):
+#         # Filters from query params
+#         location_id = request.query_params.get("location_id")
+#         user_id = request.query_params.get("user_id")
+#         month = request.query_params.get("month")  # format: YYYY-MM
+#         start_date = request.query_params.get("start_date")
+#         end_date = request.query_params.get("end_date")
+
+#         # Resolve date range
+#         if month:
+#             year, month_num = map(int, month.split("-"))
+#             start_date = datetime(year, month_num, 1).date()
+#             end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
+#         elif start_date and end_date:
+#             start_date = parse_date(start_date)
+#             end_date = parse_date(end_date)
+#         else:
+#             today = now().date()
+#             start_date = today.replace(day=1)
+#             end_date = today
+
+#         # Get assignments within date range
+#         assignments = Assignment.objects.filter(
+#             start_date__lte=end_date,
+#             end_date__gte=start_date,
+#             is_deleted=False
+#         )
+
+#         if location_id:
+#             assignments = assignments.filter(location_id=location_id)
+#         if user_id:
+#             assignments = assignments.filter(guard_id=user_id)
+
+#         # Build guard-wise attendance map
+# #         summary = []
+# #         date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+# #         for assignment in assignments.select_related("guard", "location"):
+# #             guard = assignment.guard
+# #             location = assignment.location.name if assignment.location else "N/A"
+
+# #             row = {
+# #                 #"name": guard.get_full_name() or guard.username,
+# #                 "name": guard.name,
+# #                 "location": location
+# #             }
+
+# #             for date in date_range:
+# #                 # Check if assignment is active on this date
+# #                 if assignment.start_date <= date <= assignment.end_date:
+# #                     checkin = AttendanceCheckin.objects.filter(
+# #                         guard=guard,
+# #                         assignment=assignment,
+# #                         shift=assignment.shift,
+# #                         org_location=assignment.location,
+# #                         checkin_time__date=date
+# #                     ).first()
+
+# # #                   row[date.strftime("%d-%b")] = checkin.status[0].upper() if checkin else "A"
+# #                     row[date.strftime("%d-%b")] = "P" if checkin else "A" if assignment.start_date <= date <= assignment.end_date else "-"
+
+# #                 else:
+# #                     row[date.strftime("%d-%b")] = "-"
+
+# #             summary.append(row)
+
+#         # Build guard-wise attendance map
+#         summary = []
+#         #date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+#         date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+#         # Group assignments by guard + location
+#         from collections import defaultdict
+
+#         # Group assignments by guard + location
+#         grouped = defaultdict(lambda: {
+#             "guard": None,
+#             "location": None,
+#             "assignments": []
+#         })
+
+#         guard_map = defaultdict(lambda: {"assignments": [], "location": None})
+
+#         # for assignment in assignments.select_related("guard", "location"):
+#         #     key = (assignment.guard.id, assignment.location.id if assignment.location else None)
+#         #     guard_map[key]["assignments"].append(assignment)
+#         #     guard_map[key]["location"] = assignment.location.name if assignment.location else "N/A"
+#         #     guard_map[key]["guard"] = assignment.guard
+
+#         for assignment in assignments.select_related("guard", "location"):
+#             key = (assignment.guard.id, assignment.location.id if assignment.location else None)
+#             grouped[key]["guard"] = assignment.guard
+#             grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
+#             grouped[key]["assignments"].append(assignment)
+        
+#         summary = []
+
+#         # Build summary rows
+#         for (guard_id, location_id), data in guard_map.items():
+#             guard = data["guard"]
+#             location = data["location"]
+#             row = {
+#                 "name": guard.name,
+#                 "location": location
+#             }
+
+#         for date in date_range:
+#                 # Get all assignments active on this date
+#                 active_assignments = [
+#                     a for a in data["assignments"]
+#                     if a.start_date <= date <= a.end_date
+#                 ]
+
+#                 if not active_assignments:
+#                     row[date.strftime("%d-%b")] = "-"
+#                     continue
+
+#                 # Check if any assignment has a checkin
+#                 has_checkin = AttendanceCheckin.objects.filter(
+#                     guard=guard,
+#                     assignment__in=active_assignments,
+#                     checkin_time__date=date
+#                 ).exists()
+
+#                 row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
+
+    
+#         summary.append(row)
+
+
+#         return Response(summary)
+
+
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework import status
+from django.http import HttpResponse
+from openpyxl import Workbook
+from datetime import datetime, timedelta
+from calendar import monthrange
+from django.utils.dateparse import parse_date
+from django.utils.timezone import now
+
+class MonthlyAttendanceExcelViewSet(ViewSet):
+
+    @action(detail=False, methods=["get"])
+
+    def export_excel(self, request):
+        location_id = request.query_params.get("location_id")
+        user_id = request.query_params.get("user_id")
+        month = request.query_params.get("month")
+        start_date = request.query_params.get("start_date")
+        end_date = request.query_params.get("end_date")
+
+        if month:
+            year, month_num = map(int, month.split("-"))
+            start_date = datetime(year, month_num, 1).date()
+            end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
+        elif start_date and end_date:
+            start_date = parse_date(start_date)
+            end_date = parse_date(end_date)
+        else:
+            today = now().date()
+            start_date = today.replace(day=1)
+            end_date = today
+
+        assignments = Assignment.objects.filter(
+            start_date__lte=end_date,
+            end_date__gte=start_date,
+            is_deleted=False
+        )
+
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
+        if user_id:
+            assignments = assignments.filter(guard_id=user_id)
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+        # Group assignments by guard + location
+        grouped = defaultdict(lambda: {
+            "guard": None,
+            "location": None,
+            "assignments": []
+        })
+
+        for assignment in assignments.select_related("guard", "location"):
+            key = (assignment.guard.id, assignment.location.id if assignment.location else None)
+            grouped[key]["guard"] = assignment.guard
+            grouped[key]["location"] = assignment.location.name if assignment.location else "N/A"
+            grouped[key]["assignments"].append(assignment)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Attendance Summary"
+
+        headers = ["Name", "Location"] + [date.strftime("%d-%b") for date in date_range]
+        ws.append(headers)
+
+        for (guard_id, location_id), data in grouped.items():
+            guard = data["guard"]
+            location = data["location"]
+            row = [guard.name, location]
+
+            for date in date_range:
+                active_assignments = [
+                    a for a in data["assignments"]
+                    if a.start_date <= date <= a.end_date
+                ]
+
+                if not active_assignments:
+                    row.append("-")
+                    continue
+
+                has_checkin = AttendanceCheckin.objects.filter(
+                    guard=guard,
+                    assignment__in=active_assignments,
+                    checkin_time__date=date
+                ).exists()
+
+                row.append("P" if has_checkin else "A")
+
+            ws.append(row)
+
+        response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        wb.save(response)
+        return response
+
+    # def export_excel(self, request):
+    #     location_id = request.query_params.get("location_id")
+    #     user_id = request.query_params.get("user_id")
+    #     month = request.query_params.get("month")
+    #     start_date = request.query_params.get("start_date")
+    #     end_date = request.query_params.get("end_date")
+
+    #     if month:
+    #         year, month_num = map(int, month.split("-"))
+    #         start_date = datetime(year, month_num, 1).date()
+    #         end_date = datetime(year, month_num, monthrange(year, month_num)[1]).date()
+    #     elif start_date and end_date:
+    #         start_date = parse_date(start_date)
+    #         end_date = parse_date(end_date)
+    #     else:
+    #         today = now().date()
+    #         start_date = today.replace(day=1)
+    #         end_date = today
+
+    #     assignments = Assignment.objects.filter(
+    #         start_date__lte=end_date,
+    #         end_date__gte=start_date,
+    #         is_deleted=False
+    #     )
+
+    #     if location_id:
+    #         assignments = assignments.filter(location_id=location_id)
+    #     if user_id:
+    #         assignments = assignments.filter(guard_id=user_id)
+
+    #     date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+    #     wb = Workbook()
+    #     ws = wb.active
+    #     ws.title = "Attendance Summary"
+
+    #     # Header row
+    #     headers = ["Name", "Location"] + [date.strftime("%d-%b") for date in date_range]
+    #     ws.append(headers)
+
+    #     for assignment in assignments.select_related("guard", "location"):
+    #         guard = assignment.guard
+    #         location = assignment.location.name if assignment.location else "N/A"
+
+    #         row = [guard.name, location]
+
+    #         for date in date_range:
+    #             if assignment.start_date <= date <= assignment.end_date:
+    #                 checkin = AttendanceCheckin.objects.filter(
+    #                     guard=guard,
+    #                     assignment=assignment,
+    #                     shift=assignment.shift,
+    #                     org_location=assignment.location,
+    #                     checkin_time__date=date
+    #                 ).first()
+    #                 status_code = "P" if checkin else "A"
+    #             else:
+    #                 status_code = "-"
+    #             row.append(status_code)
+
+    #         ws.append(row)
+
+    #     # Prepare response
+    #     response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    #     filename = f"attendance_summary_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
+    #     response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    #     wb.save(response)
+    #     return response
+
