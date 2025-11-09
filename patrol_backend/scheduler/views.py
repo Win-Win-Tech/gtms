@@ -389,6 +389,27 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
         result = [self._enrich_template(template) for template in templates]
         return Response(result, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
+    def by_location(self, request, location_id=None):
+        """
+        Get all checkpoint templates for a specific location.
+        
+        URL: /checkpoint-templates/by-location/{location_id}/
+        """
+        templates = CheckpointTemplate.objects.filter(
+            location_id=location_id,
+            is_deleted=False
+        )
+        
+        if not templates.exists():
+            return Response(
+                {"detail": "No templates found for this location."}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        result = [self._enrich_template(template) for template in templates]
+        return Response(result, status=status.HTTP_200_OK)        
+
     @action(detail=False, methods=['get'], url_path='by-shift/(?P<shift_id>[^/.]+)')
     def by_shift(self, request, shift_id=None):
         templates = CheckpointTemplate.objects.filter(shift_id=shift_id, is_deleted=False)
