@@ -85,6 +85,36 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             logger.error(f"Error during assignment validation: {e}", exc_info=True)
             raise ValidationError("Unexpected error during assignment validation.")
 
+    @action(detail=False, methods=['post'], url_path='bulk-create')
+    def bulk_create(self, request):
+        assignments_data = request.data
+
+        if not isinstance(assignments_data, list):
+            return Response({"error": "Expected a list of assignments"}, status=status.HTTP_400_BAD_REQUEST)
+
+        created = []
+        errors = []
+
+        for idx, data in enumerate(assignments_data):
+            serializer = self.get_serializer(data=data)
+            if serializer.is_valid():
+                serializer.save()
+                created.append(serializer.data)
+            else:
+                errors.append({
+                    "index": idx,
+                    "errors": serializer.errors,
+                    "data": data
+                })
+
+        if errors:
+            return Response({
+                "created": created,
+                "errors": errors
+            }, status=status.HTTP_207_MULTI_STATUS)
+
+        return Response({"created": created}, status=status.HTTP_201_CREATED)
+
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
     def upcoming_checkpoints(self, request, user_id=None):
         try:
