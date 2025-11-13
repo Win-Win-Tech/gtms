@@ -395,7 +395,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 # CORE FUNCTION: Shared business logic for check-in reports
 # ============================================================================
 
-def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None):
+def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None, shift_id=None):
     """
     Internal helper function that contains ALL business logic for check-in reports.
     This ensures consistency across JSON API, Excel exports, and Celery tasks.
@@ -406,6 +406,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         end_date_str: For custom filter (YYYY-MM-DD string)
         user_id: Optional UUID string to filter by guard
         location_id: Optional UUID string to filter by location
+        shift_id: Optional UUID string to filter by shift
     
     Returns:
         List of dicts with report data:
@@ -444,9 +445,10 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
     elif filter_type == 'custom' and start_date_str and end_date_str:
         try:
-            start = datetime.strptime(start_date_str, "%Y-%m-%d")
-            end = datetime.strptime(end_date_str, "%Y-%m-%d")
-            end = datetime.combine(end.date(), datetime.max.time())
+            start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            start = datetime.combine(start_date_obj, datetime.min.time())
+            end = datetime.combine(end_date_obj, datetime.max.time())
         except ValueError as e:
             raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
     else:
@@ -462,13 +464,16 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         assignments = assignments.filter(guard_id=user_id)
     if location_id:
         assignments = assignments.filter(location_id=location_id)
+    if shift_id:
+        assignments = assignments.filter(shift_id=shift_id)
     
     report = []
     
     # Generate date range for the filter period
     date_range = []
     current_date = start.date()
-    while current_date <= end.date():
+    end_date = end.date()
+    while current_date <= end_date:
         date_range.append(current_date)
         current_date += timedelta(days=1)
     
@@ -512,7 +517,6 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 day_start = datetime.combine(check_date, datetime.min.time())
                 day_end = datetime.combine(check_date, datetime.max.time())
                 
-                # Query for check-ins on this specific date
                 checkin = CheckIn.objects.filter(
                     guard=guard,
                     shift=shift,
@@ -586,6 +590,7 @@ class DashboardCheckInReportView(APIView):
         end_date = request.query_params.get('end_date')
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
         
         try:
             # Get report data using shared core function
@@ -594,7 +599,8 @@ class DashboardCheckInReportView(APIView):
                 start_date_str=start_date,
                 end_date_str=end_date,
                 user_id=user_id,
-                location_id=location_id
+                location_id=location_id,
+                shift_id=shift_id
             )
             
             # Format datetime fields for JSON response
@@ -635,6 +641,16 @@ class AttendanceCheckinListView(generics.ListAPIView):
             queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
         elif date_filter == "month":
             queryset = queryset.filter(checkin_time__date__month=today.month)
+        elif date_filter == "custom":
+            start_date = self.request.query_params.get("start_date")
+            end_date = self.request.query_params.get("end_date")
+            if start_date and end_date:
+                try:
+                    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+                    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+                    queryset = queryset.filter(checkin_time__date__range=(start_date_obj, end_date_obj))
+                except ValueError:
+                    pass  # Invalid date format, skip custom filter
 
         # Additional filters
         guard_id = self.request.query_params.get("guard")
@@ -745,6 +761,7 @@ class DashboardCheckInReportExcelView(APIView):
         end_date = request.query_params.get('end_date')
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
         
         try:
             # Get report data using shared core function
@@ -753,7 +770,8 @@ class DashboardCheckInReportExcelView(APIView):
                 start_date_str=start_date,
                 end_date_str=end_date,
                 user_id=user_id,
-                location_id=location_id
+                location_id=location_id,
+                shift_id=shift_id
             )
             
             # Create Excel workbook
@@ -786,18 +804,22 @@ class DashboardCheckInReportExcelView(APIView):
             wb.save(buffer)
             buffer.seek(0)
 
-            # Define file path
-            filename = f"checkin_report_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
-            file_path = os.path.join(settings.MEDIA_ROOT, filename)
-
-            # Save file to MEDIA directory
-            with open(file_path, 'wb') as f:
-                f.write(buffer.getvalue())
-
-            # Build downloadable URL
-            file_url = request.build_absolute_uri(os.path.join(settings.MEDIA_URL, filename))
-
-            return Response({"download_url": file_url}, status=status.HTTP_200_OK)
+            # Return Excel file as HTTP response (not JSON)
+            excel_content = buffer.getvalue()
+            
+            response = HttpResponse(
+                excel_content,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Generate a meaningful filename based on filter
+            if filter_type == 'custom' and start_date and end_date:
+                filename = f"checkin_report_{start_date}_{end_date}.xlsx"
+            else:
+                filename = f"checkin_report_{timezone.now().strftime('%Y%m%d')}.xlsx"
+            
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
             
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -880,7 +902,7 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
 
         if shift:
             shift_start = datetime.combine(checkin.date(), shift.start_time) if checkin else None
-            shift_end = datetime.combine(checkin.date(), shift.end_time)
+            shift_end = datetime.combine(checkin.date(), shift.end_time) if checkin else None
 
         if checkin and checkout:
             # Duration
@@ -909,11 +931,12 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
                     other_statuses.append("Delay Checked-in")
 
             # Check-out Timing
-            checkout_diff = abs((checkout - shift_end).total_seconds()) / 60
-            if checkout_diff <= 30:
-                other_statuses.append("On-time Checked-out")
-            elif checkout < shift_end and checkout_diff < 30:
-                other_statuses.append("Early Checked-out")
+            if shift_end:
+                checkout_diff = abs((checkout - shift_end).total_seconds()) / 60
+                if checkout_diff <= 30:
+                    other_statuses.append("On-time Checked-out")
+                elif checkout < shift_end and checkout_diff < 30:
+                    other_statuses.append("Early Checked-out")
 
         elif checkin and not checkout:
             attendance_status = ""
@@ -980,9 +1003,25 @@ class AttendanceCheckinExportView(APIView):
                 defaulters=defaulters
             )
             
-            filename = result['filename']
-            file_url = request.build_absolute_uri(settings.MEDIA_URL + filename)
-            return Response({"file_url": file_url})
+            file_path = result['file_path']
+            
+            # Return Excel file as HTTP response (not JSON)
+            with open(file_path, 'rb') as f:
+                excel_content = f.read()
+            
+            response = HttpResponse(
+                excel_content,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Generate a meaningful filename based on date filter
+            if date_filter == 'custom' and start_date and end_date:
+                filename = f"attendance_report_{start_date}_{end_date}.xlsx"
+            else:
+                filename = f"attendance_report_{timezone.now().strftime('%Y%m%d')}.xlsx"
+            
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
             
         except ValueError as e:
             return Response({"error": str(e)}, status=400)

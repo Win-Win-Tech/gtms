@@ -41,8 +41,13 @@ class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
         return f"{obj.shift.start_time}–{obj.shift.end_time}"
 
 class CheckInReportSerializer(serializers.Serializer):
+    date = serializers.CharField()
     guard_id = serializers.UUIDField()
     guard_name = serializers.CharField()
+    location_id = serializers.CharField(allow_null=True)
+    location_name = serializers.CharField()
+    shift_id = serializers.CharField(allow_null=True)
+    shift_name = serializers.CharField()
     checkpoint_id = serializers.UUIDField()
     checkpoint_name = serializers.CharField()
     expected_time = serializers.DateTimeField()
