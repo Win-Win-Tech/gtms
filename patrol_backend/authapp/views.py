@@ -151,10 +151,12 @@ class UserByRoleView(View):
         print("roles:", roles )
         if not roles:
             return JsonResponse({'error': 'No valid roles provided.'}, status=400)
+        users = User.get_by_roles(roles)
+            
         if location_id:
             users = users.filter(location_id=location_id)
             
-        users = User.get_by_roles(roles)
+        # users = User.get_by_roles(roles)
         data = [
             {
                 'id': str(user.id),
