@@ -1,20 +1,24 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.parsers import MultiPartParser
 from django.conf import settings
+from django.utils import timezone
+from django.db.models import Q
+from datetime import datetime, timedelta
 from .models import incidentreport
 from .serializers import IncidentSerializer
 from twilio.rest import Client
-from django.utils import timezone
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    get_user_today,
+    get_user_now,
+    convert_date_range_to_utc,
+    to_user_timezone
+)
 import os
 import cloudinary
 import cloudinary.uploader
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.parsers import MultiPartParser
-from twilio.rest import Client
-from django.conf import settings
 
 # Cloudinary configuration (can also be placed in settings.py)
 # cloudinary.config(
@@ -56,13 +60,17 @@ class IncidentReportView(APIView):
                 # Twilio client setup
                 client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
 
+                # Convert timestamp to user timezone for display
+                user_tz = get_user_timezone_from_request(request)
+                created_on_user = to_user_timezone(incident.created_on, user_tz)
+                
                 whatsapp_body = (
                     f"🚨 Incident Alert 🚨\n"
                     f"Severity: {incident.severity}\n"
                     f"Description: {incident.incident_description}\n"
                     f"Ticket: {incident.ticket_number}\n"
                     f"Status: {incident.status}\n"
-                    f"Timestamp: {incident.created_on.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Timestamp: {created_on_user.strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
                 )
 
@@ -261,14 +269,7 @@ class IncidentResolveView(APIView):
         return Response({'message': 'Incident resolved successfully'}, status=status.HTTP_200_OK)
 
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.utils import timezone
-from django.db.models import Q
-from .models import incidentreport
-from .serializers import IncidentSerializer
-import datetime
+# Duplicate imports removed - using imports from top of file
 
 # class IncidentFilterView(APIView):
 #     def get(self, request):
@@ -338,20 +339,37 @@ class IncidentFilterView(APIView):
         if severity_filter in ['Low', 'Medium', 'High']:
             queryset = queryset.filter(severity=severity_filter)
 
-        # Apply date filter
-        now = timezone.now()
+        # Apply date filter - use user timezone
+        user_tz = get_user_timezone_from_request(request)
+        user_now = get_user_now(user_tz)
+        user_today = user_now.date()
+        
         if date_filter == 'today':
-            queryset = queryset.filter(created_on__date=now.date())
+            # Convert today to UTC date range for query
+            start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
         elif date_filter == 'this_week':
-            start_of_week = now - datetime.timedelta(days=now.weekday())
-            queryset = queryset.filter(created_on__date__gte=start_of_week.date())
+            start_of_week = user_today - timedelta(days=user_today.weekday())
+            end_of_week = start_of_week + timedelta(days=6)
+            start_utc, end_utc = convert_date_range_to_utc(start_of_week, end_of_week, user_tz)
+            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
         elif date_filter == 'this_month':
-            queryset = queryset.filter(created_on__year=now.year, created_on__month=now.month)
+            # Get month boundaries in user timezone
+            start_of_month = user_today.replace(day=1)
+            if user_today.month == 12:
+                end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+            start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
+            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
         elif date_filter == 'custom' and start_date and end_date:
             try:
-                start = datetime.datetime.strptime(start_date, '%Y-%m-%d')
-                end = datetime.datetime.strptime(end_date, '%Y-%m-%d') + datetime.timedelta(days=1)
-                queryset = queryset.filter(created_on__range=(start, end))
+                # Parse dates as user timezone dates
+                start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
+                end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+                # Convert to UTC range for query
+                start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
+                queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
             except ValueError:
                 return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
 

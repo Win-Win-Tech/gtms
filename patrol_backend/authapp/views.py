@@ -1,6 +1,7 @@
 from rest_framework import generics, permissions, filters, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User
@@ -100,7 +101,8 @@ class LoginView(APIView):
                     'user_id': str(user.id),
                     'role': user.role,
                     'is_superuser': user.is_superuser,
-                    'location_id': str(user.location.id) if user.location else None
+                    'location_id': str(user.location.id) if user.location else None,
+                    'timezone': user.timezone
                 }, status.HTTP_200_OK))
             return Response(api_response("error", "Invalid credentials", None, status.HTTP_401_UNAUTHORIZED))
         except Exception as e:
@@ -168,4 +170,34 @@ class UserByRoleView(View):
             for user in users
         ]
         return JsonResponse(data, safe=False)
+
+
+class TimezoneListView(APIView):
+    """
+    API endpoint to get all available timezones from pytz.
+    Returns timezones in a flat list for easy dropdown usage.
+    """
+    permission_classes = [IsAuthenticated]  # Only authenticated users can access
+    
+    def get(self, request):
+        import pytz
+        
+        # Get all timezones from pytz
+        all_timezones = pytz.all_timezones
+        
+        # Return flat list with formatted labels
+        timezones_list = [
+            {'value': tz, 'label': tz.replace('_', ' ')}
+            for tz in all_timezones
+        ]
+        
+        return Response(api_response(
+            "success",
+            "Timezones fetched successfully",
+            {
+                'timezones': timezones_list,
+                'total_count': len(all_timezones)
+            },
+            status.HTTP_200_OK
+        ))
     

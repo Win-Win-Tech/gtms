@@ -6,6 +6,7 @@ mysqlclient==2.2.7
 pillow==11.3.0
 PyJWT==2.10.1
 PyMySQL==1.1.2
+pytz==2024.1
 sqlparse==0.5.3
 typing_extensions==4.15.0
 tzdata==2025.2

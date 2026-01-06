@@ -118,10 +118,18 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
     def upcoming_checkpoints(self, request, user_id=None):
         try:
-            today = now().date()
+            # Get user's timezone
+            user_tz = get_user_timezone_from_request(request)
+            today = get_user_today(user_tz)
+            
             assignments = Assignment.objects.filter(guard_id=user_id, start_date__lte=today, end_date__gte=today)
             result = []
             print("assignnnnnnnnn", assignments)
+            
+            # Convert today to UTC date range for database queries
+            from patrol_backend.utils.timezone_utils import convert_date_range_to_utc
+            start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
+            
             for assignment in assignments:
                 checkpoint_data = assignment.checkpoints
                 completed_ids = set(
@@ -130,7 +138,8 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                         shift_id=assignment.shift.id,
                         checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoint_data],
                         synced=True,
-                        timestamp__date=today  # ✅ Only include check-ins from today
+                        timestamp__gte=start_utc,
+                        timestamp__lt=end_utc + timedelta(days=1)  # Use UTC range for query
                     ).values_list('checkpoint_id', flat=True)
                 )
 
@@ -140,9 +149,16 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                     try:
                         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
-                        #checkpoint_datetime = make_aware(datetime.combine(today, checkpoint_time))
-                        checkpoint_datetime = datetime.combine(today, checkpoint_time)
-                        is_overdue = now() > checkpoint_datetime + timedelta(minutes=15)
+                        # Combine date and time in user timezone, then convert to UTC for comparison
+                        checkpoint_datetime_user = combine_date_time_in_user_tz(today, checkpoint_time, user_tz)
+                        checkpoint_datetime_user = checkpoint_datetime_user.astimezone(user_tz)
+                        
+                        # Get current time in user timezone
+                        from patrol_backend.utils.timezone_utils import get_user_now
+                        user_now = get_user_now(user_tz)
+                        
+                        # Check if overdue (in user timezone)
+                        is_overdue = user_now > checkpoint_datetime_user + timedelta(minutes=15)
                     except Exception as e:
                         print("eeee",e)
                         is_overdue = False

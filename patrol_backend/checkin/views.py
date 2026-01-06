@@ -11,9 +11,12 @@ from .serializers import CheckInSerializer
 from scheduler.models import Assignment, Checkpoint, Shift, SiteSetting
 from django.utils.timezone import make_aware
 import uuid
-from datetime import datetime
-from django.utils.timezone import now
-from django.utils.timezone import is_naive
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    get_user_today,
+    combine_date_time_in_user_tz,
+    to_user_timezone
+)
 
 User = get_user_model()
 
@@ -92,65 +95,36 @@ class CheckInViewSet(viewsets.ModelViewSet):
             if not shift:
                 return Response({"error": "Shift not found"}, status=status.HTTP_400_BAD_REQUEST)
 
-            checkin_time = now() 
-            #if not timestamp else shift.timezone.localize(now()) if hasattr(shift, 'timezone') else now()
-            shift_start = shift.start_time
-            shift_start=get_checkpoint_time(assignment,checkpoint_id)
+            # Get user's timezone from request or user model
+            user_tz = get_user_timezone_from_request(request)
             
+            # Get checkpoint expected time
             shift_start_str = get_checkpoint_time(assignment, checkpoint_id)
-
             if not shift_start_str:
                 return Response({"error": "Checkpoint time not found in assignment"}, status=status.HTTP_400_BAD_REQUEST)
             
             shift_start_time = datetime.strptime(shift_start_str, "%H:%M").time()
             
+            # Get current time in UTC (for storage)
+            checkin_time_utc = now()  # This is already UTC when USE_TZ=True
             
+            # Get today's date in user's timezone
+            user_today = get_user_today(user_tz)
             
-            # checkin_time = now()
-
-            # shift_start_dt = make_aware(datetime.combine(now().date(), shift_start_time))
+            # Combine date and checkpoint time in user's timezone, then convert to UTC
+            # This ensures the expected time is interpreted in user's local timezone
+            expected_checkpoint_dt_utc = combine_date_time_in_user_tz(
+                user_today, 
+                shift_start_time, 
+                user_tz
+            )
             
-            # if checkin_time.tzinfo:
-            #     shift_start_dt = shift_start_dt.replace(tzinfo=checkin_time.tzinfo)
-            # else:
-            #     if is_naive(shift_start_dt):
-            #         shift_start_dt = make_aware(shift_start_dt)
-                
-            # checkin_time = now()
-
-            # # Combine date and time for shift start
-            # shift_start_dt = datetime.combine(now().date(), shift_start_time)
-
-            # # Make shift_start_dt timezone-aware if needed
-            # if is_naive(shift_start_dt):
-            #     shift_start_dt = make_aware(shift_start_dt)
-
-            # # Align shift_start_dt to the same timezone as checkin_time
-            # shift_start_dt = shift_start_dt.astimezone(checkin_time.tzinfo)
-    
-
-            # # Now subtraction works
-            # time_diff = abs((checkin_time - shift_start_dt).total_seconds()) / 60
-
-            # Ensure checkin_time is timezone-aware
-            checkin_time = now()
-
-            # Combine date and time for shift start
-            shift_start_dt = datetime.combine(now().date(), shift_start_time)
-
-            # Make shift_start_dt timezone-aware if needed
-            if is_naive(shift_start_dt):
-                shift_start_dt = make_aware(shift_start_dt)
-
-            # Ensure checkin_time is also timezone-aware (redundant safety check)
-            if is_naive(checkin_time):
-                checkin_time = make_aware(checkin_time)
-
-            # Align shift_start_dt to the same timezone as checkin_time
-            shift_start_dt = shift_start_dt.astimezone(checkin_time.tzinfo)
-
-            # Now subtraction works
-            time_diff = abs((checkin_time - shift_start_dt).total_seconds()) / 60
+            # Convert checkin_time to user timezone for comparison
+            checkin_time_user = to_user_timezone(checkin_time_utc, user_tz)
+            
+            # Calculate time difference in minutes
+            # Both times are now in user's timezone for accurate comparison
+            time_diff = abs((checkin_time_user - expected_checkpoint_dt_utc.astimezone(user_tz)).total_seconds()) / 60
 
 
 
@@ -166,8 +140,12 @@ class CheckInViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            self.perform_create(serializer)
-
+            # Save the check-in (timestamp will be stored in UTC)
+            # Pass request context to serializer for timezone conversion
+            serializer.context['request'] = request
+            instance = serializer.save()
+            
+            # Get serialized data with timezone conversion
             response_data = serializer.data
             response_data['delayed'] = delayed
             response_data['message'] = "Checkpoint Successfully Scanned"

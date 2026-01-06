@@ -41,6 +41,14 @@ from authapp.models import User
 from checkin.models import CheckIn
 from scheduler.models import Assignment, Checkpoint, Location
 from tourlog.models import TourLog
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    get_user_today,
+    get_user_now,
+    to_user_timezone,
+    convert_date_range_to_utc,
+    combine_date_time_in_user_tz
+)
 
 from .models import AttendanceCheckin, CheckInLog
 from .serializers import (
@@ -113,12 +121,15 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     queryset = AttendanceCheckin.objects.all()
     serializer_class = AttendanceCheckinSerializer
 
-    def get_today_assignment(self, user):
-#       today = timezone.localtime(timezone.now()).date()
-        now = timezone.now()
-        if timezone.is_naive(now):
-            now = timezone.make_aware(now, timezone.get_current_timezone())
-        today = timezone.localtime(now).date()
+    def get_today_assignment(self, user, request=None):
+        # Get today's date in user's timezone
+        if request:
+            user_tz = get_user_timezone_from_request(request)
+        else:
+            from patrol_backend.utils.timezone_utils import get_user_timezone
+            user_tz = get_user_timezone(user)
+        
+        today = get_user_today(user_tz)
         return Assignment.objects.filter(
             guard_id=user.id,
             start_date__lte=today,
@@ -133,12 +144,12 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         user = request.user
         user_id = user.id
 
-        now = timezone.now()
-        if timezone.is_naive(now):
-            now = timezone.make_aware(now, timezone.get_current_timezone())
-        now = timezone.localtime(now)
-
-        today = now.date()
+        # Get user's timezone
+        user_tz = get_user_timezone_from_request(request)
+        
+        # Get current time and today's date in user's timezone
+        user_now = get_user_now(user_tz)
+        today = user_now.date()
 
         assignment = Assignment.objects.filter(
             guard_id=user_id,
@@ -157,44 +168,54 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         shift = assignment.shift
         location = assignment.location
 
+        # Convert today to UTC date range for database query
+        # Database stores UTC, so we need to query using UTC date range
+        start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
+        
         attendance = AttendanceCheckin.objects.filter(
             guard=user, shift=shift, assignment=assignment,
-            checkin_time__date=today
+            checkin_time__gte=start_utc,
+            checkin_time__lt=end_utc + timedelta(days=1)
         ).first()
 
         show_checkin = False
         show_checkout = False
         message = ""
 
-        # Determine shift window
-        shift_start_dt = make_aware(datetime.combine(today, shift.start_time)) if is_naive(datetime.combine(today, shift.start_time)) else datetime.combine(today, shift.start_time)
+        # Determine shift window in user's timezone
+        shift_start_dt_user = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+        shift_start_dt_user = shift_start_dt_user.astimezone(user_tz)
   
         if shift.end_time <= shift.start_time:
-            shift_end_dt = make_aware(datetime.combine(today + timedelta(days=1), shift.end_time)) if is_naive(datetime.combine(today + timedelta(days=1), shift.end_time)) else datetime.combine(today + timedelta(days=1), shift.end_time)
+            # Overnight shift
+            shift_end_dt_user = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
+            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
         else:
-            shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
-        #shift_end_dt = make_aware(datetime.combine(today, shift.end_time)) if is_naive(datetime.combine(today, shift.end_time)) else datetime.combine(today, shift.end_time)
+            shift_end_dt_user = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
+            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
         
-        # Define check-in and check-out windows
-        earliest_checkin = shift_start_dt - timedelta(minutes=30)
-        latest_checkin = shift_end_dt
-        earliest_checkout = shift_start_dt
-        latest_checkout = shift_end_dt + timedelta(minutes=30)
+        # Define check-in and check-out windows (in user timezone)
+        earliest_checkin = shift_start_dt_user - timedelta(minutes=30)
+        latest_checkin = shift_end_dt_user
+        earliest_checkout = shift_start_dt_user
+        latest_checkout = shift_end_dt_user + timedelta(minutes=30)
 
-        # Scenario logic
+        # Scenario logic (all comparisons in user timezone)
         if not attendance:
             # Scenario 1: No check-in yet
-            if earliest_checkin <= now <= latest_checkin:
+            if earliest_checkin <= user_now <= latest_checkin:
                 show_checkin = True
                 message = "You can check in"
-            elif now < earliest_checkin:
+            elif user_now < earliest_checkin:
                 message = "Too early to check in"
             else:
                 # Scenario 5: Shift ended without check-out
                 message = "Shift ended"
         else:
             if attendance.checkin_time and not attendance.checkout_time:
-                if now <= shift_end_dt:
+                # Convert stored UTC time to user timezone for comparison
+                checkin_time_user = to_user_timezone(attendance.checkin_time, user_tz)
+                if user_now <= shift_end_dt_user:
                     # Scenario 2: Checked in, not yet checked out
                     show_checkout = True
                     message = "You are checked in, checkout when done"
@@ -202,15 +223,19 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     # Scenario 5: Shift ended, no checkout
                     message = "Shift ended"
             elif attendance.checkin_time and attendance.checkout_time:
-                if now <= shift_end_dt:
+                checkout_time_user = to_user_timezone(attendance.checkout_time, user_tz)
+                if user_now <= shift_end_dt_user:
                     # Check if user has checked in again after checkout
+                    # Convert today to UTC range for query
+                    start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
                     latest_checkin = CheckInLog.objects.filter(
                         guard=user,
                         assignment=assignment,
                         shift=shift,
                         org_location=location,
                         type="checkin",
-                        timestamp__date=today,
+                        timestamp__gte=start_utc,
+                        timestamp__lt=end_utc + timedelta(days=1),
                         timestamp__gt=attendance.checkout_time
                     ).order_by("-timestamp").first()
 
@@ -247,7 +272,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["post"])
     def checkin(self, request):
         user = request.user
-        assignment = self.get_today_assignment(user)
+        user_tz = get_user_timezone_from_request(request)
+        assignment = self.get_today_assignment(user, request)
 
         if not assignment:
             return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
@@ -262,7 +288,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if distance > 100:
             return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Log this check-in
+        # Get today in user timezone for query
+        user_today = get_user_today(user_tz)
+        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+
+        # Log this check-in (timestamp will be auto-set to UTC)
         CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -274,34 +304,50 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         )
 
         # Update or create attendance record
+        # Use UTC date range for query (created_on is stored in UTC)
         attendance, _ = AttendanceCheckin.objects.get_or_create(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__date=date.today()
+            defaults={'created_on': timezone.now()}
         )
+        # Filter by UTC date range
+        attendance_list = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            created_on__gte=start_utc,
+            created_on__lt=end_utc + timedelta(days=1)
+        )
+        if attendance_list.exists():
+            attendance = attendance_list.first()
 
+        # Find earliest checkin in today's date range (UTC)
         earliest_checkin = CheckInLog.objects.filter(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
             type="checkin",
-            timestamp__date=date.today()
+            timestamp__gte=start_utc,
+            timestamp__lt=end_utc + timedelta(days=1)
         ).order_by("timestamp").first()
 
-        attendance.checkin_time = earliest_checkin.timestamp
-        attendance.latitude = earliest_checkin.latitude
-        attendance.longitude = earliest_checkin.longitude
-        attendance.save()
+        if earliest_checkin:
+            attendance.checkin_time = earliest_checkin.timestamp  # Already in UTC
+            attendance.latitude = earliest_checkin.latitude
+            attendance.longitude = earliest_checkin.longitude
+            attendance.save()
 
-        return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_201_CREATED)
+        return Response(AttendanceCheckinSerializer(attendance, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"])
     def checkout(self, request):
         user = request.user
-        assignment = self.get_today_assignment(user)
+        user_tz = get_user_timezone_from_request(request)
+        assignment = self.get_today_assignment(user, request)
 
         if not assignment:
             return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
@@ -311,18 +357,24 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        # Get today in user timezone and convert to UTC range
+        user_today = get_user_today(user_tz)
+        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+
+        # Find attendance record using UTC date range
         attendance = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__date=date.today()
+            created_on__gte=start_utc,
+            created_on__lt=end_utc + timedelta(days=1)
         ).first()
 
         if not attendance or not attendance.checkin_time:
             return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Log this checkout
+        # Log this checkout (timestamp auto-set to UTC)
         CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -333,17 +385,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             longitude=lon
         )
 
+        # Find latest checkout in today's UTC date range
         latest_checkout = CheckInLog.objects.filter(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
             type="checkout",
-            timestamp__date=date.today()
+            timestamp__gte=start_utc,
+            timestamp__lt=end_utc + timedelta(days=1)
         ).order_by("-timestamp").first()
 
-        attendance.checkout_time = latest_checkout.timestamp
-        attendance.save()
+        if latest_checkout:
+            attendance.checkout_time = latest_checkout.timestamp  # Already in UTC
+            attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
 
@@ -395,7 +450,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 # CORE FUNCTION: Shared business logic for check-in reports
 # ============================================================================
 
-def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None, shift_id=None):
+def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None, shift_id=None, request=None):
     """
     Internal helper function that contains ALL business logic for check-in reports.
     This ensures consistency across JSON API, Excel exports, and Celery tasks.
@@ -407,6 +462,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         user_id: Optional UUID string to filter by guard
         location_id: Optional UUID string to filter by location
         shift_id: Optional UUID string to filter by shift
+        request: Optional request object for timezone detection (for API calls)
     
     Returns:
         List of dicts with report data:
@@ -428,36 +484,48 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     """
     from django.utils.timezone import now as django_now
     
-    today = timezone.now().date()
+    # Get user timezone if request is provided, otherwise use default
+    if request:
+        user_tz = get_user_timezone_from_request(request)
+        today = get_user_today(user_tz)
+    else:
+        # For Celery tasks or non-request contexts, use default timezone
+        user_tz = pytz.timezone('Asia/Kolkata')
+        today = timezone.now().date()
     
-    # Parse filter and determine date range
+    # Parse filter and determine date range in user timezone
     if filter_type == 'today':
-        start = datetime.combine(today, datetime.min.time())
-        end = datetime.combine(today, datetime.max.time())
+        start_dt_user = datetime.combine(today, datetime.min.time())
+        end_dt_user = datetime.combine(today, datetime.max.time())
     elif filter_type == 'this_week':
-        start = today - timedelta(days=today.weekday())
-        end = start + timedelta(days=6)
-        start = datetime.combine(start, datetime.min.time())
-        end = datetime.combine(end, datetime.max.time())
+        start_week = today - timedelta(days=today.weekday())
+        end_week = start_week + timedelta(days=6)
+        start_dt_user = datetime.combine(start_week, datetime.min.time())
+        end_dt_user = datetime.combine(end_week, datetime.max.time())
     elif filter_type == 'this_month':
-        start = datetime(today.year, today.month, 1)
-        next_month = start.replace(day=28) + timedelta(days=4)
-        end = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+        start_dt_user = datetime(today.year, today.month, 1)
+        next_month = start_dt_user.replace(day=28) + timedelta(days=4)
+        end_dt_user = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
     elif filter_type == 'custom' and start_date_str and end_date_str:
         try:
             start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
             end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
-            start = datetime.combine(start_date_obj, datetime.min.time())
-            end = datetime.combine(end_date_obj, datetime.max.time())
+            start_dt_user = datetime.combine(start_date_obj, datetime.min.time())
+            end_dt_user = datetime.combine(end_date_obj, datetime.max.time())
         except ValueError as e:
             raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
     else:
         raise ValueError("Invalid filter or missing dates")
     
-    # Get assignments that overlap with the date range
+    # Convert user timezone date range to UTC for database queries
+    start_utc, end_utc = convert_date_range_to_utc(start_dt_user.date(), end_dt_user.date(), user_tz)
+    # Adjust end_utc to include the full end day
+    end_utc = end_utc + timedelta(days=1)
+    
+    # Get assignments that overlap with the date range (using UTC dates for query)
     assignments = Assignment.objects.filter(
-        start_date__lte=end.date(),
-        end_date__gte=start.date()
+        start_date__lte=end_utc.date(),
+        end_date__gte=start_utc.date()
     ).select_related('guard', 'location', 'shift')
     
     if user_id:
@@ -469,10 +537,10 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     
     report = []
     
-    # Generate date range for the filter period
+    # Generate date range for the filter period (in user timezone)
     date_range = []
-    current_date = start.date()
-    end_date = end.date()
+    current_date = start_dt_user.date()
+    end_date = end_dt_user.date()
     while current_date <= end_date:
         date_range.append(current_date)
         current_date += timedelta(days=1)
@@ -510,19 +578,21 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 if not (assignment.start_date <= check_date <= assignment.end_date):
                     continue
                 
-                # Calculate expected time for this specific date
-                expected_datetime = datetime.combine(check_date, expected_time_obj)
+                # Calculate expected time for this specific date in user timezone
+                expected_datetime_user = combine_date_time_in_user_tz(check_date, expected_time_obj, user_tz)
                 
-                # Define the search window for this specific date's check-in
-                day_start = datetime.combine(check_date, datetime.min.time())
-                day_end = datetime.combine(check_date, datetime.max.time())
+                # Define the search window for this specific date's check-in (convert to UTC)
+                day_start_user = datetime.combine(check_date, datetime.min.time())
+                day_end_user = datetime.combine(check_date, datetime.max.time())
+                day_start_utc, day_end_utc = convert_date_range_to_utc(day_start_user.date(), day_end_user.date(), user_tz)
+                day_end_utc = day_end_utc + timedelta(days=1)
                 
                 checkin = CheckIn.objects.filter(
                     guard=guard,
                     shift=shift,
                     checkpoint_id=checkpoint_id,
-                    timestamp__gte=day_start,
-                    timestamp__lte=day_end
+                    timestamp__gte=day_start_utc,
+                    timestamp__lt=day_end_utc
                 ).order_by('timestamp').first()
                 
                 actual_time = None
@@ -541,8 +611,12 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                         # Valid synced check-in
                         actual_time = checkin.timestamp
                         
-                        # Calculate delay in minutes
-                        delay = int((actual_time - expected_datetime).total_seconds() / 60)
+                        # Convert both to user timezone for delay calculation
+                        actual_time_user = to_user_timezone(actual_time, user_tz)
+                        expected_time_user = expected_datetime_user.astimezone(user_tz)
+                        
+                        # Calculate delay in minutes (in user timezone)
+                        delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
                         
                         # Determine status based on delay
                         if delay <= 15:
@@ -552,7 +626,10 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                         else:
                             status = "Missed"
                 
-                # Add to report
+                # Add to report (convert times to user timezone for display)
+                expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
+                actual_time_display = to_user_timezone(actual_time, user_tz) if actual_time else None
+                
                 report.append({
                     'date': check_date.strftime('%Y-%m-%d'),
                     'guard_id': str(guard.id),
@@ -563,8 +640,8 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     'shift_name': shift.name if shift else "",
                     'checkpoint_id': str(checkpoint_id),
                     'checkpoint_name': checkpoint_name,
-                    'expected_time': expected_datetime,
-                    'actual_checkin_time': actual_time,
+                    'expected_time': expected_time_display,  # In user timezone
+                    'actual_checkin_time': actual_time_display,  # In user timezone
                     'status': status,
                     'delay_minutes': delay
                 })
@@ -603,12 +680,20 @@ class DashboardCheckInReportView(APIView):
                 shift_id=shift_id
             )
             
-            # Format datetime fields for JSON response
+            # Format datetime fields for JSON response (already in user timezone from _get_checkin_report_data)
             for item in report_data:
                 if item['expected_time']:
-                    item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
+                    # Convert to ISO format string (timezone-aware)
+                    if hasattr(item['expected_time'], 'isoformat'):
+                        item['expected_time'] = item['expected_time'].isoformat()
+                    else:
+                        item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
                 if item['actual_checkin_time']:
-                    item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
+                    # Convert to ISO format string (timezone-aware)
+                    if hasattr(item['actual_checkin_time'], 'isoformat'):
+                        item['actual_checkin_time'] = item['actual_checkin_time'].isoformat()
+                    else:
+                        item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
             
             # Serialize and return
             serializer = CheckInReportSerializer(report_data, many=True)
@@ -628,19 +713,30 @@ class AttendanceCheckinListView(generics.ListAPIView):
     def get_queryset(self):
         queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
 
-        #today = timezone.localdate()
+        # Get user timezone
+        user_tz = get_user_timezone_from_request(self.request)
         date_filter = self.request.query_params.get("date_filter", "today")
 
-        today = datetime.now().date()
+        user_today = get_user_today(user_tz)
 
         if date_filter == "today":
-            queryset = queryset.filter(checkin_time__date=today)
+            # Convert today to UTC range for query
+            start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "week":
-            start_week = today - timezone.timedelta(days=today.weekday())
-            end_week = start_week + timezone.timedelta(days=6)
-            queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
+            start_week = user_today - timedelta(days=user_today.weekday())
+            end_week = start_week + timedelta(days=6)
+            start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
+            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "month":
-            queryset = queryset.filter(checkin_time__date__month=today.month)
+            # Get month boundaries in user timezone
+            start_of_month = user_today.replace(day=1)
+            if user_today.month == 12:
+                end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
+            else:
+                end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+            start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
+            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "custom":
             start_date = self.request.query_params.get("start_date")
             end_date = self.request.query_params.get("end_date")
@@ -648,7 +744,9 @@ class AttendanceCheckinListView(generics.ListAPIView):
                 try:
                     start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
                     end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-                    queryset = queryset.filter(checkin_time__date__range=(start_date_obj, end_date_obj))
+                    # Convert to UTC range for query
+                    start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
+                    queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
                 except ValueError:
                     pass  # Invalid date format, skip custom filter
 
@@ -671,12 +769,18 @@ class AttendanceCheckinListView(generics.ListAPIView):
 
         defaulters = self.request.query_params.get("defaulters")
         if defaulters == "true":
-            queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
+            # Use UTC date range for today
+            start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+            queryset = queryset.filter(
+                checkin_time__gte=start_utc,
+                checkin_time__lt=end_utc + timedelta(days=1),
+                checkout_time__isnull=True
+            )
 
         return queryset
 
 
-def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None):
+def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None, request=None):
     """
     Internal helper function to generate check-in Excel report.
     Used by both the API endpoint and Celery tasks.
@@ -687,17 +791,19 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
         end_date: For custom filter (YYYY-MM-DD string)
         user_id: Optional UUID string to filter by guard
         location_id: Optional UUID string to filter by location
+        request: Optional request object for timezone (None for Celery tasks)
     
     Returns:
         dict with 'file_path', 'filename', and 'row_count'
     """
-    # Get report data using shared core function
+    # Get report data using shared core function (pass request for timezone)
     report_data = _get_checkin_report_data(
         filter_type=filter_type,
         start_date_str=start_date,
         end_date_str=end_date,
         user_id=user_id,
-        location_id=location_id
+        location_id=location_id,
+        request=request
     )
     
     # Create Excel workbook
@@ -764,14 +870,15 @@ class DashboardCheckInReportExcelView(APIView):
         shift_id = request.query_params.get('shift_id')
         
         try:
-            # Get report data using shared core function
+            # Get report data using shared core function (pass request for timezone)
             report_data = _get_checkin_report_data(
                 filter_type=filter_type,
                 start_date_str=start_date,
                 end_date_str=end_date,
                 user_id=user_id,
                 location_id=location_id,
-                shift_id=shift_id
+                shift_id=shift_id,
+                request=request
             )
             
             # Create Excel workbook

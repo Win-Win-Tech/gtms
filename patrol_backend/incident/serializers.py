@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from .models import incidentreport
 from django.contrib.auth import get_user_model
+from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, to_user_timezone
 
 User = get_user_model()
 
@@ -43,6 +44,27 @@ class IncidentSerializer(serializers.ModelSerializer):
 
     def get_checkpoint_name(self, obj):
         return obj.checkpoint.label if obj.checkpoint else None
+    
+    def to_representation(self, instance):
+        """Convert UTC datetimes to user timezone before serialization"""
+        data = super().to_representation(instance)
+        
+        # Get user timezone from request context
+        request = self.context.get('request')
+        if request:
+            user_tz = get_user_timezone_from_request(request)
+            
+            # Convert datetime fields to user timezone
+            if instance.created_on:
+                data['created_on'] = to_user_timezone(instance.created_on, user_tz).isoformat()
+            
+            if instance.assigned_on:
+                data['assigned_on'] = to_user_timezone(instance.assigned_on, user_tz).isoformat()
+            
+            if instance.resolved_on:
+                data['resolved_on'] = to_user_timezone(instance.resolved_on, user_tz).isoformat()
+        
+        return data
 
 
     # class Meta:

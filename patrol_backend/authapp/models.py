@@ -1,4 +1,5 @@
 import uuid
+import pytz
 from django.db import models
 from django.utils.timezone import now
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
@@ -42,6 +43,11 @@ class User(AbstractBaseUser, PermissionsMixin):
         null=True,
         blank=True,
         related_name="users"
+    )
+    timezone = models.CharField(
+        max_length=50,
+        default='Asia/Kolkata',
+        help_text="User's timezone (e.g., 'Asia/Kolkata', 'America/New_York')"
     )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
@@ -91,6 +97,32 @@ class User(AbstractBaseUser, PermissionsMixin):
         if user:
             self.deleted_by = user
         self.save()
+
+    def save(self, *args, **kwargs):
+        """Override save to sync timezone for location users when admin timezone changes"""
+        is_update = self.pk is not None
+        old_timezone = None
+        location_to_sync = None
+        
+        if is_update and self.role == 'admin':
+            try:
+                old_instance = User.objects.get(pk=self.pk)
+                old_timezone = old_instance.timezone
+                location_to_sync = old_instance.location
+            except User.DoesNotExist:
+                pass
+        
+        super().save(*args, **kwargs)
+        
+        # If admin's timezone changed, update all users in same location
+        if is_update and self.role == 'admin' and location_to_sync:
+            if old_timezone != self.timezone and self.timezone:
+                # Update all non-admin users in this location
+                User.objects.filter(
+                    location=location_to_sync,
+                    role__in=['guard', 'so', 'fo'],
+                    is_deleted=False
+                ).exclude(id=self.id).update(timezone=self.timezone)
 
     def __str__(self):
         return f"{self.email} ({self.role})"

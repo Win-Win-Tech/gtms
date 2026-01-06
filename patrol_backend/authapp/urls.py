@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import UserCreateView, LoginView, UserListView, UserUpdateView, UserDeleteView, ToggleUserActiveView, UserDetailView, UserByRoleView
+from .views import UserCreateView, LoginView, UserListView, UserUpdateView, UserDeleteView, ToggleUserActiveView, UserDetailView, UserByRoleView, TimezoneListView
 
 urlpatterns = [
     path('auth/users/', UserCreateView.as_view(), name='create_user'),
@@ -10,5 +10,6 @@ urlpatterns = [
     path('auth/users/<uuid:id>/delete/', UserDeleteView.as_view(), name='delete_user'), # DELETE
     path('auth/users/<uuid:id>/toggle-active/', ToggleUserActiveView.as_view(), name='toggle_user_active'), # PATCH
     path('users/by-role/', UserByRoleView.as_view(), name='users-by-role'),
+    path('auth/timezones/', TimezoneListView.as_view(), name='list_timezones'),
 ]
 
