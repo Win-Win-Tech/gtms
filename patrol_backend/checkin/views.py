@@ -82,15 +82,17 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 return Response({"error": f"Check-in location is too far from checkpoint (>{int(distance)}m)"},
                                 status=status.HTTP_403_FORBIDDEN)
 
-            #Rule 5: Validate timestamp within ±15 minutes of shift start
+            #Rule 5: Validate timestamp within allowed window
 
             shift = Shift.objects.filter(id=shift_id).first()
 
-            def get_checkpoint_time(assignment, checkpoint_id):
+            def get_all_checkpoint_times(assignment, checkpoint_id):
+                """Get all time slots for this checkpoint (in case it appears multiple times)"""
+                times = []
                 for checkpoint in assignment.checkpoints:
                     if checkpoint.get("checkpoint_id") == checkpoint_id:
-                        return checkpoint.get("time")
-                return None  # if not found
+                        times.append(checkpoint.get("time"))
+                return times  # Returns list of all times for this checkpoint
 
             if not shift:
                 return Response({"error": "Shift not found"}, status=status.HTTP_400_BAD_REQUEST)
@@ -98,38 +100,73 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Get user's timezone from request or user model
             user_tz = get_user_timezone_from_request(request)
             
-            # Get checkpoint expected time
-            shift_start_str = get_checkpoint_time(assignment, checkpoint_id)
-            if not shift_start_str:
+            # Get all checkpoint times for this checkpoint (handles multiple occurrences)
+            checkpoint_times_str = get_all_checkpoint_times(assignment, checkpoint_id)
+            if not checkpoint_times_str:
                 return Response({"error": "Checkpoint time not found in assignment"}, status=status.HTTP_400_BAD_REQUEST)
-            
-            shift_start_time = datetime.strptime(shift_start_str, "%H:%M").time()
             
             # Get current time in UTC (for storage)
             checkin_time_utc = now()  # This is already UTC when USE_TZ=True
             
-            # Get today's date in user's timezone
-            user_today = get_user_today(user_tz)
-            
-            # Combine date and checkpoint time in user's timezone, then convert to UTC
-            # This ensures the expected time is interpreted in user's local timezone
-            expected_checkpoint_dt_utc = combine_date_time_in_user_tz(
-                user_today, 
-                shift_start_time, 
-                user_tz
-            )
-            
             # Convert checkin_time to user timezone for comparison
             checkin_time_user = to_user_timezone(checkin_time_utc, user_tz)
             
-            # Calculate time difference in minutes
-            # Both times are now in user's timezone for accurate comparison
-            time_diff = abs((checkin_time_user - expected_checkpoint_dt_utc.astimezone(user_tz)).total_seconds()) / 60
-
-
-
-            # delayed = time_diff > 15
-            delayed = time_diff > int(settings[0]['value'])
+            # Get today's date in user's timezone
+            user_today = get_user_today(user_tz)
+            
+            # Check if shift is overnight
+            is_overnight = shift.end_time <= shift.start_time
+            
+            # Find the closest matching checkpoint time slot
+            best_match = None
+            min_time_diff = float('inf')
+            
+            for checkpoint_time_str in checkpoint_times_str:
+                checkpoint_time = datetime.strptime(checkpoint_time_str, "%H:%M").time()
+                
+                # Determine which date this checkpoint belongs to
+                if is_overnight:
+                    # For overnight shifts, check if checkpoint time is before or after midnight
+                    # If checkpoint time is >= shift start_time, it's on the start date
+                    # If checkpoint time is <= shift end_time, it's on the next day
+                    if checkpoint_time >= shift.start_time:
+                        # Checkpoint is on the same day as shift start (before midnight)
+                        checkpoint_date = user_today
+                    else:
+                        # Checkpoint is after midnight (next day)
+                        checkpoint_date = user_today + timedelta(days=1)
+                else:
+                    # Normal shift - checkpoint is on the same day
+                    checkpoint_date = user_today
+                
+                # Combine date and checkpoint time in user's timezone, then convert to UTC
+                expected_checkpoint_dt_utc = combine_date_time_in_user_tz(
+                    checkpoint_date, 
+                    checkpoint_time, 
+                    user_tz
+                )
+                
+                # Convert to user timezone for comparison
+                expected_checkpoint_dt_user = to_user_timezone(expected_checkpoint_dt_utc, user_tz)
+                
+                # Calculate time difference in minutes
+                time_diff = abs((checkin_time_user - expected_checkpoint_dt_user).total_seconds()) / 60
+                
+                # Keep track of the closest match
+                if time_diff < min_time_diff:
+                    min_time_diff = time_diff
+                    best_match = {
+                        'time': checkpoint_time,
+                        'date': checkpoint_date,
+                        'expected_dt_utc': expected_checkpoint_dt_utc,
+                        'time_diff': time_diff
+                    }
+            
+            if not best_match:
+                return Response({"error": "Could not determine checkpoint time"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Check if scan is within allowed window
+            delayed = min_time_diff > int(settings[0]['value'])
 
             serializer = self.get_serializer(data=data)
             serializer.is_valid(raise_exception=True)

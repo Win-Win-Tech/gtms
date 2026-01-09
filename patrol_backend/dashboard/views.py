@@ -572,18 +572,42 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 checkpoint_name = "Unknown Checkpoint"
                 continue  # Skip if checkpoint doesn't exist
             
+            # Check if shift is overnight
+            is_overnight = shift.end_time <= shift.start_time
+            
             # For each date in the range where the assignment is active
             for check_date in date_range:
                 # Only process if assignment is active on this date
                 if not (assignment.start_date <= check_date <= assignment.end_date):
                     continue
                 
+                # Determine which date this checkpoint belongs to
+                if is_overnight:
+                    # For overnight shifts, check if checkpoint time is before or after midnight
+                    if expected_time_obj >= shift.start_time:
+                        # Checkpoint is on the same day as shift start (before midnight)
+                        checkpoint_date = check_date
+                    else:
+                        # Checkpoint is after midnight (next day)
+                        checkpoint_date = check_date + timedelta(days=1)
+                else:
+                    # Normal shift - checkpoint is on the same day
+                    checkpoint_date = check_date
+                
                 # Calculate expected time for this specific date in user timezone
-                expected_datetime_user = combine_date_time_in_user_tz(check_date, expected_time_obj, user_tz)
+                expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
                 
                 # Define the search window for this specific date's check-in (convert to UTC)
-                day_start_user = datetime.combine(check_date, datetime.min.time())
-                day_end_user = datetime.combine(check_date, datetime.max.time())
+                # For overnight shifts, we need to search across two days
+                if is_overnight and expected_time_obj < shift.start_time:
+                    # Checkpoint is on next day, so search window starts from checkpoint date
+                    day_start_user = datetime.combine(checkpoint_date, datetime.min.time())
+                    day_end_user = datetime.combine(checkpoint_date, datetime.max.time())
+                else:
+                    # Normal case or checkpoint before midnight in overnight shift
+                    day_start_user = datetime.combine(check_date, datetime.min.time())
+                    day_end_user = datetime.combine(check_date, datetime.max.time())
+                
                 day_start_utc, day_end_utc = convert_date_range_to_utc(day_start_user.date(), day_end_user.date(), user_tz)
                 day_end_utc = day_end_utc + timedelta(days=1)
                 
@@ -630,8 +654,11 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
                 actual_time_display = to_user_timezone(actual_time, user_tz) if actual_time else None
                 
+                # Use checkpoint_date for report date (handles overnight shifts correctly)
+                report_date = checkpoint_date if is_overnight else check_date
+                
                 report.append({
-                    'date': check_date.strftime('%Y-%m-%d'),
+                    'date': report_date.strftime('%Y-%m-%d'),
                     'guard_id': str(guard.id),
                     'guard_name': guard.name,
                     'location_id': str(location.id) if location else None,
@@ -1008,8 +1035,35 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
         duration = ""
 
         if shift:
-            shift_start = datetime.combine(checkin.date(), shift.start_time) if checkin else None
-            shift_end = datetime.combine(checkin.date(), shift.end_time) if checkin else None
+            # Check if shift is overnight
+            is_overnight = shift.end_time <= shift.start_time
+            
+            if checkin:
+                checkin_date = checkin.date()
+                
+                if is_overnight:
+                    # For overnight shifts, end time is on the next day
+                    shift_start = datetime.combine(checkin_date, shift.start_time)
+                    # If checkout is on the same date as checkin, shift end is next day
+                    # If checkout is on next day, shift end is on checkout date
+                    if checkout:
+                        checkout_date = checkout.date()
+                        if checkout_date > checkin_date:
+                            # Shift spans two days, end is on checkout date
+                            shift_end = datetime.combine(checkout_date, shift.end_time)
+                        else:
+                            # Both on same date (shouldn't happen for overnight, but handle it)
+                            shift_end = datetime.combine(checkin_date + timedelta(days=1), shift.end_time)
+                    else:
+                        # No checkout yet, assume end is next day
+                        shift_end = datetime.combine(checkin_date + timedelta(days=1), shift.end_time)
+                else:
+                    # Normal shift - both times on same day
+                    shift_start = datetime.combine(checkin_date, shift.start_time)
+                    shift_end = datetime.combine(checkin_date, shift.end_time)
+            else:
+                shift_start = None
+                shift_end = None
 
         if checkin and checkout:
             # Duration

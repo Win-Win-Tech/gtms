@@ -63,7 +63,7 @@ class IncidentReportView(APIView):
                 # Convert timestamp to user timezone for display
                 user_tz = get_user_timezone_from_request(request)
                 created_on_user = to_user_timezone(incident.created_on, user_tz)
-                
+
                 whatsapp_body = (
                     f"🚨 Incident Alert 🚨\n"
                     f"Severity: {incident.severity}\n"
