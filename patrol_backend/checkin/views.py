@@ -123,7 +123,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             
             for checkpoint_time_str in checkpoint_times_str:
                 checkpoint_time = datetime.strptime(checkpoint_time_str, "%H:%M").time()
-                
+
                 # Determine which date this checkpoint belongs to
                 if is_overnight:
                     # For overnight shifts, check if checkpoint time is before or after midnight
@@ -145,10 +145,10 @@ class CheckInViewSet(viewsets.ModelViewSet):
                     checkpoint_time, 
                     user_tz
                 )
-                
+
                 # Convert to user timezone for comparison
                 expected_checkpoint_dt_user = to_user_timezone(expected_checkpoint_dt_utc, user_tz)
-                
+
                 # Calculate time difference in minutes
                 time_diff = abs((checkin_time_user - expected_checkpoint_dt_user).total_seconds()) / 60
                 
@@ -181,7 +181,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Pass request context to serializer for timezone conversion
             serializer.context['request'] = request
             instance = serializer.save()
-            
+
             # Get serialized data with timezone conversion
             response_data = serializer.data
             response_data['delayed'] = delayed

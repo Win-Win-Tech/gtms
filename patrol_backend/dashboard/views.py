@@ -484,14 +484,16 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     """
     from django.utils.timezone import now as django_now
     
-    # Get user timezone if request is provided, otherwise use default
+    # Get user timezone from request (authenticated user making the request)
+    # This ensures filters use the requesting user's timezone, not admin's timezone
     if request:
         user_tz = get_user_timezone_from_request(request)
         today = get_user_today(user_tz)
     else:
         # For Celery tasks or non-request contexts, use default timezone
+        # Note: In Celery tasks, we should ideally get timezone from the user_id if provided
         user_tz = pytz.timezone('Asia/Kolkata')
-        today = timezone.now().date()
+        today = get_user_today(user_tz)  # Use get_user_today instead of timezone.now().date()
     
     # Parse filter and determine date range in user timezone
     if filter_type == 'today':
@@ -593,6 +595,12 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 else:
                     # Normal shift - checkpoint is on the same day
                     checkpoint_date = check_date
+                
+                # FIX: For "today" filter, only show checkpoints that fall within today's calendar day
+                # Skip checkpoints that are scheduled for tomorrow (after midnight)
+                if filter_type == 'today' and checkpoint_date != check_date:
+                    # This checkpoint is scheduled for tomorrow, skip it for "today" filter
+                    continue
                 
                 # Calculate expected time for this specific date in user timezone
                 expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
@@ -964,7 +972,7 @@ class DashboardCheckInReportExcelView(APIView):
             )
 
 
-def generate_attendance_excel_report_internal(date_filter='today', start_date=None, end_date=None, guard_id=None, location_id=None, shift_id=None, status_filter=None, defaulters=False):
+def generate_attendance_excel_report_internal(date_filter='today', start_date=None, end_date=None, guard_id=None, location_id=None, shift_id=None, status_filter=None, defaulters=False, request=None):
     """
     Internal helper function to generate attendance check-in Excel report.
     This contains the business logic that both the API endpoint and Celery tasks can use.
@@ -978,26 +986,47 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
         shift_id: Optional UUID string to filter by shift
         status_filter: Optional status string
         defaulters: Boolean to filter only defaulters
+        request: Optional request object for timezone detection (required for proper timezone handling)
     
     Returns: dict with 'file_path' and 'filename'
     """
     queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
 
-    today = datetime.now().date()
+    # Get user timezone from request (authenticated user making the request)
+    # This ensures filters use the requesting user's timezone, not admin's timezone
+    if request:
+        user_tz = get_user_timezone_from_request(request)
+        user_today = get_user_today(user_tz)
+    else:
+        # Fallback: use default timezone if no request (should not happen in normal API calls)
+        user_tz = pytz.timezone('Asia/Kolkata')
+        user_today = get_user_today(user_tz)
 
     if date_filter == "today":
-        queryset = queryset.filter(checkin_time__date=today)
+        # Convert today to UTC range for query
+        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "week":
-        start_week = today - timezone.timedelta(days=today.weekday())
-        end_week = start_week + timezone.timedelta(days=6)
-        queryset = queryset.filter(checkin_time__date__range=(start_week, end_week))
+        start_week = user_today - timedelta(days=user_today.weekday())
+        end_week = start_week + timedelta(days=6)
+        start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
+        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "month":
-        queryset = queryset.filter(checkin_time__date__month=today.month)
+        # Get month boundaries in user timezone
+        start_of_month = user_today.replace(day=1)
+        if user_today.month == 12:
+            end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+        start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
+        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "custom" and start_date and end_date:
         try:
             start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
             end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-            queryset = queryset.filter(checkin_time__date__range=(start_date_obj, end_date_obj))
+            # Convert to UTC range for query
+            start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
+            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         except ValueError:
             raise ValueError("Invalid custom date format. Use YYYY-MM-DD.")
 
@@ -1015,7 +1044,13 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
         queryset = queryset.filter(status=status_filter)
 
     if defaulters:
-        queryset = queryset.filter(checkin_time__date=today, checkout_time__isnull=True)
+        # Use UTC date range for today
+        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+        queryset = queryset.filter(
+            checkin_time__gte=start_utc,
+            checkin_time__lt=end_utc + timedelta(days=1),
+            checkout_time__isnull=True
+        )
 
     # Create Excel
     wb = Workbook()
@@ -1027,8 +1062,9 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
 
     row_count = 0  # Track number of data rows
     for obj in queryset:
-        checkin = obj.checkin_time
-        checkout = obj.checkout_time
+        # Convert UTC times to user timezone for display in Excel
+        checkin = to_user_timezone(obj.checkin_time, user_tz) if obj.checkin_time else None
+        checkout = to_user_timezone(obj.checkout_time, user_tz) if obj.checkout_time else None
         shift = obj.shift
         attendance_status = ""
         other_statuses = []
@@ -1039,28 +1075,30 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
             is_overnight = shift.end_time <= shift.start_time
             
             if checkin:
+                # checkin is already in user timezone (converted above)
                 checkin_date = checkin.date()
                 
                 if is_overnight:
                     # For overnight shifts, end time is on the next day
-                    shift_start = datetime.combine(checkin_date, shift.start_time)
+                    # Combine date and time in user timezone
+                    shift_start = user_tz.localize(datetime.combine(checkin_date, shift.start_time))
                     # If checkout is on the same date as checkin, shift end is next day
                     # If checkout is on next day, shift end is on checkout date
                     if checkout:
                         checkout_date = checkout.date()
                         if checkout_date > checkin_date:
                             # Shift spans two days, end is on checkout date
-                            shift_end = datetime.combine(checkout_date, shift.end_time)
+                            shift_end = user_tz.localize(datetime.combine(checkout_date, shift.end_time))
                         else:
                             # Both on same date (shouldn't happen for overnight, but handle it)
-                            shift_end = datetime.combine(checkin_date + timedelta(days=1), shift.end_time)
+                            shift_end = user_tz.localize(datetime.combine(checkin_date + timedelta(days=1), shift.end_time))
                     else:
                         # No checkout yet, assume end is next day
-                        shift_end = datetime.combine(checkin_date + timedelta(days=1), shift.end_time)
+                        shift_end = user_tz.localize(datetime.combine(checkin_date + timedelta(days=1), shift.end_time))
                 else:
                     # Normal shift - both times on same day
-                    shift_start = datetime.combine(checkin_date, shift.start_time)
-                    shift_end = datetime.combine(checkin_date, shift.end_time)
+                    shift_start = user_tz.localize(datetime.combine(checkin_date, shift.start_time))
+                    shift_end = user_tz.localize(datetime.combine(checkin_date, shift.end_time))
             else:
                 shift_start = None
                 shift_end = None
@@ -1161,7 +1199,8 @@ class AttendanceCheckinExportView(APIView):
                 location_id=location_id,
                 shift_id=shift_id,
                 status_filter=status_filter,
-                defaulters=defaulters
+                defaulters=defaulters,
+                request=request  # Pass request for timezone detection
             )
             
             file_path = result['file_path']
@@ -1190,7 +1229,7 @@ class AttendanceCheckinExportView(APIView):
             return Response({"error": f"Failed to generate report: {str(e)}"}, status=500)
 
 
-def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None):
+def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, request=None):
     """
     Internal helper function to generate monthly attendance summary data.
     This contains the business logic shared by both JSON and Excel endpoints.
@@ -1201,6 +1240,7 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
         end_date_str: Optional string in YYYY-MM-DD format (for custom range)
         location_id: Optional UUID string to filter by location
         user_id: Optional UUID string to filter by guard
+        request: Optional request object for timezone detection (to determine "today" for future date check)
     
     Returns:
         dict with 'summary_data' (list of dicts), 'date_range' (list of dates), 
@@ -1238,6 +1278,15 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
     if user_id:
         assignments = assignments.filter(guard_id=user_id)
 
+    # Get user timezone and today for future date check
+    if request:
+        user_tz = get_user_timezone_from_request(request)
+        user_today = get_user_today(user_tz)
+    else:
+        # Fallback: use default timezone if no request (for Celery tasks)
+        user_tz = pytz.timezone('Asia/Kolkata')
+        user_today = get_user_today(user_tz)
+
     # Generate date range
     date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
@@ -1267,6 +1316,11 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
 
         # Check attendance for each date
         for date in date_range:
+            # Check if date is in the future - if so, show "-" instead of "A"
+            if date > user_today:
+                row[date.strftime("%d-%b")] = "-"
+                continue
+
             active_assignments = [
                 a for a in data["assignments"]
                 if a.start_date <= date <= a.end_date
@@ -1276,10 +1330,13 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
                 row[date.strftime("%d-%b")] = "-"
                 continue
 
+            # Convert date to UTC range for query using user timezone
+            start_utc, end_utc = convert_date_range_to_utc(date, date, user_tz)
             has_checkin = AttendanceCheckin.objects.filter(
                 guard=guard,
                 assignment__in=active_assignments,
-                checkin_time__date=date
+                checkin_time__gte=start_utc,
+                checkin_time__lt=end_utc + timedelta(days=1)
             ).exists()
 
             row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
@@ -1294,7 +1351,7 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
     }
 
 
-def generate_monthly_attendance_summary_excel_internal(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None):
+def generate_monthly_attendance_summary_excel_internal(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, request=None):
     """
     Internal helper function to generate monthly attendance summary Excel report.
     This contains the business logic that both the API endpoint and Celery tasks can use.
@@ -1305,16 +1362,18 @@ def generate_monthly_attendance_summary_excel_internal(month=None, start_date_st
         end_date_str: Optional string in YYYY-MM-DD format (for custom range)
         location_id: Optional UUID string to filter by location
         user_id: Optional UUID string to filter by guard
+        request: Optional request object for timezone detection (to determine "today" for future date check)
     
     Returns: dict with 'file_path', 'filename', 'start_date', 'end_date', 'row_count'
     """
-    # Get summary data using core helper
+    # Get summary data using core helper (pass request for timezone detection)
     result = _get_monthly_attendance_summary_data(
         month=month,
         start_date_str=start_date_str,
         end_date_str=end_date_str,
         location_id=location_id,
-        user_id=user_id
+        user_id=user_id,
+        request=request  # Pass request for timezone detection
     )
     
     summary_data = result['summary_data']
@@ -1375,13 +1434,14 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
         end_date = request.query_params.get("end_date")
 
         try:
-            # Use internal helper function
+            # Use internal helper function (pass request for timezone detection)
             result = _get_monthly_attendance_summary_data(
                 month=month,
                 start_date_str=start_date,
                 end_date_str=end_date,
                 location_id=location_id,
-                user_id=user_id
+                user_id=user_id,
+                request=request  # Pass request for timezone detection
             )
             
             return Response(result['summary_data'])
@@ -1543,6 +1603,7 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
                 month=month,
                 start_date_str=start_date,
                 end_date_str=end_date,
+                request=request,  # Pass request for timezone detection
                 location_id=location_id,
                 user_id=user_id
             )
