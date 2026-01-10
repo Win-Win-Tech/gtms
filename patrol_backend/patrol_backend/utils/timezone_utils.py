@@ -30,20 +30,41 @@ def get_user_timezone(user):
     return pytz.timezone('Asia/Kolkata')
 
 
-def get_user_timezone_from_request(request):
+def get_user_timezone_from_request(request, location_id=None):
     """
     Get timezone from authenticated user model (from JWT token).
+    For superadmin viewing location-specific reports, uses location admin's timezone.
     
     Priority:
-    1. User model timezone field (from authenticated user)
-    2. Default (Asia/Kolkata)
+    1. Location admin's timezone (if location_id provided and location has admin)
+    2. User model timezone field (from authenticated user)
+    3. Default (Asia/Kolkata)
     
     Args:
         request: Django request object
+        location_id: Optional UUID string - if provided, use location admin's timezone
     
     Returns:
         pytz timezone object
     """
+    # If location_id is provided, try to use location admin's timezone
+    if location_id:
+        try:
+            from scheduler.models import Location
+            from authapp.models import User as AuthUser
+            location = Location.objects.get(id=location_id)
+            # Find admin for this location
+            location_admin = AuthUser.objects.filter(
+                location=location,
+                role='admin',
+                is_deleted=False
+            ).first()
+            if location_admin and location_admin.timezone:
+                return pytz.timezone(location_admin.timezone)
+        except Exception:
+            # If location not found or error, fall through to user timezone
+            pass
+    
     # Get timezone from authenticated user (from JWT token)
     if hasattr(request, 'user') and request.user and request.user.is_authenticated:
         return get_user_timezone(request.user)

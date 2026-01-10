@@ -488,9 +488,10 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     from django.utils.timezone import now as django_now
     
     # Get user timezone from request (authenticated user making the request)
-    # This ensures filters use the requesting user's timezone, not admin's timezone
+    # For superadmin viewing location-specific reports, uses location admin's timezone
+    # This ensures filters use the correct timezone for the location being viewed
     if request:
-        user_tz = get_user_timezone_from_request(request)
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
         today = get_user_today(user_tz)
     else:
         # For Celery tasks or non-request contexts, use default timezone
@@ -546,6 +547,12 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     date_range = []
     current_date = start_dt_user.date()
     end_date = end_dt_user.date()
+    
+    # For "this_week", "this_month", and "custom" filters, limit to only include dates up to today
+    # This prevents showing checkpoints from future shifts
+    if filter_type in ['this_week', 'this_month', 'custom']:
+        end_date = min(end_date, today)
+    
     while current_date <= end_date:
         date_range.append(current_date)
         current_date += timedelta(days=1)
@@ -590,6 +597,10 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     dates_to_check.insert(0, prev_day)
             
             for check_date in dates_to_check:
+                # Skip future dates - don't process shifts that haven't started yet
+                if check_date > today:
+                    continue
+                
                 # Only process if assignment is active on this date
                 if not (assignment.start_date <= check_date <= assignment.end_date):
                     continue
@@ -713,6 +724,15 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     'status': status,
                     'delay_minutes': delay
                 })
+    
+    # Sort report by date, then by guard_name, then by checkpoint_name, then by expected_time
+    # This ensures all checkpoints for a date are grouped together
+    report.sort(key=lambda x: (
+        x['date'],
+        x['guard_name'],
+        x['checkpoint_name'],
+        x['expected_time'] if x['expected_time'] else ''
+    ))
     
     logger.info(f"[CHECKIN_REPORT] Generated {len(report)} records for filter: {filter_type}")
     return report
@@ -1033,9 +1053,9 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
     queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
 
     # Get user timezone from request (authenticated user making the request)
-    # This ensures filters use the requesting user's timezone, not admin's timezone
+    # For superadmin viewing location-specific reports, uses location admin's timezone
     if request:
-        user_tz = get_user_timezone_from_request(request)
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
         user_today = get_user_today(user_tz)
     else:
         # Fallback: use default timezone if no request (should not happen in normal API calls)
@@ -1325,8 +1345,10 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
         assignments = assignments.filter(guard_id=user_id)
 
     # Get user timezone and today for future date check
+    # IMPORTANT: Get user_today BEFORE generating date_range to ensure correct future date detection
+    # For superadmin viewing location-specific reports, uses location admin's timezone
     if request:
-        user_tz = get_user_timezone_from_request(request)
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
         user_today = get_user_today(user_tz)
     else:
         # Fallback: use default timezone if no request (for Celery tasks)
@@ -1334,7 +1356,17 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
         user_today = get_user_today(user_tz)
 
     # Generate date range
-    date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    # For month parameter, always include full month (even future dates will show as "-")
+    # For custom range, limit to user_today if end_date is in future
+    if month:
+        # Keep full month range - future dates will be handled in the loop to show "-"
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    else:
+        # For custom range, limit to user_today if end_date is in future
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        if end_date > user_today:
+            date_range = [d for d in date_range if d <= user_today]
+            end_date = user_today
 
     # Group assignments by guard + location
     grouped = defaultdict(lambda: {
