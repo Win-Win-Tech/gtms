@@ -6,6 +6,7 @@ from django.contrib.auth import get_user_model
 from geopy.distance import geodesic
 from datetime import timedelta
 from datetime import datetime, time
+import logging
 from .models import CheckIn
 from .serializers import CheckInSerializer
 from scheduler.models import Assignment, Checkpoint, Shift, SiteSetting
@@ -19,6 +20,7 @@ from patrol_backend.utils.timezone_utils import (
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 class CheckInViewSet(viewsets.ModelViewSet):
     queryset = CheckIn.objects.all()
@@ -28,7 +30,6 @@ class CheckInViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         try:
             data = request.data
-            print("data", data)
             site_settings = SiteSetting.objects.all()
        
             guard_id = data.get('guard')
@@ -39,6 +40,12 @@ class CheckInViewSet(viewsets.ModelViewSet):
             latitude = float(data.get('latitude'))
             longitude = float(data.get('longitude'))
             qr_data = data.get('data')
+            
+            # Get user's timezone for logging
+            user_tz = get_user_timezone_from_request(request)
+            user_today = get_user_today(user_tz)
+            user_now = to_user_timezone(now(), user_tz)
+            
 
             # Rule 1: Validate guard exists
             try:
@@ -103,6 +110,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Get all checkpoint times for this checkpoint (handles multiple occurrences)
             checkpoint_times_str = get_all_checkpoint_times(assignment, checkpoint_id)
             if not checkpoint_times_str:
+                logger.warning(f"[SCAN_CHECKPOINT_API] Checkpoint time not found - Assignment ID: {assigned_id}, Checkpoint ID: {checkpoint_id}")
                 return Response({"error": "Checkpoint time not found in assignment"}, status=status.HTTP_400_BAD_REQUEST)
             
             # Get current time in UTC (for storage)
@@ -114,6 +122,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Get today's date in user's timezone
             user_today = get_user_today(user_tz)
             
+            
             # Check if shift is overnight
             is_overnight = shift.end_time <= shift.start_time
             
@@ -124,17 +133,18 @@ class CheckInViewSet(viewsets.ModelViewSet):
             for checkpoint_time_str in checkpoint_times_str:
                 checkpoint_time = datetime.strptime(checkpoint_time_str, "%H:%M").time()
 
-                # Determine which date this checkpoint belongs to
+                # Determine which calendar date this checkpoint occurs on
+                # For overnight shifts: checkpoints after midnight occur on TODAY's calendar date
+                # For normal shifts: checkpoints always occur on today's date
                 if is_overnight:
-                    # For overnight shifts, check if checkpoint time is before or after midnight
-                    # If checkpoint time is >= shift start_time, it's on the start date
-                    # If checkpoint time is <= shift end_time, it's on the next day
-                    if checkpoint_time >= shift.start_time:
-                        # Checkpoint is on the same day as shift start (before midnight)
-                        checkpoint_date = user_today
-                    else:
-                        # Checkpoint is after midnight (next day)
-                        checkpoint_date = user_today + timedelta(days=1)
+                    # For overnight shifts:
+                    # - If checkpoint_time >= shift.start_time: Checkpoint is before midnight (e.g., 8:00 PM)
+                    #   Occurs on today's calendar date
+                    # - If checkpoint_time < shift.start_time: Checkpoint is after midnight (e.g., 1:30 AM)
+                    #   Occurs on TODAY's calendar date (not tomorrow!)
+                    #   Example: Scan at 1:30 AM on Jan 10 → checkpoint_date = Jan 10 (not Jan 11)
+                    #   This checkpoint belongs to the shift that STARTED on Jan 9, but occurs on Jan 10
+                    checkpoint_date = user_today
                 else:
                     # Normal shift - checkpoint is on the same day
                     checkpoint_date = user_today
@@ -189,6 +199,8 @@ class CheckInViewSet(viewsets.ModelViewSet):
             response_data['success'] = True
             response_data['distance_from_checkpoint_m'] = round(distance, 2)
 
+            logger.info(f"[SCAN_CHECKPOINT_API] Check-in successful - Guard: {guard_id}, Checkpoint: {checkpoint_id}, Delay: {min_time_diff:.1f}min")
+            
             return Response(
                 response_data,
                 status=status.HTTP_201_CREATED
@@ -196,6 +208,6 @@ class CheckInViewSet(viewsets.ModelViewSet):
 
 
         except Exception as e:
-            print(f"Check-in creation error: {e}")
+            logger.error(f"[SCAN_CHECKPOINT_API] Error: {str(e)}", exc_info=True)
             return Response({"error": "An unexpected error occurred during check-in."},
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)

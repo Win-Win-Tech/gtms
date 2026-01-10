@@ -1,6 +1,7 @@
 # Standard library imports
 import csv
 import json
+import logging
 import os
 from calendar import monthrange
 from collections import defaultdict
@@ -56,6 +57,9 @@ from .serializers import (
     AttendanceCheckinSerializer,
     CheckInReportSerializer,
 )
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -171,7 +175,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Convert today to UTC date range for database query
         # Database stores UTC, so we need to query using UTC date range
         start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
-        
+
         attendance = AttendanceCheckin.objects.filter(
             guard=user, shift=shift, assignment=assignment,
             checkin_time__gte=start_utc,
@@ -283,7 +287,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
         distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-        print("request.data", request.data)
 
         if distance > 100:
             return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
@@ -337,9 +340,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         if earliest_checkin:
             attendance.checkin_time = earliest_checkin.timestamp  # Already in UTC
-            attendance.latitude = earliest_checkin.latitude
-            attendance.longitude = earliest_checkin.longitude
-            attendance.save()
+        attendance.latitude = earliest_checkin.latitude
+        attendance.longitude = earliest_checkin.longitude
+        attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
@@ -398,7 +401,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         if latest_checkout:
             attendance.checkout_time = latest_checkout.timestamp  # Already in UTC
-            attendance.save()
+        attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
 
@@ -529,7 +532,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         start_date__lte=end_utc.date(),
         end_date__gte=start_utc.date()
     ).select_related('guard', 'location', 'shift')
-    
+
     if user_id:
         assignments = assignments.filter(guard_id=user_id)
     if location_id:
@@ -578,29 +581,43 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
             is_overnight = shift.end_time <= shift.start_time
             
             # For each date in the range where the assignment is active
-            for check_date in date_range:
+            # For "today" filter, we also need to check the previous day's shift for overnight checkpoints
+            dates_to_check = list(date_range)
+            if filter_type == 'today' and is_overnight:
+                # Also check previous day for overnight shifts (to catch checkpoints after midnight)
+                prev_day = today - timedelta(days=1)
+                if assignment.start_date <= prev_day <= assignment.end_date:
+                    dates_to_check.insert(0, prev_day)
+            
+            for check_date in dates_to_check:
                 # Only process if assignment is active on this date
                 if not (assignment.start_date <= check_date <= assignment.end_date):
                     continue
                 
-                # Determine which date this checkpoint belongs to
+                # Determine which calendar date this checkpoint occurs on
+                # For overnight shifts: checkpoints after midnight occur on the NEXT calendar day
+                # For normal shifts: checkpoints occur on the same day
                 if is_overnight:
                     # For overnight shifts, check if checkpoint time is before or after midnight
                     if expected_time_obj >= shift.start_time:
-                        # Checkpoint is on the same day as shift start (before midnight)
+                        # Checkpoint is before midnight - occurs on the same calendar day as shift start
                         checkpoint_date = check_date
                     else:
-                        # Checkpoint is after midnight (next day)
+                        # Checkpoint is after midnight - occurs on the NEXT calendar day
                         checkpoint_date = check_date + timedelta(days=1)
                 else:
                     # Normal shift - checkpoint is on the same day
                     checkpoint_date = check_date
                 
-                # FIX: For "today" filter, only show checkpoints that fall within today's calendar day
-                # Skip checkpoints that are scheduled for tomorrow (after midnight)
-                if filter_type == 'today' and checkpoint_date != check_date:
-                    # This checkpoint is scheduled for tomorrow, skip it for "today" filter
-                    continue
+                # FIX: For "today" filter - include ALL checkpoints that occur on today's calendar date
+                # This includes:
+                # 1. Checkpoints from yesterday's overnight shift that occur today (e.g., 1:30 AM Jan 10 from Jan 9 shift)
+                # 2. Checkpoints from today's shift that occur today (e.g., 8:00 PM Jan 10 from Jan 10 shift)
+                # We use checkpoint_date (the actual calendar date the checkpoint occurs) to determine this
+                if filter_type == 'today':
+                    # Include if checkpoint occurs on today's calendar date (regardless of which shift it belongs to)
+                    if checkpoint_date != today:
+                        continue
                 
                 # Calculate expected time for this specific date in user timezone
                 expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
@@ -663,7 +680,23 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 actual_time_display = to_user_timezone(actual_time, user_tz) if actual_time else None
                 
                 # Use checkpoint_date for report date (handles overnight shifts correctly)
-                report_date = checkpoint_date if is_overnight else check_date
+                # For overnight shifts, use check_date (when shift started) for report date
+                # This ensures all checkpoints from the same shift show the same date
+                if is_overnight:
+                    report_date = check_date  # Use the date the shift started
+                else:
+                    report_date = checkpoint_date
+                
+                # FIX: Only include checkpoints that fall within the filter date range
+                # For "today" filter, we already handled it above for overnight shifts
+                if filter_type == 'today':
+                    # Already handled above, but double-check for normal shifts
+                    if not is_overnight and report_date != today:
+                        continue
+                elif filter_type in ['this_week', 'this_month', 'custom']:
+                    # For other filters, ensure report_date is within the date range
+                    if not (start_dt_user.date() <= report_date <= end_dt_user.date()):
+                        continue  # Skip checkpoints outside the filter range
                 
                 report.append({
                     'date': report_date.strftime('%Y-%m-%d'),
@@ -681,6 +714,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     'delay_minutes': delay
                 })
     
+    logger.info(f"[CHECKIN_REPORT] Generated {len(report)} records for filter: {filter_type}")
     return report
 
 
@@ -704,6 +738,8 @@ class DashboardCheckInReportView(APIView):
         location_id = request.query_params.get('location_id')
         shift_id = request.query_params.get('shift_id')
         
+        # Log request details (both logger and print for visibility)
+        
         try:
             # Get report data using shared core function
             report_data = _get_checkin_report_data(
@@ -712,7 +748,8 @@ class DashboardCheckInReportView(APIView):
                 end_date_str=end_date,
                 user_id=user_id,
                 location_id=location_id,
-                shift_id=shift_id
+                shift_id=shift_id,
+                request=request  # Pass request for timezone detection
             )
             
             # Format datetime fields for JSON response (already in user timezone from _get_checkin_report_data)
@@ -735,8 +772,10 @@ class DashboardCheckInReportView(APIView):
             return Response(serializer.data, status=status.HTTP_200_OK)
             
         except ValueError as e:
+            logger.error(f"[CHECKIN_REPORT_API] ValueError: {str(e)}")
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
+            logger.error(f"[CHECKIN_REPORT_API] Exception: {str(e)}", exc_info=True)
             return Response(
                 {"error": f"An error occurred while generating the report: {str(e)}"}, 
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -903,6 +942,7 @@ class DashboardCheckInReportExcelView(APIView):
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
         shift_id = request.query_params.get('shift_id')
+        
         
         try:
             # Get report data using shared core function (pass request for timezone)
@@ -1189,6 +1229,8 @@ class AttendanceCheckinExportView(APIView):
         status_filter = request.query_params.get("status")
         defaulters = request.query_params.get("defaulters") == "true"
         
+        log_msg = f"[ATTENDANCE_EXPORT_API] GET request - Filter: {date_filter}, Start: {start_date}, End: {end_date}, Guard ID: {guard_id}, Location ID: {location_id}, Shift ID: {shift_id}, Status: {status_filter}, Defaulters: {defaulters}"
+        
         try:
             # Use internal helper function to avoid code duplication
             result = generate_attendance_excel_report_internal(
@@ -1224,8 +1266,12 @@ class AttendanceCheckinExportView(APIView):
             return response
             
         except ValueError as e:
+            error_msg = f"[ATTENDANCE_EXPORT_API] ValueError: {str(e)}"
+            logger.error(error_msg)
             return Response({"error": str(e)}, status=400)
         except Exception as e:
+            error_msg = f"[ATTENDANCE_EXPORT_API] Exception: {str(e)}"
+            logger.error(error_msg, exc_info=True)
             return Response({"error": f"Failed to generate report: {str(e)}"}, status=500)
 
 
@@ -1433,6 +1479,7 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 
+
         try:
             # Use internal helper function (pass request for timezone detection)
             result = _get_monthly_attendance_summary_data(
@@ -1447,8 +1494,12 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
             return Response(result['summary_data'])
             
         except ValueError as e:
+            error_msg = f"[MONTHLY_ATTENDANCE_SUMMARY_API] ValueError: {str(e)}"
+            logger.error(error_msg)
             return Response({"error": str(e)}, status=400)
         except Exception as e:
+            error_msg = f"[MONTHLY_ATTENDANCE_SUMMARY_API] Exception: {str(e)}"
+            logger.error(error_msg, exc_info=True)
             return Response({"error": f"Failed to generate summary: {str(e)}"}, status=500)
 
 
@@ -1594,6 +1645,7 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
         location_id = request.query_params.get("location_id")
         user_id = request.query_params.get("user_id")
         month = request.query_params.get("month")
+        
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
 

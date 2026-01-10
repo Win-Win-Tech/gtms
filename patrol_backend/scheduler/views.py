@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status as http_status
 from .models import Location, Shift, Assignment, Checkpoint, SiteSetting
 from checkin.models import CheckIn
 from .serializers import (
@@ -22,6 +22,14 @@ from rest_framework.decorators import action
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from django.http import HttpResponse
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    get_user_today,
+    get_user_now,
+    combine_date_time_in_user_tz,
+    to_user_timezone,
+    convert_date_range_to_utc
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,16 +130,20 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             user_tz = get_user_timezone_from_request(request)
             today = get_user_today(user_tz)
             
+            
             assignments = Assignment.objects.filter(guard_id=user_id, start_date__lte=today, end_date__gte=today)
             result = []
-            print("assignnnnnnnnn", assignments)
             
             # Convert today to UTC date range for database queries
-            from patrol_backend.utils.timezone_utils import convert_date_range_to_utc
             start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
+            
             
             for assignment in assignments:
                 checkpoint_data = assignment.checkpoints
+                shift = assignment.shift
+                is_overnight = shift.end_time <= shift.start_time
+                
+                
                 completed_ids = set(
                     CheckIn.objects.filter(
                         guard_id=user_id,
@@ -149,18 +161,45 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                     try:
                         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
-                        # Combine date and time in user timezone, then convert to UTC for comparison
-                        checkpoint_datetime_user = combine_date_time_in_user_tz(today, checkpoint_time, user_tz)
-                        checkpoint_datetime_user = checkpoint_datetime_user.astimezone(user_tz)
                         
-                        # Get current time in user timezone
+                        # Get current time in user timezone (needed for shift instance determination)
                         from patrol_backend.utils.timezone_utils import get_user_now
                         user_now = get_user_now(user_tz)
+                        current_time = user_now.time()
+                        
+                        # Determine which calendar date this checkpoint occurs on
+                        # For overnight shifts: need to determine which shift instance is active
+                        if is_overnight:
+                            if checkpoint_time >= shift.start_time:
+                                # Checkpoint is before midnight - belongs to today's shift
+                                checkpoint_date = today
+                            else:
+                                # Checkpoint is after midnight - need to determine which shift instance
+                                # If current time < shift.end_time: We're still in yesterday's shift
+                                #   → Checkpoint belongs to yesterday's shift but occurs on today
+                                # If current time >= shift.end_time: Yesterday's shift ended
+                                #   → Checkpoint belongs to today's shift and occurs tomorrow
+                                if current_time < shift.end_time:
+                                    # Still in yesterday's shift - checkpoint occurs today
+                                    checkpoint_date = today
+                                else:
+                                    # Past yesterday's shift end - this is tomorrow's checkpoint from today's shift
+                                    checkpoint_date = today + timedelta(days=1)
+                                    # Only include if assignment is still active on that date
+                                    if not (assignment.start_date <= checkpoint_date <= assignment.end_date):
+                                        continue  # Skip if assignment not active on that date
+                        else:
+                            # Normal shift - checkpoint is on the same day
+                            checkpoint_date = today
+                        
+                        # Combine date and time in user timezone, then convert to UTC for comparison
+                        checkpoint_datetime_user = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, user_tz)
+                        checkpoint_datetime_user = checkpoint_datetime_user.astimezone(user_tz)
                         
                         # Check if overdue (in user timezone)
                         is_overdue = user_now > checkpoint_datetime_user + timedelta(minutes=15)
                     except Exception as e:
-                        print("eeee",e)
+                        logger.warning(f"[UPCOMING_CHECKPOINTS_API] Error processing checkpoint time: {e}")
                         is_overdue = False
 
                     is_checked_in = UUID(checkpoint_id) in completed_ids
@@ -208,10 +247,11 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                     result.append(checkpoint_info)
 
+            logger.info(f"[UPCOMING_CHECKPOINTS_API] Returned {len(result)} checkpoints for user {user_id}")
             return Response(result)
         except Exception as e:
-            logger.error(f"Error fetching upcoming checkpoints: {e}", exc_info=True)
-            return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.error(f"[UPCOMING_CHECKPOINTS_API] Error: {str(e)}", exc_info=True)
+            return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='by-guard/(?P<guard_id>[^/.]+)')
     def by_guard(self, request, guard_id=None):
