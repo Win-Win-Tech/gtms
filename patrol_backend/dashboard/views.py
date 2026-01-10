@@ -807,8 +807,11 @@ class AttendanceCheckinListView(generics.ListAPIView):
     def get_queryset(self):
         queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
 
-        # Get user timezone
-        user_tz = get_user_timezone_from_request(self.request)
+        # Get location_id for timezone (for superadmin viewing location-specific reports)
+        location_id = self.request.query_params.get("location")
+        
+        # Get user timezone - for superadmin viewing location-specific reports, uses location admin's timezone
+        user_tz = get_user_timezone_from_request(self.request, location_id=location_id)
         date_filter = self.request.query_params.get("date_filter", "today")
 
         user_today = get_user_today(user_tz)
@@ -819,16 +822,19 @@ class AttendanceCheckinListView(generics.ListAPIView):
             queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "week":
             start_week = user_today - timedelta(days=user_today.weekday())
-            end_week = start_week + timedelta(days=6)
+            # Limit to user_today to prevent showing future dates
+            end_week = min(start_week + timedelta(days=6), user_today)
             start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
             queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "month":
             # Get month boundaries in user timezone
             start_of_month = user_today.replace(day=1)
-            if user_today.month == 12:
-                end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
-            else:
-                end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+            # Limit to user_today to prevent showing future dates
+            end_of_month = min(
+                user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1) if user_today.month != 12
+                else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
+                user_today
+            )
             start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
             queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
         elif date_filter == "custom":
@@ -838,6 +844,8 @@ class AttendanceCheckinListView(generics.ListAPIView):
                 try:
                     start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
                     end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+                    # Limit to user_today to prevent showing future dates
+                    end_date_obj = min(end_date_obj, user_today)
                     # Convert to UTC range for query
                     start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
                     queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
@@ -1068,22 +1076,27 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
         queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "week":
         start_week = user_today - timedelta(days=user_today.weekday())
-        end_week = start_week + timedelta(days=6)
+        # Limit to user_today to prevent showing future dates
+        end_week = min(start_week + timedelta(days=6), user_today)
         start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
         queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "month":
         # Get month boundaries in user timezone
         start_of_month = user_today.replace(day=1)
-        if user_today.month == 12:
-            end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+        # Limit to user_today to prevent showing future dates
+        end_of_month = min(
+            user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1) if user_today.month != 12
+            else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
+            user_today
+        )
         start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
         queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))
     elif date_filter == "custom" and start_date and end_date:
         try:
             start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
             end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+            # Limit to user_today to prevent showing future dates
+            end_date_obj = min(end_date_obj, user_today)
             # Convert to UTC range for query
             start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
             queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lt=end_utc + timedelta(days=1))

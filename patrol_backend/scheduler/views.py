@@ -270,6 +270,13 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             year = int(year)
             month = int(month)
             num_days = monthrange(year, month)[1]
+            
+            # Get user timezone - for superadmin viewing location-specific reports, uses location admin's timezone
+            user_tz = get_user_timezone_from_request(request, location_id=location_id)
+            # Note: This API shows shift assignments (schedules), not attendance records
+            # So we always return the full month to show all scheduled shifts, including future dates
+            
+            # Always generate full month days array (01-01 through 31-01, etc.)
             days = [f"{day:02d}-{month:02d}" for day in range(1, num_days + 1)]
 
             # Get all assignments for the location
@@ -280,7 +287,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 is_deleted=False
             )
 
-            # Build summary map
+            # Build summary map - initialize with all days set to '-'
             summary_map = defaultdict(lambda: {
                 'name': '',
                 'location': '',
@@ -292,6 +299,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 location_name = assignment.shift.location.name
                 shift_name = assignment.shift.name
 
+                # Process all days in the month (not limited to today)
                 for day in range(1, num_days + 1):
                     current_date = datetime(year, month, day).date()
                     if assignment.start_date <= current_date <= assignment.end_date:
@@ -309,7 +317,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
         except Exception as e:
             logger.error(f"Error generating location-based summary: {e}", exc_info=True)
-            return Response({'error': 'Failed to generate summary.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to generate summary.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path=r'monthly-location-summary-excel/(?P<location_id>[^/.]+)/(?P<year>\d{4})/(?P<month>\d{1,2})')
     def monthly_location_summary_excel(self, request, location_id=None, year=None, month=None):
@@ -317,6 +325,13 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             year = int(year)
             month = int(month)
             num_days = monthrange(year, month)[1]
+            
+            # Get user timezone - for superadmin viewing location-specific reports, uses location admin's timezone
+            user_tz = get_user_timezone_from_request(request, location_id=location_id)
+            # Note: This API shows shift assignments (schedules), not attendance records
+            # So we always return the full month to show all scheduled shifts, including future dates
+            
+            # Always generate full month days array (01-01 through 31-01, etc.)
             days = [f"{day:02d}-{month:02d}" for day in range(1, num_days + 1)]
 
             assignments = Assignment.objects.select_related('guard', 'shift', 'shift__location').filter(
@@ -337,6 +352,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 location_name = assignment.shift.location.name
                 shift_name = assignment.shift.name
 
+                # Process all days in the month (not limited to today)
                 for day in range(1, num_days + 1):
                     current_date = datetime(year, month, day).date()
                     if assignment.start_date <= current_date <= assignment.end_date:
