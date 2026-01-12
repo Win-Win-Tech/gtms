@@ -493,6 +493,8 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     if request:
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         today = get_user_today(user_tz)
+        # Log timezone being used for debugging
+        logger.info(f"[CHECKIN_REPORT] Using timezone: {user_tz.zone} for location_id: {location_id}")
     else:
         # For Celery tasks or non-request contexts, use default timezone
         # Note: In Celery tasks, we should ideally get timezone from the user_id if provided
@@ -533,7 +535,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         start_date__lte=end_utc.date(),
         end_date__gte=start_utc.date()
     ).select_related('guard', 'location', 'shift')
-
+    
     if user_id:
         assignments = assignments.filter(guard_id=user_id)
     if location_id:
@@ -657,7 +659,19 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 
                 actual_time = None
                 delay = None
-                status = "Missed"
+                
+                # Determine default status based on whether scheduled time has passed
+                # Convert expected time to user timezone for comparison
+                if expected_datetime_user:
+                    expected_time_user = expected_datetime_user.astimezone(user_tz)
+                    user_now = get_user_now(user_tz)
+                    # Check if scheduled time + 15 minutes grace period has passed
+                    if user_now > expected_time_user + timedelta(minutes=15):
+                        status = "Missed"  # Time has passed, no check-in = Missed
+                    else:
+                        status = "Pending"  # Time hasn't passed yet = Pending
+                else:
+                    status = "Missed"  # Fallback if no expected time
                 
                 # Process check-in if found
                 if checkin:
@@ -671,9 +685,16 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                         # Valid synced check-in
                         actual_time = checkin.timestamp
                         
+                        # Log UTC time before conversion
+                        logger.info(f"[CHECKIN_REPORT] UTC time (before conversion): {actual_time}, timezone: {actual_time.tzinfo if actual_time else None}")
+                        
                         # Convert both to user timezone for delay calculation
                         actual_time_user = to_user_timezone(actual_time, user_tz)
                         expected_time_user = expected_datetime_user.astimezone(user_tz)
+                        
+                        # Log converted time
+                        logger.info(f"[CHECKIN_REPORT] Converted time (after conversion): {actual_time_user}, target timezone: {user_tz.zone}")
+                        logger.info(f"[CHECKIN_REPORT] Expected time: {expected_time_user}, timezone: {expected_time_user.tzinfo if expected_time_user else None}")
                         
                         # Calculate delay in minutes (in user timezone)
                         delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
@@ -688,7 +709,13 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 
                 # Add to report (convert times to user timezone for display)
                 expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
-                actual_time_display = to_user_timezone(actual_time, user_tz) if actual_time else None
+                if actual_time:
+                    # Log before final conversion for display
+                    logger.info(f"[CHECKIN_REPORT] Display conversion - UTC: {actual_time}, Converting to: {user_tz.zone}")
+                    actual_time_display = to_user_timezone(actual_time, user_tz)
+                    logger.info(f"[CHECKIN_REPORT] Display conversion - Result: {actual_time_display}, timezone: {actual_time_display.tzinfo if actual_time_display else None}")
+                else:
+                    actual_time_display = None
                 
                 # Use checkpoint_date for report date (handles overnight shifts correctly)
                 # For overnight shifts, use check_date (when shift started) for report date
@@ -773,19 +800,25 @@ class DashboardCheckInReportView(APIView):
             )
             
             # Format datetime fields for JSON response (already in user timezone from _get_checkin_report_data)
-            for item in report_data:
+            for idx, item in enumerate(report_data):
                 if item['expected_time']:
+                    # Log before formatting
+                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time before format: {item['expected_time']}, timezone: {item['expected_time'].tzinfo if hasattr(item['expected_time'], 'tzinfo') else 'N/A'}")
                     # Convert to ISO format string (timezone-aware)
                     if hasattr(item['expected_time'], 'isoformat'):
                         item['expected_time'] = item['expected_time'].isoformat()
                     else:
                         item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
+                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time after format: {item['expected_time']}")
                 if item['actual_checkin_time']:
+                    # Log before formatting
+                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time before format: {item['actual_checkin_time']}, timezone: {item['actual_checkin_time'].tzinfo if hasattr(item['actual_checkin_time'], 'tzinfo') else 'N/A'}")
                     # Convert to ISO format string (timezone-aware)
                     if hasattr(item['actual_checkin_time'], 'isoformat'):
                         item['actual_checkin_time'] = item['actual_checkin_time'].isoformat()
                     else:
                         item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
+                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time after format: {item['actual_checkin_time']}")
             
             # Serialize and return
             serializer = CheckInReportSerializer(report_data, many=True)

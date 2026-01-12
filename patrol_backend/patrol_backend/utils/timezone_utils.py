@@ -53,7 +53,8 @@ def get_user_timezone_from_request(request, location_id=None):
             from scheduler.models import Location
             from authapp.models import User as AuthUser
             location = Location.objects.get(id=location_id)
-            # Find admin for this location
+            
+            # First, try to find admin for this location
             location_admin = AuthUser.objects.filter(
                 location=location,
                 role='admin',
@@ -61,8 +62,20 @@ def get_user_timezone_from_request(request, location_id=None):
             ).first()
             if location_admin and location_admin.timezone:
                 return pytz.timezone(location_admin.timezone)
-        except Exception:
-            # If location not found or error, fall through to user timezone
+            
+            # If no admin found, try to find any user associated with this location who has a timezone
+            location_user = AuthUser.objects.filter(
+                location=location,
+                is_deleted=False,
+                timezone__isnull=False
+            ).exclude(timezone='').first()
+            if location_user and location_user.timezone:
+                return pytz.timezone(location_user.timezone)
+        except Exception as e:
+            # Log the error for debugging but fall through to user timezone
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Error getting location timezone for location_id {location_id}: {e}")
             pass
     
     # Get timezone from authenticated user (from JWT token)

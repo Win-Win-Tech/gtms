@@ -200,7 +200,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             response_data['distance_from_checkpoint_m'] = round(distance, 2)
 
             logger.info(f"[SCAN_CHECKPOINT_API] Check-in successful - Guard: {guard_id}, Checkpoint: {checkpoint_id}, Delay: {min_time_diff:.1f}min")
-            
+
             return Response(
                 response_data,
                 status=status.HTTP_201_CREATED
