@@ -52,7 +52,10 @@ class IncidentSerializer(serializers.ModelSerializer):
         # Get user timezone from request context
         request = self.context.get('request')
         if request:
-            user_tz = get_user_timezone_from_request(request)
+            # Use incident's location timezone if available, otherwise use user timezone
+            # This ensures superadmins viewing multiple locations see times in each location's timezone
+            location_id = str(instance.location.id) if instance.location else None
+            user_tz = get_user_timezone_from_request(request, location_id=location_id)
             
             # Convert datetime fields to user timezone
             if instance.created_on:

@@ -14,7 +14,15 @@ class CheckInSerializer(serializers.ModelSerializer):
         # Get user timezone from request context
         request = self.context.get('request')
         if request:
-            user_tz = get_user_timezone_from_request(request)
+            # Use check-in's location timezone if available
+            # Get location from shift or guard
+            location_id = None
+            if instance.shift and instance.shift.location:
+                location_id = str(instance.shift.location.id)
+            elif instance.guard and instance.guard.location:
+                location_id = str(instance.guard.location.id)
+            
+            user_tz = get_user_timezone_from_request(request, location_id=location_id)
             
             # Convert timestamp to user timezone
             if instance.timestamp:

@@ -34,7 +34,7 @@ class IncidentReportView(APIView):
             data = request.data.copy()
             data['created_by'] = request.user.id
             data['location'] = request.user.location_id
-            serializer = IncidentSerializer(data=data)
+            serializer = IncidentSerializer(data=data, context={'request': request})
 
             if serializer.is_valid():
                 incident = serializer.save()
@@ -60,8 +60,10 @@ class IncidentReportView(APIView):
                 # Twilio client setup
                 client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
 
-                # Convert timestamp to user timezone for display
-                user_tz = get_user_timezone_from_request(request)
+                # Convert timestamp to location timezone for display
+                # Use incident's location timezone if available
+                location_id = str(incident.location.id) if incident.location else None
+                user_tz = get_user_timezone_from_request(request, location_id=location_id)
                 created_on_user = to_user_timezone(incident.created_on, user_tz)
 
                 whatsapp_body = (
@@ -253,7 +255,10 @@ class IncidentAssignView(APIView):
         incident.assigned_to_id = request.data.get('assigned_to')
         incident.assigned_on = timezone.now()
         incident.save()
-        return Response({'message': 'Incident assigned successfully'}, status=status.HTTP_200_OK)
+        
+        # Return serialized incident with timezone conversion
+        serializer = IncidentSerializer(incident, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 class IncidentResolveView(APIView):
     def post(self, request, ticket_number):
@@ -266,7 +271,10 @@ class IncidentResolveView(APIView):
         incident.resolved_on = timezone.now()
         incident.closure_description = request.data.get('closure_description', '')
         incident.save()
-        return Response({'message': 'Incident resolved successfully'}, status=status.HTTP_200_OK)
+        
+        # Return serialized incident with timezone conversion
+        serializer = IncidentSerializer(incident, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 # Duplicate imports removed - using imports from top of file
@@ -339,8 +347,10 @@ class IncidentFilterView(APIView):
         if severity_filter in ['Low', 'Medium', 'High']:
             queryset = queryset.filter(severity=severity_filter)
 
-        # Apply date filter - use user timezone
-        user_tz = get_user_timezone_from_request(request)
+        # Apply date filter - use location timezone if location_id filter is provided
+        # This ensures superadmins see dates in the filtered location's timezone
+        filter_location_id = location_id if location_id else None
+        user_tz = get_user_timezone_from_request(request, location_id=filter_location_id)
         user_now = get_user_now(user_tz)
         user_today = user_now.date()
         
@@ -384,6 +394,6 @@ class IncidentFilterView(APIView):
             queryset = queryset.filter(checkpoint_id=checkpoint_id)
 
         # Serialize and return
-        serializer = IncidentSerializer(queryset, many=True)
+        serializer = IncidentSerializer(queryset, many=True, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 

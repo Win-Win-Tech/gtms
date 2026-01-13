@@ -3,8 +3,10 @@ from celery import shared_task
 from django.core.mail import EmailMessage
 from django.conf import settings
 from django.db import close_old_connections
+from django.utils import timezone as django_timezone
 import os
 import django
+import pytz
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "patrol_backend.settings")
 django.setup()
@@ -16,6 +18,7 @@ from dashboard.views import (
     generate_monthly_attendance_summary_excel_internal
 )
 from scheduler.models import Location
+from authapp.models import User
 from datetime import datetime, timedelta
 
 
@@ -247,8 +250,33 @@ def email_daily_checkin_report():
                 print(f"    - Check-in report: {'Yes' if has_checkin_data else 'No'}")
                 print(f"    - Attendance report: {'Yes' if has_attendance_data else 'No'}")
                 
-                # Get current date for email
-                today_date = datetime.now().strftime('%Y-%m-%d')
+                # Get current date for email in location's timezone
+                # Find location admin to get timezone
+                location_admin = User.objects.filter(
+                    location=location,
+                    role='admin',
+                    is_deleted=False,
+                    is_active=True
+                ).first()
+                
+                if location_admin and location_admin.timezone:
+                    location_tz = pytz.timezone(location_admin.timezone)
+                else:
+                    # Fallback to any user's timezone in this location
+                    location_user = User.objects.filter(
+                        location=location,
+                        is_deleted=False,
+                        timezone__isnull=False
+                    ).exclude(timezone='').first()
+                    if location_user and location_user.timezone:
+                        location_tz = pytz.timezone(location_user.timezone)
+                    else:
+                        # Default to UTC if no timezone found
+                        location_tz = pytz.UTC
+                
+                # Get current datetime in location timezone
+                location_now = django_timezone.now().astimezone(location_tz)
+                today_date = location_now.strftime('%Y-%m-%d')
                 
                 # Prepare attachments list
                 attachments = []
@@ -372,10 +400,12 @@ def email_monthly_attendance_summary():
         
         print(f"Found {locations.count()} locations to process")
         
-        # Determine the month to report (previous month)
-        today = datetime.now().date()
-        # Get last day of previous month
-        first_day_this_month = today.replace(day=1)
+        # Determine the month to report (previous month) using UTC
+        # We'll calculate per location using their timezone
+        utc_now = django_timezone.now()
+        utc_today = utc_now.date()
+        # Get last day of previous month in UTC
+        first_day_this_month = utc_today.replace(day=1)
         last_day_prev_month = first_day_this_month - timedelta(days=1)
         year = last_day_prev_month.year
         month = last_day_prev_month.month
@@ -430,8 +460,33 @@ def email_monthly_attendance_summary():
                 
                 print(f"  Report file created: {file_path}")
                 
-                # Format month name for email
-                month_name = last_day_prev_month.strftime('%B %Y')
+                # Get location timezone for date formatting
+                location_admin = User.objects.filter(
+                    location=location,
+                    role='admin',
+                    is_deleted=False,
+                    is_active=True
+                ).first()
+                
+                if location_admin and location_admin.timezone:
+                    location_tz = pytz.timezone(location_admin.timezone)
+                else:
+                    # Fallback to any user's timezone in this location
+                    location_user = User.objects.filter(
+                        location=location,
+                        is_deleted=False,
+                        timezone__isnull=False
+                    ).exclude(timezone='').first()
+                    if location_user and location_user.timezone:
+                        location_tz = pytz.timezone(location_user.timezone)
+                    else:
+                        # Default to UTC if no timezone found
+                        location_tz = pytz.UTC
+                
+                # Format month name for email using location timezone
+                # Convert last_day_prev_month to location timezone for display
+                location_date = location_tz.localize(datetime.combine(last_day_prev_month, datetime.min.time()))
+                month_name = location_date.strftime('%B %Y')
                 
                 # Build download URL
                 download_url = f"http://127.0.0.1:8000{settings.MEDIA_URL}{filename}"
