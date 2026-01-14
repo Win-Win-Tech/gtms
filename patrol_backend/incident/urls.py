@@ -4,6 +4,7 @@ from .views import (
     IncidentAssignView,
     IncidentResolveView,
     IncidentFilterView,
+    IncidentExportExcelView,
 )
 
 urlpatterns = [
@@ -16,4 +17,5 @@ urlpatterns = [
     # Endpoint for resolving a ticket
     path('resolve/<str:ticket_number>/', IncidentResolveView.as_view(), name='incident-resolve'),
     path('dashboard/filter/', IncidentFilterView.as_view(), name='incident-filter'),
+    path('dashboard/export-excel/', IncidentExportExcelView.as_view(), name='incident-export-excel'),
 ]
