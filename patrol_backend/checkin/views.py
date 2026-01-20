@@ -178,6 +178,10 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # Check if scan is within allowed window
             delayed = min_time_diff > int(settings[0]['value'])
 
+            # Add the expected checkpoint time to the data for storage
+            data = data.copy()  # Create a mutable copy
+            data['expected_checkpoint_time'] = best_match['time']
+
             serializer = self.get_serializer(data=data)
             serializer.is_valid(raise_exception=True)
 

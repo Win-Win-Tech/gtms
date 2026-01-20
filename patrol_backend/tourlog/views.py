@@ -5,7 +5,7 @@ from .serializers import TourLogSerializer, MissedCheckpointSerializer, Incident
 class TourLogViewSet(viewsets.ModelViewSet):
     queryset = TourLog.objects.all()
     serializer_class = TourLogSerializer
-    
+
     def get_serializer_context(self):
         """Add request to serializer context for timezone conversion"""
         context = super().get_serializer_context()

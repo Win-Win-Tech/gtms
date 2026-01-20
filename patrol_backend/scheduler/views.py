@@ -1,3 +1,5 @@
+import uuid
+
 from rest_framework import viewsets, status as http_status
 from django.db.models import Q, F
 from .models import Location, Shift, Assignment, Checkpoint, SiteSetting
@@ -12,7 +14,6 @@ from .serializers import (
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils.timezone import now, make_aware
-from uuid import UUID
 from django.core.exceptions import ValidationError
 from datetime import datetime, timedelta
 import pytz
@@ -127,195 +128,148 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
     def upcoming_checkpoints(self, request, user_id=None):
         try:
-            # Get initial timezone (will be updated per assignment if location is found)
+            # Get initial timezone
             user_tz = get_user_timezone_from_request(request)
             today_initial = get_user_today(user_tz)
             yesterday_initial = today_initial - timedelta(days=1)
             
-            # Get assignments that are active today
-            # Also include assignments that ended yesterday but have overnight shifts still active today
-            # (for single-day overnight shifts like Jan 12 7:45 PM - Jan 13 7:15 AM)
+            # Use same date range logic as dashboard API for consistent assignment filtering
+            start_dt_user = datetime.combine(today_initial, datetime.min.time())
+            end_dt_user = datetime.combine(today_initial, datetime.max.time())
+            start_utc, end_utc = convert_date_range_to_utc(start_dt_user.date(), end_dt_user.date(), user_tz)
+            # Adjust end_utc to include the full day
+            end_utc = end_utc + timedelta(days=1)
+
+            # Get active assignments for today
             assignments = Assignment.objects.filter(
-                Q(guard_id=user_id, start_date__lte=today_initial, end_date__gte=today_initial) |
-                Q(guard_id=user_id, end_date=yesterday_initial, shift__end_time__lte=F('shift__start_time'))
+                start_date__lte=end_utc.date(),
+                end_date__gte=start_utc.date(),
+                guard_id=user_id
             ).select_related('shift', 'shift__location')
-            
+
+            # Also include assignments that ended yesterday but might have overnight shifts active today
+            yesterday_assignments = Assignment.objects.filter(
+                guard_id=user_id,
+                end_date=yesterday_initial,
+                shift__end_time__lte=F('shift__start_time')
+            ).select_related('shift', 'shift__location')
+
+            # Combine querysets
+            assignments = list(assignments) + list(yesterday_assignments)
+
+            # Collect all CheckIn records for the same period (like dashboard API)
+            all_relevant_checkins = CheckIn.objects.filter(
+                guard__in=[a.guard for a in assignments],
+                shift__in=[a.shift for a in assignments],
+                timestamp__gte=start_utc,
+                timestamp__lt=end_utc
+            ).select_related('checkpoint', 'guard', 'shift')
+
+            # Group CheckIns by assignment
+            checkins_by_assignment = defaultdict(list)
+            for checkin in all_relevant_checkins:
+                for assignment in assignments:
+                    if checkin.shift == assignment.shift:
+                        checkins_by_assignment[assignment].append(checkin)
+                        break
+
+            # Track which CheckIn records we've already used globally to prevent duplication
+            checkin_ids_used = set()
+
             result = []
-            
+
             for assignment in assignments:
-                # Get location-specific timezone for this assignment
-                # This ensures checkpoints are shown in the location's timezone, not the guard's timezone
-                location_id = assignment.shift.location_id if assignment.shift and assignment.shift.location else None
-                if location_id:
-                    # Use location's timezone for this assignment
-                    assignment_tz = get_user_timezone_from_request(request, location_id=location_id)
-                    logger.info(f"[UPCOMING_CHECKPOINTS] Using location timezone: {assignment_tz.zone} for location_id: {location_id}")
-                else:
-                    # Fallback to user's timezone if no location
-                    assignment_tz = user_tz
-                    logger.info(f"[UPCOMING_CHECKPOINTS] Using user timezone: {assignment_tz.zone} (no location)")
+                assignment_checkins = checkins_by_assignment[assignment]
                 
-                # Get today and current time in assignment's location timezone
+                location_id = assignment.shift.location_id if assignment.shift and assignment.shift.location else None
+                assignment_tz = get_user_timezone_from_request(request, location_id=location_id) if location_id else user_tz
+
                 today = get_user_today(assignment_tz)
                 user_now = get_user_now(assignment_tz)
-                current_time = user_now.time()
                 yesterday = today - timedelta(days=1)
-                checkpoint_data = assignment.checkpoints
+                
                 shift = assignment.shift
                 is_overnight = shift.end_time <= shift.start_time
-                
-                # Check if assignment ended yesterday (for single-day overnight shifts)
                 assignment_ended_yesterday = assignment.end_date == yesterday
                 
-                # If assignment ended yesterday, only process if we're still in the shift
                 if assignment_ended_yesterday and is_overnight:
-                    if current_time >= shift.end_time:
-                        # Shift has ended, skip this assignment
+                    if user_now.time() >= shift.end_time:
                         continue
 
-                for cp in checkpoint_data:
-                    checkpoint_id = cp['checkpoint_id']
+                for cp in assignment.checkpoints:
+                    checkpoint_id_str = cp.get('checkpoint_id')
+                    try:
+                        checkpoint_id = uuid.UUID(checkpoint_id_str)
+                    except (ValueError, TypeError):
+                        continue
+                    
                     checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
+                    if not checkpoint_obj:
+                        continue
 
                     try:
                         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
-                        current_time = user_now.time()
                         
-                        # Determine which calendar date this checkpoint occurs on
-                        # For overnight shifts: need to determine which shift instance this checkpoint belongs to
+                        # Determine date for this checkpoint instance
                         if is_overnight:
                             if checkpoint_time >= shift.start_time:
-                                # Checkpoint is before midnight - belongs to today's shift
-                                # But if assignment ended yesterday, these checkpoints already passed
-                                if assignment_ended_yesterday:
-                                    continue  # Skip checkpoints before midnight if assignment ended yesterday
+                                if assignment_ended_yesterday: continue
                                 checkpoint_date = today
-                                # Checkpoint occurs today, shift starts today
-                                shift_start_date = today
                             else:
-                                # Checkpoint is after midnight - need to determine which shift instance
-                                if current_time < shift.end_time:
-                                    # Still in yesterday's shift - checkpoint occurs today
-                                    # Belongs to shift that started yesterday
+                                if user_now.time() < shift.end_time:
                                     checkpoint_date = today
-                                    shift_start_date = today - timedelta(days=1)
                                 else:
-                                    # Past yesterday's shift end - checkpoint belongs to today's shift
-                                    # But it occurs TOMORROW (after midnight)
                                     checkpoint_date = today + timedelta(days=1)
-                                    shift_start_date = today
-                                    
-                                    # Check if today is within assignment range
-                                    if today < assignment.start_date:
-                                        # Today is before assignment starts - don't show
-                                        continue
-                                    elif today > assignment.end_date:
-                                        # Today is past assignment end - don't show
-                                        continue
+                                    if today > assignment.end_date: continue
                         else:
-                            # Normal shift - checkpoint is on the same day
                             checkpoint_date = today
-                            shift_start_date = today
                         
-                        # Combine date and time in assignment's location timezone, then convert to UTC for comparison
-                        checkpoint_datetime_user = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, assignment_tz)
-                        checkpoint_datetime_user = checkpoint_datetime_user.astimezone(assignment_tz)
-                        
-                        # For overnight shifts: check if the shift has actually started yet
-                        # Only mark as overdue if the shift has started AND checkpoint time has passed
-                        if is_overnight:
-                            # Calculate when the shift starts
-                            shift_start_datetime = combine_date_time_in_user_tz(shift_start_date, shift.start_time, assignment_tz)
-                            shift_start_datetime = shift_start_datetime.astimezone(assignment_tz)
-                            
-                            # Check if shift has started
-                            if user_now < shift_start_datetime:
-                                # Shift hasn't started yet - checkpoint is pending, not overdue
-                                is_overdue = False
-                            else:
-                                # Shift has started - check if checkpoint time has passed
-                                is_overdue = user_now > checkpoint_datetime_user + timedelta(minutes=15)
-                        else:
-                            # Normal shift - check if checkpoint time has passed
-                            is_overdue = user_now > checkpoint_datetime_user + timedelta(minutes=15)
-                        
-                        # Check if this specific checkpoint at this specific date/time is checked in
-                        # Convert checkpoint_date to UTC date range for query (using assignment's location timezone)
-                        checkpoint_start_utc, checkpoint_end_utc = convert_date_range_to_utc(
-                            checkpoint_date, checkpoint_date, assignment_tz
-                        )
-                        
-                        # Calculate expected checkpoint datetime for precise matching (using assignment's location timezone)
-                        expected_checkpoint_dt_utc = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, assignment_tz)
-                        
-                        # Query CheckIn for this specific checkpoint_id on this specific date
-                        # Also check if the scan time is close to the expected time (within 2 hours)
-                        # This handles cases where same checkpoint appears multiple times with different scheduled times
-                        checkin_window_start = expected_checkpoint_dt_utc - timedelta(hours=1)
-                        checkin_window_end = expected_checkpoint_dt_utc + timedelta(hours=2)
-                        
-                        # Use the more restrictive window (expected time ± window) but within the date range
-                        query_start = max(checkpoint_start_utc, checkin_window_start)
-                        query_end = min(checkpoint_end_utc + timedelta(days=1), checkin_window_end)
-                        
-                        is_checked_in = CheckIn.objects.filter(
-                            guard_id=user_id,
-                            shift_id=assignment.shift.id,
-                            checkpoint_id=checkpoint_id,
-                            synced=True,
-                            timestamp__gte=query_start,
-                            timestamp__lte=query_end
-                        ).exists()
-                        
-                    except Exception as e:
-                        logger.warning(f"[UPCOMING_CHECKPOINTS_API] Error processing checkpoint time: {e}")
-                        is_overdue = False
+                        # Match scan logic (identical to dashboard)
+                        expected_dt_utc = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, assignment_tz)
                         is_checked_in = False
 
-                    status = 'completed' if is_checked_in or is_overdue else 'pending'
-                    synced = True if is_checked_in else False if is_overdue else None
+                        for checkin in assignment_checkins:
+                            if checkin.id in checkin_ids_used:
+                                continue
 
-                    if is_overdue and not is_checked_in and checkpoint_obj:
-                        try:
-                            CheckIn.objects.create(
-                                guard_id=user_id,
-                                shift_id=assignment.shift.id,
-                                checkpoint_id=checkpoint_id,
-                                timestamp=now(),
-                                latitude=checkpoint_obj.latitude,
-                                longitude=checkpoint_obj.longitude,
-                                synced=False
-                            )
-                            is_checked_in = True
-                        except Exception as e:
-                            logger.warning(f"Failed to auto-create missed check-in: {e}")
+                            if checkin.checkpoint_id == checkpoint_id:
+                                # 1. Exact match for new records
+                                if checkin.expected_checkpoint_time and checkin.expected_checkpoint_time == checkpoint_time:
+                                    is_checked_in = True
+                                    checkin_ids_used.add(checkin.id)
+                                    break
+                                # 2. Window match for legacy records (±30 minutes)
+                                elif not checkin.expected_checkpoint_time:
+                                    expected_start = expected_dt_utc - timedelta(minutes=30)
+                                    expected_end = expected_dt_utc + timedelta(minutes=30)
+                                    if expected_start <= checkin.timestamp <= expected_end:
+                                        is_checked_in = True
+                                        checkin_ids_used.add(checkin.id)
+                                        break
+                        
+                    except Exception as e:
+                        logger.warning(f"[UPCOMING_CHECKPOINTS_API] Error: {e}")
+                        is_checked_in = False
 
-                    try:
-                        ist_time = cp['time']
-                    except Exception:
-                        ist_time = cp['time']
-
-                    checkpoint_info = {
+                    result.append({
                         'assign_id': assignment.id,
                         'checkpoint_id': checkpoint_id,
-                        'label': checkpoint_obj.label if checkpoint_obj else '',
-                        'time': ist_time,
-                        'lat': checkpoint_obj.latitude if checkpoint_obj else '',
-                        'lon': checkpoint_obj.longitude if checkpoint_obj else '',
-                        'qr': checkpoint_obj.data if checkpoint_obj else '',
-                        'shift_id': assignment.shift.id,
-                        'status': status
-                    }
+                        'label': checkpoint_obj.label,
+                        'time': cp['time'],
+                        'lat': checkpoint_obj.latitude,
+                        'lon': checkpoint_obj.longitude,
+                        'qr': checkpoint_obj.data,
+                        'shift_id': shift.id,
+                        'status': 'completed' if is_checked_in else 'pending',
+                        'synced': True if is_checked_in else None
+                    })
 
-                    if synced is not None:
-                        checkpoint_info['synced'] = synced
-
-                    result.append(checkpoint_info)
-
-            logger.info(f"[UPCOMING_CHECKPOINTS_API] Returned {len(result)} checkpoints for user {user_id}")
+            # Sort and return
+            result.sort(key=lambda x: x['time'])
             return Response(result)
+
         except Exception as e:
-            logger.error(f"[UPCOMING_CHECKPOINTS_API] Error: {str(e)}", exc_info=True)
+            logger.error(f"[UPCOMING_CHECKPOINTS_API] Global Error: {str(e)}", exc_info=True)
             return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['get'], url_path='by-guard/(?P<guard_id>[^/.]+)')

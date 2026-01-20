@@ -559,210 +559,143 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         date_range.append(current_date)
         current_date += timedelta(days=1)
     
+    # Collect all actual CheckIn records for the period first
+    # This avoids duplication issues with old records
+    all_checkins = []
+    checkin_ids_used = set()  # Track which CheckIn records we've already used globally
+
+    # First, collect all relevant CheckIn records across all assignments
+    all_relevant_checkins = CheckIn.objects.filter(
+        guard__in=[a.guard for a in assignments],
+        shift__in=[a.shift for a in assignments],
+        timestamp__gte=start_utc,
+        timestamp__lt=end_utc
+    ).select_related('checkpoint', 'guard', 'shift')
+
+    # Group CheckIns by assignment for processing
+    checkins_by_assignment = defaultdict(list)
+    for checkin in all_relevant_checkins:
+        # Find which assignment this CheckIn belongs to
+        for assignment in assignments:
+            if (checkin.guard == assignment.guard and
+                checkin.shift == assignment.shift):
+                checkins_by_assignment[assignment].append(checkin)
+                break
+
+    # Process ALL expected checkpoints from assignments (not just scanned ones)
     for assignment in assignments:
         guard = assignment.guard
         shift = assignment.shift
         location = assignment.location
-        
-        # For each checkpoint in the assignment
+
+        # Get CheckIns for this assignment (already filtered and grouped)
+        assignment_checkins = checkins_by_assignment[assignment]
+
+        # Process ALL expected checkpoints in this assignment
         for cp in assignment.checkpoints:
             checkpoint_id = cp.get('checkpoint_id')
             expected_time_str = cp.get('time')
-            
-            # Validate checkpoint data
-            if not checkpoint_id or not expected_time_str:
-                continue  # Skip invalid checkpoint entries
-            
+
+            # Get checkpoint name from the actual Checkpoint model
+            checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
+            checkpoint_name = checkpoint_obj.label if checkpoint_obj else f"CP-{checkpoint_id[:8]}"
+
+            if not expected_time_str:
+                continue
+
             try:
                 expected_time_obj = datetime.strptime(expected_time_str, "%H:%M").time()
             except ValueError:
-                continue  # Skip invalid time format
-            
-            # Get checkpoint name (with error handling)
-            try:
-                checkpoint = Checkpoint.objects.get(id=checkpoint_id)
-                checkpoint_name = checkpoint.label
-            except Checkpoint.DoesNotExist:
-                checkpoint_name = "Unknown Checkpoint"
-                continue  # Skip if checkpoint doesn't exist
-            
-            # Check if shift is overnight
-            is_overnight = shift.end_time <= shift.start_time
-            
-            # For each date in the range where the assignment is active
-            # For "today" filter, we also need to check the previous day's shift for overnight checkpoints
-            dates_to_check = list(date_range)
-            if filter_type == 'today' and is_overnight:
-                # Also check previous day for overnight shifts (to catch checkpoints after midnight)
-                prev_day = today - timedelta(days=1)
-                if assignment.start_date <= prev_day <= assignment.end_date:
-                    dates_to_check.insert(0, prev_day)
-            
-            for check_date in dates_to_check:
-                # Skip future dates - don't process shifts that haven't started yet
-                if check_date > today:
-                    continue
-                
-                # Only process if assignment is active on this date
-                if not (assignment.start_date <= check_date <= assignment.end_date):
-                    continue
-                
-                # Determine which calendar date this checkpoint occurs on
-                # For overnight shifts: checkpoints after midnight occur on the NEXT calendar day
-                # For normal shifts: checkpoints occur on the same day
-                if is_overnight:
-                    # For overnight shifts, check if checkpoint time is before or after midnight
-                    if expected_time_obj >= shift.start_time:
-                        # Checkpoint is before midnight - occurs on the same calendar day as shift start
-                        checkpoint_date = check_date
-                    else:
-                        # Checkpoint is after midnight - occurs on the NEXT calendar day
-                        checkpoint_date = check_date + timedelta(days=1)
+                continue
+
+            # Create expected datetime for today in location timezone
+            expected_datetime = datetime.combine(today, expected_time_obj)
+            expected_datetime = user_tz.localize(expected_datetime)
+            expected_time_display = expected_datetime  # Keep as datetime for Excel export
+
+            # Check if this checkpoint was scanned
+            matching_checkin = None
+            actual_time_display = None
+            delay = None
+
+            # Find matching CheckIn for this specific checkpoint and expected time
+            for checkin in assignment_checkins:
+                if str(checkin.checkpoint.id) == checkpoint_id:
+                    # For new records, use exact time matching
+                    if checkin.expected_checkpoint_time and checkin.expected_checkpoint_time == expected_time_obj:
+                        matching_checkin = checkin
+                        break
+                    # For old records, use time window matching (±30 minutes)
+                    elif not checkin.expected_checkpoint_time:
+                        # Create a time window around expected time for matching
+                        expected_start = expected_datetime - timedelta(minutes=30)
+                        expected_end = expected_datetime + timedelta(minutes=30)
+                        if expected_start <= checkin.timestamp.astimezone(user_tz) <= expected_end:
+                            matching_checkin = checkin
+                            break
+
+            if matching_checkin:
+                # Mark this CheckIn as used to prevent duplication
+                checkin_ids_used.add(matching_checkin.id)
+
+                actual_time = matching_checkin.timestamp
+                actual_time_display = actual_time.astimezone(user_tz)
+
+                # Calculate delay
+                expected_utc = expected_datetime.astimezone(actual_time.tzinfo)
+                delay_seconds = (actual_time - expected_utc).total_seconds()
+                delay = int(delay_seconds / 60)
+
+                # Determine status
+                if abs(delay) <= 15:  # Within 15 minutes
+                    status = "On Time"
+                elif delay > 0:
+                    status = "Delayed"
                 else:
-                    # Normal shift - checkpoint is on the same day
-                    checkpoint_date = check_date
-                
-                # FIX: For "today" filter - include ALL checkpoints that occur on today's calendar date
-                # This includes:
-                # 1. Checkpoints from yesterday's overnight shift that occur today (e.g., 1:30 AM Jan 10 from Jan 9 shift)
-                # 2. Checkpoints from today's shift that occur today (e.g., 8:00 PM Jan 10 from Jan 10 shift)
-                # We use checkpoint_date (the actual calendar date the checkpoint occurs) to determine this
-                if filter_type == 'today':
-                    # Include if checkpoint occurs on today's calendar date (regardless of which shift it belongs to)
-                    if checkpoint_date != today:
-                        continue
-                
-                # Calculate expected time for this specific date in user timezone
-                expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
-                
-                # Define the search window for this specific date's check-in (convert to UTC)
-                # For overnight shifts, we need to search across two days
-                if is_overnight and expected_time_obj < shift.start_time:
-                    # Checkpoint is on next day, so search window starts from checkpoint date
-                    day_start_user = datetime.combine(checkpoint_date, datetime.min.time())
-                    day_end_user = datetime.combine(checkpoint_date, datetime.max.time())
-                else:
-                    # Normal case or checkpoint before midnight in overnight shift
-                    day_start_user = datetime.combine(check_date, datetime.min.time())
-                    day_end_user = datetime.combine(check_date, datetime.max.time())
-                
-                day_start_utc, day_end_utc = convert_date_range_to_utc(day_start_user.date(), day_end_user.date(), user_tz)
-                day_end_utc = day_end_utc + timedelta(days=1)
-                
-                checkin = CheckIn.objects.filter(
-                    guard=guard,
-                    shift=shift,
-                    checkpoint_id=checkpoint_id,
-                    timestamp__gte=day_start_utc,
-                    timestamp__lt=day_end_utc
-                ).order_by('timestamp').first()
-                
-                actual_time = None
-                delay = None
-                
-                # Determine default status based on whether scheduled time has passed
-                # Convert expected time to user timezone for comparison
-                if expected_datetime_user:
-                    expected_time_user = expected_datetime_user.astimezone(user_tz)
-                    user_now = get_user_now(user_tz)
-                    # Check if scheduled time + 15 minutes grace period has passed
-                    if user_now > expected_time_user + timedelta(minutes=15):
-                        status = "Missed"  # Time has passed, no check-in = Missed
-                    else:
-                        status = "Pending"  # Time hasn't passed yet = Pending
-                else:
-                    status = "Missed"  # Fallback if no expected time
-                
-                # Process check-in if found
-                if checkin:
-                    # Check if it's synced
-                    if not checkin.synced:
-                        # Unsynced check-in (offline mode) - treat as missed
-                        status = "Missed"
-                        actual_time = None
-                        delay = None
-                    else:
-                        # Valid synced check-in
-                        actual_time = checkin.timestamp
-                        
-                        # Log UTC time before conversion
-                        logger.info(f"[CHECKIN_REPORT] UTC time (before conversion): {actual_time}, timezone: {actual_time.tzinfo if actual_time else None}")
-                        
-                        # Convert both to user timezone for delay calculation
-                        actual_time_user = to_user_timezone(actual_time, user_tz)
-                        expected_time_user = expected_datetime_user.astimezone(user_tz)
-                        
-                        # Log converted time
-                        logger.info(f"[CHECKIN_REPORT] Converted time (after conversion): {actual_time_user}, target timezone: {user_tz.zone}")
-                        logger.info(f"[CHECKIN_REPORT] Expected time: {expected_time_user}, timezone: {expected_time_user.tzinfo if expected_time_user else None}")
-                        
-                        # Calculate delay in minutes (in user timezone)
-                        delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
-                        
-                        # Determine status based on delay
-                        if delay <= 15:
-                            status = "On Time"
-                        elif 15 < delay <= 30:
-                            status = "Delayed"
-                        else:
-                            status = "Missed"
-                
-                # Add to report (convert times to user timezone for display)
-                expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
-                if actual_time:
-                    # Log before final conversion for display
-                    logger.info(f"[CHECKIN_REPORT] Display conversion - UTC: {actual_time}, Converting to: {user_tz.zone}")
-                    actual_time_display = to_user_timezone(actual_time, user_tz)
-                    logger.info(f"[CHECKIN_REPORT] Display conversion - Result: {actual_time_display}, timezone: {actual_time_display.tzinfo if actual_time_display else None}")
-                else:
-                    actual_time_display = None
-                
-                # Use checkpoint_date for report date (handles overnight shifts correctly)
-                # For overnight shifts, use check_date (when shift started) for report date
-                # This ensures all checkpoints from the same shift show the same date
-                if is_overnight:
-                    report_date = check_date  # Use the date the shift started
-                else:
-                    report_date = checkpoint_date
-                
-                # FIX: Only include checkpoints that fall within the filter date range
-                # For "today" filter, we already handled it above for overnight shifts
-                if filter_type == 'today':
-                    # Already handled above, but double-check for normal shifts
-                    if not is_overnight and report_date != today:
-                        continue
-                elif filter_type in ['this_week', 'this_month', 'custom']:
-                    # For other filters, ensure report_date is within the date range
-                    if not (start_dt_user.date() <= report_date <= end_dt_user.date()):
-                        continue  # Skip checkpoints outside the filter range
-                
-                report.append({
-                    'date': report_date.strftime('%Y-%m-%d'),
-                    'guard_id': str(guard.id),
-                    'guard_name': guard.name,
-                    'location_id': str(location.id) if location else None,
-                    'location_name': location.name if location else "",
-                    'shift_id': str(shift.id) if shift else None,
-                    'shift_name': shift.name if shift else "",
-                    'checkpoint_id': str(checkpoint_id),
-                    'checkpoint_name': checkpoint_name,
-                    'expected_time': expected_time_display,  # In user timezone
-                    'actual_checkin_time': actual_time_display,  # In user timezone
-                    'status': status,
-                    'delay_minutes': delay
-                })
-    
-    # Sort report by date, then by guard_name, then by checkpoint_name, then by expected_time
-    # This ensures all checkpoints for a date are grouped together
-    report.sort(key=lambda x: (
-        x['date'],
-        x['guard_name'],
-        x['checkpoint_name'],
-        x['expected_time'] if x['expected_time'] else ''
-    ))
-    
-    logger.info(f"[CHECKIN_REPORT] Generated {len(report)} records for filter: {filter_type}")
-    return report
+                    status = "Early"
+            else:
+                # Checkpoint not scanned
+                status = "Missed"
+
+            # Format date
+            date_str = today.isoformat()
+
+            all_checkins.append({
+                'date': date_str,
+                'guard_id': str(guard.id),
+                'guard_name': guard.name,
+                'location_id': str(location.id) if location else None,
+                'location_name': location.name if location else "",
+                'shift_id': str(shift.id) if shift else None,
+                'shift_name': shift.name if shift else "",
+                'checkpoint_id': checkpoint_id,
+                'checkpoint_name': checkpoint_name,
+                'expected_time': expected_time_display,
+                'actual_checkin_time': actual_time_display,
+                'status': status,
+                'delay_minutes': delay
+            })
+
+    # Deduplication: ensure each expected checkpoint appears only once
+    # Use checkpoint_id + expected_time as key since each checkpoint should appear once per assignment
+    seen_checkpoints = set()
+    deduplicated_results = []
+
+    for result in all_checkins:
+        # Create unique key for each expected checkpoint instance
+        expected_time_str = result['expected_time'].isoformat()[:16] if result['expected_time'] else 'None'
+        checkpoint_key = f"{result['checkpoint_id']}_{expected_time_str}"
+
+        if checkpoint_key not in seen_checkpoints:
+            seen_checkpoints.add(checkpoint_key)
+            deduplicated_results.append(result)
+        # Skip duplicates - handles cases where same checkpoint appears in multiple assignments
+        # (shouldn't happen but provides safety net)
+
+    # Sort results by expected time (chronological order)
+    deduplicated_results.sort(key=lambda x: x['expected_time'] if x['expected_time'] else '')
+
+    return deduplicated_results
 
 
 # ============================================================================
