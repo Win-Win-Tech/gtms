@@ -6,9 +6,6 @@ class CheckInSerializer(serializers.ModelSerializer):
     class Meta:
         model = CheckIn
         fields = '__all__'
-        extra_kwargs = {
-            'expected_checkpoint_time': {'required': False}
-        }
     
     def to_representation(self, instance):
         """Convert UTC datetimes to user timezone before serialization"""

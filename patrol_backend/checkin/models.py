@@ -13,7 +13,6 @@ class CheckIn(models.Model):
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
     synced = models.BooleanField(default=True)  # False if offline, True when synced
-    expected_checkpoint_time = models.TimeField(null=True, blank=True)  # The scheduled time for this checkpoint instance
 
 #class Checkpoint(models.Model):
 #    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
