@@ -256,6 +256,165 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     #         logger.error(f"[UPCOMING_CHECKPOINTS_API] Global Error: {str(e)}", exc_info=True)
     #         return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
+    # def upcoming_checkpoints(self, request, user_id=None):
+    #     try:
+    #         # 1. Timezone and Date Range Setup
+    #         user_tz = get_user_timezone_from_request(request)
+    #         today_initial = get_user_today(user_tz)
+    #         yesterday_initial = today_initial - timedelta(days=1)
+            
+    #         from patrol_backend.utils.timezone_utils import convert_date_range_to_utc
+    #         start_dt_user = datetime.combine(today_initial, datetime.min.time())
+    #         end_dt_user = datetime.combine(today_initial, datetime.max.time())
+    #         start_utc, end_utc = convert_date_range_to_utc(start_dt_user.date(), end_dt_user.date(), user_tz)
+    #         end_utc = end_utc + timedelta(days=1)
+
+    #         # 2. Fetch Assignments (Today + Overnight carry-overs)
+    #         assignments = list(Assignment.objects.filter(
+    #             start_date__lte=end_utc.date(),
+    #             end_date__gte=start_utc.date(),
+    #             guard_id=user_id
+    #         ).select_related('shift', 'shift__location'))
+
+    #         yesterday_assignments = list(Assignment.objects.filter(
+    #             guard_id=user_id,
+    #             end_date=yesterday_initial,
+    #             shift__end_time__lte=F('shift__start_time')
+    #         ).select_related('shift', 'shift__location'))
+
+    #         all_assignments = assignments + yesterday_assignments
+
+    #         # 3. COLLECT ALL SCANS (Fetch all scans in the period to match)
+    #         all_checkins = list(CheckIn.objects.filter(
+    #             guard_id=user_id,
+    #             timestamp__gte=start_utc,
+    #             timestamp__lt=end_utc
+    #         ).order_by('timestamp'))
+            
+    #         used_checkin_ids = set() # To track consumed physical scans
+    #         result = []
+
+    #         # 4. Process Each Assignment
+    #         for assignment in all_assignments:
+    #             location_id = assignment.shift.location_id if assignment.shift and assignment.shift.location else None
+    #             assignment_tz = get_user_timezone_from_request(request, location_id=location_id) if location_id else user_tz
+
+    #             today = get_user_today(assignment_tz)
+    #             user_now = get_user_now(assignment_tz)
+    #             user_now_utc = user_now.astimezone(pytz.UTC)
+    #             yesterday = today - timedelta(days=1)
+                
+    #             shift = assignment.shift
+    #             is_overnight = shift.end_time <= shift.start_time
+    #             assignment_ended_yesterday = assignment.end_date == yesterday
+                
+    #             if assignment_ended_yesterday and is_overnight:
+    #                 if user_now.time() >= shift.end_time:
+    #                     continue
+
+    #             # 5. Process Checkpoints in this Assignment
+    #             for cp in assignment.checkpoints:
+    #                 checkpoint_id_str = cp.get('checkpoint_id')
+    #                 try:
+    #                     checkpoint_id = uuid.UUID(checkpoint_id_str)
+    #                 except (ValueError, TypeError):
+    #                     continue
+                    
+    #                 checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
+    #                 if not checkpoint_obj:
+    #                     continue
+
+    #                 try:
+    #                     checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
+                        
+    #                     # Determine actual calendar date for this instance
+    #                     if is_overnight:
+    #                         if checkpoint_time >= shift.start_time:
+    #                             if assignment_ended_yesterday: continue
+    #                             checkpoint_date = today
+    #                         else:
+    #                             if user_now.time() < shift.end_time:
+    #                                 checkpoint_date = today
+    #                             else:
+    #                                 checkpoint_date = today + timedelta(days=1)
+    #                                 if today > assignment.end_date: continue
+    #                     else:
+    #                         checkpoint_date = today
+                        
+    #                     # Expected time in UTC
+    #                     expected_dt_utc = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, assignment_tz)
+                        
+    #                     # 6. SCAN CONSUMPTION MATCHING (Physical scans only)
+    #                     is_checked_in = False
+    #                     for scan in all_checkins:
+    #                         # Only match physical scans (synced=True)
+    #                         if (scan.checkpoint_id == checkpoint_id and 
+    #                             getattr(scan, 'synced', True) == True and 
+    #                             scan.id not in used_checkin_ids and 
+    #                             abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=30)):
+                                
+    #                             is_checked_in = True
+    #                             used_checkin_ids.add(scan.id)
+    #                             break
+
+    #                     # 7. OVERDUE & SYNC LOGIC
+    #                     is_overdue = user_now_utc > (expected_dt_utc + timedelta(minutes=15))
+
+    #                     if is_checked_in:
+    #                         status = 'completed'
+    #                         synced = True
+    #                     elif is_overdue:
+    #                         status = 'completed' # Per requirement: status is 'completed' for missed
+    #                         synced = False      # But synced is false
+                            
+    #                         # Optional: Auto-create missed record in DB if it doesn't exist
+    #                         CheckIn.objects.get_or_create(
+    #                             guard_id=user_id,
+    #                             shift_id=shift.id,
+    #                             checkpoint_id=checkpoint_id,
+    #                             timestamp=expected_dt_utc,
+    #                             defaults={
+    #                                 'latitude': checkpoint_obj.latitude,
+    #                                 'longitude': checkpoint_obj.longitude,
+    #                                 'synced': False
+    #                             }
+    #                         )
+    #                     else:
+    #                         status = 'pending'
+    #                         synced = None
+
+    #                     # Convert UTC time to local for mobile display
+    #                     display_time = expected_dt_utc.astimezone(assignment_tz).strftime('%H:%M')
+                        
+    #                 except Exception as e:
+    #                     logger.warning(f"[UPCOMING_CHECKPOINTS_API] Error: {e}")
+    #                     status = 'pending'
+    #                     synced = None
+    #                     display_time = cp.get('time')
+
+    #                 result.append({
+    #                     'assign_id': assignment.id,
+    #                     'checkpoint_id': checkpoint_id,
+    #                     'label': checkpoint_obj.label,
+    #                     'time': display_time,
+    #                     'lat': checkpoint_obj.latitude,
+    #                     'lon': checkpoint_obj.longitude,
+    #                     'qr': checkpoint_obj.data,
+    #                     'shift_id': shift.id,
+    #                     'status': status,
+    #                     'synced': synced
+    #                 })
+
+    #         # 8. FINAL SORTING BY TIME
+    #         result.sort(key=lambda x: x['time'])
+            
+    #         return Response(result)
+
+    #     except Exception as e:
+    #         logger.error(f"[UPCOMING_CHECKPOINTS_API] Global Error: {str(e)}", exc_info=True)
+    #         return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+   
     @action(detail=False, methods=['get'], url_path='upcoming-checkpoints/(?P<user_id>[^/.]+)')
     def upcoming_checkpoints(self, request, user_id=None):
         try:
@@ -263,7 +422,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             user_tz = get_user_timezone_from_request(request)
             today_initial = get_user_today(user_tz)
             yesterday_initial = today_initial - timedelta(days=1)
-            
+
             from patrol_backend.utils.timezone_utils import convert_date_range_to_utc
             start_dt_user = datetime.combine(today_initial, datetime.min.time())
             end_dt_user = datetime.combine(today_initial, datetime.max.time())
@@ -291,8 +450,8 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 timestamp__gte=start_utc,
                 timestamp__lt=end_utc
             ).order_by('timestamp'))
-            
-            used_checkin_ids = set() # To track consumed physical scans
+
+            used_checkin_ids = set()  # To track consumed physical scans
             result = []
 
             # 4. Process Each Assignment
@@ -304,11 +463,11 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 user_now = get_user_now(assignment_tz)
                 user_now_utc = user_now.astimezone(pytz.UTC)
                 yesterday = today - timedelta(days=1)
-                
+
                 shift = assignment.shift
                 is_overnight = shift.end_time <= shift.start_time
                 assignment_ended_yesterday = assignment.end_date == yesterday
-                
+
                 if assignment_ended_yesterday and is_overnight:
                     if user_now.time() >= shift.end_time:
                         continue
@@ -320,40 +479,42 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                         checkpoint_id = uuid.UUID(checkpoint_id_str)
                     except (ValueError, TypeError):
                         continue
-                    
+
                     checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
                     if not checkpoint_obj:
                         continue
 
                     try:
                         checkpoint_time = datetime.strptime(cp['time'], '%H:%M').time()
-                        
+
                         # Determine actual calendar date for this instance
                         if is_overnight:
                             if checkpoint_time >= shift.start_time:
-                                if assignment_ended_yesterday: continue
+                                if assignment_ended_yesterday:
+                                    continue
                                 checkpoint_date = today
                             else:
                                 if user_now.time() < shift.end_time:
                                     checkpoint_date = today
                                 else:
                                     checkpoint_date = today + timedelta(days=1)
-                                    if today > assignment.end_date: continue
+                                    if today > assignment.end_date:
+                                        continue
                         else:
                             checkpoint_date = today
-                        
+
                         # Expected time in UTC
                         expected_dt_utc = combine_date_time_in_user_tz(checkpoint_date, checkpoint_time, assignment_tz)
-                        
+
                         # 6. SCAN CONSUMPTION MATCHING (Physical scans only)
                         is_checked_in = False
                         for scan in all_checkins:
                             # Only match physical scans (synced=True)
-                            if (scan.checkpoint_id == checkpoint_id and 
-                                getattr(scan, 'synced', True) == True and 
-                                scan.id not in used_checkin_ids and 
+                            if (scan.checkpoint_id == checkpoint_id and
+                                getattr(scan, 'synced', True) == True and
+                                scan.id not in used_checkin_ids and
                                 abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=30)):
-                                
+
                                 is_checked_in = True
                                 used_checkin_ids.add(scan.id)
                                 break
@@ -365,9 +526,9 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                             status = 'completed'
                             synced = True
                         elif is_overdue:
-                            status = 'completed' # Per requirement: status is 'completed' for missed
-                            synced = False      # But synced is false
-                            
+                            status = 'completed'  # Per requirement: status is 'completed' for missed
+                            synced = False        # But synced is false
+
                             # Optional: Auto-create missed record in DB if it doesn't exist
                             CheckIn.objects.get_or_create(
                                 guard_id=user_id,
@@ -386,12 +547,16 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                         # Convert UTC time to local for mobile display
                         display_time = expected_dt_utc.astimezone(assignment_tz).strftime('%H:%M')
-                        
+
+                        # NEW: internal sort key (fixes overnight ordering)
+                        sort_ts = expected_dt_utc.timestamp()
+
                     except Exception as e:
                         logger.warning(f"[UPCOMING_CHECKPOINTS_API] Error: {e}")
                         status = 'pending'
                         synced = None
                         display_time = cp.get('time')
+                        sort_ts = float('inf')  # push bad records to end
 
                     result.append({
                         'assign_id': assignment.id,
@@ -403,17 +568,25 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                         'qr': checkpoint_obj.data,
                         'shift_id': shift.id,
                         'status': status,
-                        'synced': synced
+                        'synced': synced,
+
+                        # NEW: used only for sorting
+                        'sort_ts': sort_ts
                     })
 
-            # 8. FINAL SORTING BY TIME
-            result.sort(key=lambda x: x['time'])
-            
+            # 8. FINAL SORTING BY TIME (FIXED)
+            result.sort(key=lambda x: x['sort_ts'])
+
+            # OPTIONAL: remove internal field
+            for r in result:
+                r.pop('sort_ts', None)
+
             return Response(result)
 
         except Exception as e:
             logger.error(f"[UPCOMING_CHECKPOINTS_API] Global Error: {str(e)}", exc_info=True)
             return Response({'error': 'Failed to retrieve upcoming checkpoints.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+   
     @action(detail=False, methods=['get'], url_path='by-guard/(?P<guard_id>[^/.]+)')
     def by_guard(self, request, guard_id=None):
         try:
