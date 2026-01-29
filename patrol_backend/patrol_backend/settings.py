@@ -31,6 +31,8 @@ ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '147.93.27.224', 'unmentholated-konne
 # Application definition
 
 INSTALLED_APPS = [
+    'daphne',  # for socket
+    'channels', # for socket channel
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -48,7 +50,23 @@ INSTALLED_APPS = [
     'corsheaders',
     'incident',
     'django_celery_beat',
+    'livetracking',  # Sokcet app
     ]
+
+# Socker config
+
+ASGI_APPLICATION = 'patrol_backend.asgi.application'
+
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        'CONFIG': {
+            "hosts": [('127.0.0.1', 6379)],
+        },
+    },
+}
+
+# Socket cofig end
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
