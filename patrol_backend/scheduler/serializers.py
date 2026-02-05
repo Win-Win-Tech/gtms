@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Location, Shift, Assignment, Checkpoint,SiteSetting
+from .models import Location, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate
 from django.utils.timezone import now
 from uuid import UUID
 
@@ -14,6 +14,11 @@ class ShiftSerializer(serializers.ModelSerializer):
 
     start_time = serializers.TimeField(input_formats=['%I:%M %p'], format='%I:%M %p')
     end_time = serializers.TimeField(input_formats=['%I:%M %p'], format='%I:%M %p')
+    checkpoint_template = serializers.PrimaryKeyRelatedField(
+        queryset=CheckpointTemplate.objects.filter(is_deleted=False),
+        required=False,
+        allow_null=True
+    )
 
     class Meta:
         model = Shift

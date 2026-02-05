@@ -86,6 +86,14 @@ class Shift(models.Model):
     location = models.ForeignKey('Location', on_delete=models.CASCADE)
     start_time = models.TimeField()
     end_time = models.TimeField()
+    is_default = models.BooleanField(default=False)
+    checkpoint_template = models.ForeignKey(
+        'CheckpointTemplate',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='default_for_shifts'
+    )
 
     # Audit fields
     created_on = models.DateTimeField(auto_now_add=True)
