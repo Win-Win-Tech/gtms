@@ -40,7 +40,7 @@ from rest_framework.viewsets import ViewSet
 # Local app imports
 from authapp.models import User
 from checkin.models import CheckIn
-from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate
+from scheduler.models import Assignment, Checkpoint, Location
 from tourlog.models import TourLog
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
@@ -125,10 +125,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     queryset = AttendanceCheckin.objects.all()
     serializer_class = AttendanceCheckinSerializer
 
-    # ===== OLD APIs (for current mobile app - no overnight enhancements) =====
-    
     def get_today_assignment(self, user, request=None):
-        """OLD: Simple assignment lookup - today only, no overnight handling"""
+        # Get today's date in user's timezone
         if request:
             user_tz = get_user_timezone_from_request(request)
         else:
@@ -140,283 +138,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             guard_id=user.id,
             start_date__lte=today,
             end_date__gte=today
-        ).first()
+        ).first()        
 
-    # ===== V2 APIs (enhanced with overnight shift + auto-assignment support) =====
-
-    def get_today_assignment_v2(self, user, request=None):
-        """V2: Enhanced assignment lookup with overnight shift support"""
-        if request:
-            user_tz = get_user_timezone_from_request(request)
-        else:
-            from patrol_backend.utils.timezone_utils import get_user_timezone
-            user_tz = get_user_timezone(user)
-        
-        today = get_user_today(user_tz)
-        yesterday = today - timedelta(days=1)
-        user_now = get_user_now(user_tz)
-        
-        # Check assignments that overlap with today OR yesterday (for overnight shifts)
-        assignments = Assignment.objects.filter(
-            guard_id=user.id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location')
-        
-        # Find the active shift instance
-        for assignment in assignments:
-            shift = assignment.shift
-            if not shift:
-                continue
-                
-            is_overnight = shift.end_time <= shift.start_time
-            
-            # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    return assignment  # Still active from yesterday
-            
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                if is_overnight:
-                    if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                        return assignment
-                else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                    if shift_start_dt <= user_now <= shift_end_dt:
-                        return assignment
-        
-        return None
-
-    def find_and_create_default_assignment(self, user, checkin_time_user, user_tz, location_lat, location_lon):
-        """
-        Find default shift matching check-in time and create assignment.
-        Returns assignment if created, None otherwise.
-        """
-        checkin_time = checkin_time_user.time()
-        checkin_date = checkin_time_user.date()
-        
-        # Get all default shifts for the user's location (or all locations if location not specified)
-        # First, try to find location based on check-in coordinates
-        # Note: Some locations in DB may not have lat/lon, so we only check locations that have coordinates
-        location = None
-        if location_lat and location_lon:
-            # Find nearest location (within reasonable distance, e.g., 1km)
-            # Only check locations that have both latitude and longitude
-            locations = Location.objects.filter(
-                is_deleted=False,
-                latitude__isnull=False,
-                longitude__isnull=False
-            )
-            min_distance = float('inf')
-            for loc in locations:
-                dist = geodesic((location_lat, location_lon), (loc.latitude, loc.longitude)).meters
-                if dist < min_distance and dist < 1000:  # Within 1km
-                    min_distance = dist
-                    location = loc
-        
-        # Fallback: If location not found via coordinates (or coordinates not provided, or locations don't have coordinates),
-        # use user's location from token
-        if not location and user.location:
-            location = user.location
-        
-        # Get default shifts
-        if location:
-            default_shifts = Shift.objects.filter(
-                is_default=True,
-                is_deleted=False,
-                location=location
-            ).select_related('checkpoint_template')
-        else:
-            # If no location found, get all default shifts (user will need to select location)
-            default_shifts = Shift.objects.filter(
-                is_default=True,
-                is_deleted=False
-            ).select_related('checkpoint_template')
-        
-        if not default_shifts.exists():
-            return None
-        
-        # Find shift that matches check-in time
-        # Priority 1: Nearest shift based on start time (±2 hours)
-        # Priority 2: If user is in active shift ending within 2 hours, and upcoming shift starts within 2 hours, assign upcoming shift
-        matching_shift = None
-        best_match_score = -1
-        WINDOW_MINUTES = 120  # ±2 hours = 120 minutes
-        
-        checkin_minutes = checkin_time.hour * 60 + checkin_time.minute
-        
-        # First pass: Find all shifts within ±2 hours of start time (nearest shift logic)
-        candidate_shifts = []
-        active_shift_ending_soon = None
-        
-        for shift in default_shifts:
-            is_overnight = shift.end_time <= shift.start_time
-            start_minutes = shift.start_time.hour * 60 + shift.start_time.minute
-            end_minutes = shift.end_time.hour * 60 + shift.end_time.minute
-            matches = False
-            minutes_from_start = None
-            is_active = False
-            is_upcoming = False
-            
-            # Check if check-in is within active shift window
-            if is_overnight:
-                # Overnight shift: Check if in active window
-                if checkin_time >= shift.start_time or checkin_time < shift.end_time:
-                    is_active = True
-                    # Calculate minutes until end
-                    if checkin_time >= shift.start_time:
-                        # Check-in is after start, end is next day
-                        minutes_until_end = (24 * 60 - checkin_minutes) + end_minutes
-                    else:
-                        # Check-in is before end (after midnight part)
-                        minutes_until_end = end_minutes - checkin_minutes
-                    
-                    # Check if ending within 2 hours
-                    if minutes_until_end <= WINDOW_MINUTES:
-                        active_shift_ending_soon = shift
-            else:
-                # Regular shift: Check if in active window
-                if shift.start_time <= checkin_time <= shift.end_time:
-                    is_active = True
-                    minutes_until_end = end_minutes - checkin_minutes
-                    if minutes_until_end <= WINDOW_MINUTES:
-                        active_shift_ending_soon = shift
-            
-            # Check if within ±2 hours of start time
-            if is_overnight:
-                if checkin_time >= shift.start_time:
-                    minutes_from_start = checkin_minutes - start_minutes
-                    if minutes_from_start <= WINDOW_MINUTES:
-                        matches = True
-                else:
-                    minutes_until_start = start_minutes - checkin_minutes
-                    if minutes_until_start <= WINDOW_MINUTES:
-                        matches = True
-                        minutes_from_start = minutes_until_start
-                        is_upcoming = True
-                    else:
-                        # Check yesterday's start
-                        minutes_since_yesterday_start = (24 * 60 - start_minutes) + checkin_minutes
-                        if minutes_since_yesterday_start <= WINDOW_MINUTES:
-                            matches = True
-                            minutes_from_start = minutes_since_yesterday_start
-            else:
-                if checkin_time >= shift.start_time:
-                    minutes_from_start = checkin_minutes - start_minutes
-                    if minutes_from_start <= WINDOW_MINUTES:
-                        matches = True
-                else:
-                    minutes_until_start = start_minutes - checkin_minutes
-                    if minutes_until_start <= WINDOW_MINUTES:
-                        matches = True
-                        minutes_from_start = minutes_until_start
-                        is_upcoming = True
-            
-            if matches and minutes_from_start is not None:
-                candidate_shifts.append({
-                    'shift': shift,
-                    'minutes_from_start': minutes_from_start,
-                    'is_upcoming': is_upcoming,
-                    'is_active': is_active
-                })
-        
-        # Priority logic:
-        # 1. If active shift ending soon → find next upcoming shift (any shift starting after current time)
-        # 2. Otherwise → assign nearest shift (closest to start time, within ±2 hours)
-        if active_shift_ending_soon:
-            # Find next upcoming shift (any shift that starts after current time, no ±2 hours restriction)
-            upcoming_shift = None
-            min_minutes_until_start = float('inf')
-            
-            for shift in default_shifts:
-                if shift == active_shift_ending_soon:
-                    continue  # Skip the active shift
-                
-                is_overnight = shift.end_time <= shift.start_time
-                start_minutes = shift.start_time.hour * 60 + shift.start_time.minute
-                minutes_until_start = None
-                
-                if is_overnight:
-                    # For overnight shift, check if start time is today or tomorrow
-                    if checkin_time >= shift.start_time:
-                        # Start time already passed today, next occurrence is tomorrow
-                        minutes_until_start = (24 * 60 - checkin_minutes) + start_minutes
-                    else:
-                        # Start time is later today
-                        minutes_until_start = start_minutes - checkin_minutes
-                else:
-                    # Regular shift
-                    if checkin_time >= shift.start_time:
-                        # Start time already passed today, next occurrence is tomorrow
-                        minutes_until_start = (24 * 60 - checkin_minutes) + start_minutes
-                    else:
-                        # Start time is later today
-                        minutes_until_start = start_minutes - checkin_minutes
-                
-                # Find the shift that starts soonest (next upcoming)
-                if minutes_until_start < min_minutes_until_start:
-                    min_minutes_until_start = minutes_until_start
-                    upcoming_shift = shift
-            
-            if upcoming_shift:
-                # Assign next upcoming shift
-                matching_shift = upcoming_shift
-            else:
-                # No upcoming shift found, assign nearest shift from candidates
-                if candidate_shifts:
-                    best_candidate = min(candidate_shifts, key=lambda x: x['minutes_from_start'])
-                    matching_shift = best_candidate['shift']
-        else:
-            # No active shift ending soon, assign nearest shift (within ±2 hours)
-            if candidate_shifts:
-                best_candidate = min(candidate_shifts, key=lambda x: x['minutes_from_start'])
-                matching_shift = best_candidate['shift']
-        
-        if not matching_shift:
-            return None
-        
-        # Get checkpoints from template
-        checkpoints = []
-        if matching_shift.checkpoint_template:
-            template = matching_shift.checkpoint_template
-            if template.checkpoints:
-                checkpoints = template.checkpoints  # Already in format [{"checkpoint_id": "uuid", "time": "HH:MM"}]
-        
-        # Determine assignment date range
-        start_date = checkin_date
-        if matching_shift.end_time <= matching_shift.start_time:
-            # Overnight shift
-            # If check-in time is before end_time (e.g., 1 AM), shift started yesterday
-            if checkin_time < matching_shift.end_time:
-                start_date = checkin_date - timedelta(days=1)  # Shift started yesterday
-            # End date is the day the shift ends (today for overnight shifts)
-            end_date = checkin_date
-        else:
-            # Regular shift - same day
-            end_date = checkin_date
-        
-        # Create assignment
-        assignment = Assignment.objects.create(
-            guard=user,
-            location=matching_shift.location,
-            shift=matching_shift,
-            start_date=start_date,
-            end_date=end_date,
-            checkpoints=checkpoints
-        )
-        
-        return assignment
+    
 
     @action(detail=False, methods=["get"])
     def shift_today(self, request):
-        """OLD: Simple shift_today for current mobile app"""
+        """Return today's shift info + flags for checkin/checkout buttons"""
         user = request.user
         user_id = user.id
 
+        # Get user's timezone
         user_tz = get_user_timezone_from_request(request)
+        
+        # Get current time and today's date in user's timezone
         user_now = get_user_now(user_tz)
         today = user_now.date()
 
@@ -437,6 +172,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         shift = assignment.shift
         location = assignment.location
 
+        # Convert today to UTC date range for database query
+        # Database stores UTC, so we need to query using UTC date range
         start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
 
         attendance = AttendanceCheckin.objects.filter(
@@ -449,178 +186,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         show_checkout = False
         message = ""
 
+        # Determine shift window in user's timezone
         shift_start_dt_user = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
         shift_start_dt_user = shift_start_dt_user.astimezone(user_tz)
   
         if shift.end_time <= shift.start_time:
+            # Overnight shift
             shift_end_dt_user = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
             shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
         else:
             shift_end_dt_user = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
-        
-        earliest_checkin = shift_start_dt_user - timedelta(minutes=30)
-        latest_checkin = shift_end_dt_user
-        earliest_checkout = shift_start_dt_user
-        latest_checkout = shift_end_dt_user + timedelta(minutes=30)
-
-        if not attendance:
-            if earliest_checkin <= user_now <= latest_checkin:
-                show_checkin = True
-                message = "You can check in"
-            elif user_now < earliest_checkin:
-                message = "Too early to check in"
-            else:
-                message = "Shift ended"
-        else:
-            if attendance.checkin_time and not attendance.checkout_time:
-                checkin_time_user = to_user_timezone(attendance.checkin_time, user_tz)
-                if user_now <= shift_end_dt_user:
-                    show_checkout = True
-                    message = "You are checked in, checkout when done"
-                else:
-                    message = "Shift ended"
-            elif attendance.checkin_time and attendance.checkout_time:
-                checkout_time_user = to_user_timezone(attendance.checkout_time, user_tz)
-                if user_now <= shift_end_dt_user:
-                    start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
-                    latest_checkin = CheckInLog.objects.filter(
-                        guard=user,
-                        assignment=assignment,
-                        shift=shift,
-                        org_location=location,
-                        type="checkin",
-                        timestamp__gte=start_utc,
-                        timestamp__lt=end_utc + timedelta(days=1),
-                        timestamp__gt=attendance.checkout_time
-                    ).order_by("-timestamp").first()
-
-                    if latest_checkin:
-                        show_checkin = False
-                        show_checkout = True
-                        message = "You have checked-in. You can check-out"
-                    else:
-                        show_checkin = True
-                        show_checkout = False
-                        message = "You are checked out already but can check in again"
-   
-                else:
-                    message = "Shift ended"
-
-        return Response({
-                "has_shift": True,
-                "shift_id": str(shift.id),
-                "shift_start": shift.start_time,
-                "shift_end": shift.end_time,
-                "location_name": location.name,
-                "show_checkin": show_checkin,
-                "show_checkout": show_checkout,
-                "message": message
-            }, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=["get"], url_path="shift_today_v2")
-    def shift_today_v2(self, request):
-        """V2: Enhanced shift_today with overnight shift support"""
-        user = request.user
-        user_id = user.id
-
-        user_tz = get_user_timezone_from_request(request)
-        user_now = get_user_now(user_tz)
-        today = user_now.date()
-        yesterday = today - timedelta(days=1)
-
-        assignments = Assignment.objects.filter(
-            guard_id=user_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location').order_by('-start_date', '-created_on')
-        assignment = None
-        shift_start_date = today
-        
-        # 1) Prefer the assignment that is active right now.
-        for assgn in assignments:
-            shift = assgn.shift
-            if not shift:
-                continue
-                
-            is_overnight = shift.end_time <= shift.start_time
-
-            if is_overnight:
-                # If it's after midnight and before shift end, active shift instance started yesterday.
-                logical_start_date = yesterday if user_now.time() < shift.end_time else today
-                if not (assgn.start_date <= logical_start_date <= assgn.end_date):
-                    continue
-                if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                    assignment = assgn
-                    shift_start_date = logical_start_date
-                    break
-            else:
-                if not (assgn.start_date <= today <= assgn.end_date):
-                    continue
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if shift_start_dt <= user_now <= shift_end_dt:
-                    assignment = assgn
-                    shift_start_date = today
-                    break
-
-        # 2) If nothing is active, still return today's scheduled shift (pre-shift behavior).
-        if not assignment:
-            best_scheduled = None
-            best_distance = None
-            for assgn in assignments:
-                shift = assgn.shift
-                if not shift:
-                    continue
-                if not (assgn.start_date <= today <= assgn.end_date):
-                    continue
-
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                distance_seconds = abs((shift_start_dt - user_now).total_seconds())
-
-                if best_distance is None or distance_seconds < best_distance:
-                    best_distance = distance_seconds
-                    best_scheduled = assgn
-
-            if best_scheduled:
-                assignment = best_scheduled
-                shift_start_date = today
-
-        if not assignment:
-            return Response({
-                "has_shift": False,
-                "show_checkin": True,
-                "show_checkout": False,
-                "message": "No shifts today"
-            }, status=status.HTTP_200_OK)
-
-        shift = assignment.shift
-        location = assignment.location
-
-        # Use shift_start_date (could be yesterday for overnight) for UTC conversion
-        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
-        
-        # Check attendance in expanded date range (yesterday + today + tomorrow for overnight)
-        attendance = AttendanceCheckin.objects.filter(
-            guard=user, shift=shift, assignment=assignment,
-            checkin_time__gte=start_utc - timedelta(days=1),  # Include yesterday
-            checkin_time__lt=end_utc + timedelta(days=2)  # Include tomorrow
-        ).first()
-
-        show_checkin = False
-        show_checkout = False
-        message = ""
-
-        # Calculate shift window using shift_start_date
-        shift_start_dt_user = combine_date_time_in_user_tz(shift_start_date, shift.start_time, user_tz)
-        shift_start_dt_user = shift_start_dt_user.astimezone(user_tz)
-  
-        if shift.end_time <= shift.start_time:
-            # Overnight shift - end is next day
-            shift_end_dt_user = combine_date_time_in_user_tz(shift_start_date + timedelta(days=1), shift.end_time, user_tz)
-            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
-        else:
-            shift_end_dt_user = combine_date_time_in_user_tz(shift_start_date, shift.end_time, user_tz)
             shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
         
         # Define check-in and check-out windows (in user timezone)
@@ -655,17 +230,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 checkout_time_user = to_user_timezone(attendance.checkout_time, user_tz)
                 if user_now <= shift_end_dt_user:
                     # Check if user has checked in again after checkout
-                    # Use expanded date range for query
-                    start_utc_expanded = start_utc - timedelta(days=1)
-                    end_utc_expanded = end_utc + timedelta(days=2)
+                    # Convert today to UTC range for query
+                    start_utc, end_utc = convert_date_range_to_utc(today, today, user_tz)
                     latest_checkin = CheckInLog.objects.filter(
                         guard=user,
                         assignment=assignment,
                         shift=shift,
                         org_location=location,
                         type="checkin",
-                        timestamp__gte=start_utc_expanded,
-                        timestamp__lt=end_utc_expanded,
+                        timestamp__gte=start_utc,
+                        timestamp__lt=end_utc + timedelta(days=1),
                         timestamp__gt=attendance.checkout_time
                     ).order_by("-timestamp").first()
 
@@ -682,6 +256,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     # Scenario 5: Shift ended
                     message = "Shift ended"
 
+    # Optional: Scenario 4 — checked in again after checkout
+    # If you track multiple check-ins via a log, you can detect this and show:
+    # show_checkout = True
+    # message = "You can check out"
+
         return Response({
                 "has_shift": True,
                 "shift_id": str(shift.id),
@@ -696,7 +275,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
   
     @action(detail=False, methods=["post"])
     def checkin(self, request):
-        """OLD: Simple checkin for current mobile app"""
         user = request.user
         user_tz = get_user_timezone_from_request(request)
         assignment = self.get_today_assignment(user, request)
@@ -713,9 +291,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if distance > 100:
             return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Get today in user timezone for query
         user_today = get_user_today(user_tz)
         start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
 
+        # Log this check-in (timestamp will be auto-set to UTC)
         CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -726,6 +306,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             longitude=lon
         )
 
+        # Update or create attendance record
+        # Use UTC date range for query (created_on is stored in UTC)
         attendance, _ = AttendanceCheckin.objects.get_or_create(
             guard=user,
             assignment=assignment,
@@ -733,6 +315,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             org_location=org_location,
             defaults={'created_on': timezone.now()}
         )
+        # Filter by UTC date range
         attendance_list = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
@@ -744,6 +327,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if attendance_list.exists():
             attendance = attendance_list.first()
 
+        # Find earliest checkin in today's date range (UTC)
         earliest_checkin = CheckInLog.objects.filter(
             guard=user,
             assignment=assignment,
@@ -755,7 +339,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         ).order_by("timestamp").first()
 
         if earliest_checkin:
-            attendance.checkin_time = earliest_checkin.timestamp
+            attendance.checkin_time = earliest_checkin.timestamp  # Already in UTC
         attendance.latitude = earliest_checkin.latitude
         attendance.longitude = earliest_checkin.longitude
         attendance.save()
@@ -764,7 +348,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def checkout(self, request):
-        """OLD: Simple checkout for current mobile app"""
         user = request.user
         user_tz = get_user_timezone_from_request(request)
         assignment = self.get_today_assignment(user, request)
@@ -777,9 +360,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        # Get today in user timezone and convert to UTC range
         user_today = get_user_today(user_tz)
         start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
 
+        # Find attendance record using UTC date range
         attendance = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
@@ -792,6 +377,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if not attendance or not attendance.checkin_time:
             return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Log this checkout (timestamp auto-set to UTC)
         CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -802,6 +388,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             longitude=lon
         )
 
+        # Find latest checkout in today's UTC date range
         latest_checkout = CheckInLog.objects.filter(
             guard=user,
             assignment=assignment,
@@ -813,381 +400,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         ).order_by("-timestamp").first()
 
         if latest_checkout:
-            attendance.checkout_time = latest_checkout.timestamp
+            attendance.checkout_time = latest_checkout.timestamp  # Already in UTC
         attendance.save()
 
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
-
-    # ===== V2 CHECKIN/CHECKOUT (enhanced with overnight + auto-assignment) =====
-
-    @action(detail=False, methods=["post"], url_path="checkin_v2")
-    def checkin_v2(self, request):
-        """V2: Enhanced checkin with overnight shift + auto-assignment support"""
-        user = request.user
-        user_tz = get_user_timezone_from_request(request)
-        user_now = get_user_now(user_tz)
-        assignment = self.get_today_assignment_v2(user, request)
-
-        # If no assignment, try to create one from default shift
-        if not assignment:
-            lat = float(request.data.get("latitude", 0))
-            lon = float(request.data.get("longitude", 0))
-            assignment = self.find_and_create_default_assignment(user, user_now, user_tz, lat, lon)
-            
-            if not assignment:
-                return Response({"message": "No shifts today and no default shift found"}, status=status.HTTP_400_BAD_REQUEST)
-
-        shift = assignment.shift
-        org_location = assignment.location
-        
-        lat = float(request.data.get("latitude"))
-        lon = float(request.data.get("longitude"))
-        
-        # Validate location if location has coordinates
-        if org_location.latitude and org_location.longitude:
-            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-            if distance > 100:
-                return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Get expanded date range (yesterday + today + tomorrow for overnight shifts)
-        user_today = get_user_today(user_tz)
-        yesterday = user_today - timedelta(days=1)
-        start_utc, _ = convert_date_range_to_utc(yesterday, yesterday, user_tz)
-        _, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        end_utc = end_utc + timedelta(days=2)
-
-        CheckInLog.objects.create(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            type="checkin",
-            latitude=lat,
-            longitude=lon
-        )
-
-        attendance, _ = AttendanceCheckin.objects.get_or_create(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            defaults={'created_on': timezone.now()}
-        )
-        
-        attendance_list = AttendanceCheckin.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            created_on__gte=start_utc,
-            created_on__lt=end_utc
-        )
-        if attendance_list.exists():
-            attendance = attendance_list.first()
-
-        earliest_checkin = CheckInLog.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            type="checkin",
-            timestamp__gte=start_utc,
-            timestamp__lt=end_utc
-        ).order_by("timestamp").first()
-
-        if earliest_checkin:
-            attendance.checkin_time = earliest_checkin.timestamp
-            attendance.latitude = earliest_checkin.latitude
-            attendance.longitude = earliest_checkin.longitude
-        attendance.save()
-
-        return Response(AttendanceCheckinSerializer(attendance, context={'request': request}).data, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=["post"], url_path="checkout_v2")
-    def checkout_v2(self, request):
-        """V2: Enhanced checkout with overnight shift support"""
-        user = request.user
-        user_tz = get_user_timezone_from_request(request)
-        assignment = self.get_today_assignment_v2(user, request)
-
-        if not assignment:
-            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
-
-        shift = assignment.shift
-        org_location = assignment.location
-        lat = float(request.data.get("latitude"))
-        lon = float(request.data.get("longitude"))
-
-        user_today = get_user_today(user_tz)
-        yesterday = user_today - timedelta(days=1)
-        start_utc, _ = convert_date_range_to_utc(yesterday, yesterday, user_tz)
-        _, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        end_utc = end_utc + timedelta(days=2)
-
-        attendance = AttendanceCheckin.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            created_on__gte=start_utc,
-            created_on__lt=end_utc
-        ).first()
-
-        if not attendance or not attendance.checkin_time:
-            return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
-
-        CheckInLog.objects.create(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            type="checkout",
-            latitude=lat,
-            longitude=lon
-        )
-
-        latest_checkout = CheckInLog.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            type="checkout",
-            timestamp__gte=start_utc,
-            timestamp__lt=end_utc
-        ).order_by("-timestamp").first()
-
-        if latest_checkout:
-            attendance.checkout_time = latest_checkout.timestamp
-        attendance.save()
-
-        return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=["get"])
-    def list_default_shifts(self, request):
-        """
-        List default shifts for guard's location.
-        Only returns shifts if guard has no shift for today.
-        Query params: guard_id
-        """
-        guard_id = request.query_params.get("guard_id")
-        
-        if not guard_id:
-            return Response(
-                {"error": "guard_id is required"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            guard = User.objects.get(id=guard_id)
-        except User.DoesNotExist:
-            return Response(
-                {"error": "Guard not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        # Check if guard has shift for today
-        user_tz = get_user_timezone_from_request(request)
-        today = get_user_today(user_tz)
-        yesterday = today - timedelta(days=1)
-        user_now = get_user_now(user_tz)
-        
-        # Check assignments that overlap with today OR yesterday (for overnight shifts)
-        assignments = Assignment.objects.filter(
-            guard_id=guard_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location')
-        
-        # Check if guard has active shift today
-        has_shift_today = False
-        for assignment in assignments:
-            shift = assignment.shift
-            if not shift:
-                continue
-                
-            is_overnight = shift.end_time <= shift.start_time
-            
-            # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    has_shift_today = True
-                    break
-            
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                if is_overnight:
-                    if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                        has_shift_today = True
-                        break
-                else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                    if shift_start_dt <= user_now <= shift_end_dt:
-                        has_shift_today = True
-                        break
-        
-        if has_shift_today:
-            return Response(
-                {"message": "Guard already has a shift for today", "has_shift": True},
-                status=status.HTTP_200_OK
-            )
-        
-        # Get guard's location
-        if not guard.location:
-            return Response(
-                {"error": "Guard does not have an assigned location"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Get default shifts for guard's location
-        default_shifts = Shift.objects.filter(
-            is_default=True,
-            is_deleted=False,
-            location=guard.location
-        ).select_related('checkpoint_template', 'location')
-        
-        # Serialize shifts
-        shifts_data = []
-        for shift in default_shifts:
-            shifts_data.append({
-                "id": str(shift.id),
-                "name": shift.name,
-                "start_time": shift.start_time.strftime("%H:%M:%S"),
-                "end_time": shift.end_time.strftime("%H:%M:%S"),
-                "location_id": str(shift.location.id) if shift.location else None,
-                "location_name": shift.location.name if shift.location else None,
-                "checkpoint_template_id": str(shift.checkpoint_template.id) if shift.checkpoint_template else None,
-                "checkpoint_template_name": shift.checkpoint_template.template_name if shift.checkpoint_template else None,
-                "is_overnight": shift.end_time <= shift.start_time
-            })
-        
-        return Response({
-            "has_shift": False,
-            "default_shifts": shifts_data,
-            "location_id": str(guard.location.id),
-            "location_name": guard.location.name
-        }, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=["post"])
-    def create_assignment(self, request):
-        """
-        Create assignment for guard with specified shift.
-        Only creates if guard has no shift for today.
-        Body: guard_id, shift_id
-        """
-        guard_id = request.data.get("guard_id")
-        shift_id = request.data.get("shift_id")
-        
-        if not guard_id or not shift_id:
-            return Response(
-                {"error": "guard_id and shift_id are required"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            guard = User.objects.get(id=guard_id)
-        except User.DoesNotExist:
-            return Response(
-                {"error": "Guard not found"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        try:
-            shift = Shift.objects.get(id=shift_id, is_deleted=False)
-        except Shift.DoesNotExist:
-            return Response(
-                {"error": "Shift not found or deleted"},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
-        # Check if guard has shift for today
-        user_tz = get_user_timezone_from_request(request)
-        today = get_user_today(user_tz)
-        yesterday = today - timedelta(days=1)
-        user_now = get_user_now(user_tz)
-        
-        # Check assignments that overlap with today OR yesterday (for overnight shifts)
-        assignments = Assignment.objects.filter(
-            guard_id=guard_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location')
-        
-        # Check if guard has active shift today
-        has_shift_today = False
-        for assignment in assignments:
-            assignment_shift = assignment.shift
-            if not assignment_shift:
-                continue
-                
-            is_overnight = assignment_shift.end_time <= assignment_shift.start_time
-            
-            # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, assignment_shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    has_shift_today = True
-                    break
-            
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, assignment_shift.start_time, user_tz)
-                if is_overnight:
-                    if user_now.time() >= assignment_shift.start_time or user_now.time() < assignment_shift.end_time:
-                        has_shift_today = True
-                        break
-                else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, assignment_shift.end_time, user_tz)
-                    if shift_start_dt <= user_now <= shift_end_dt:
-                        has_shift_today = True
-                        break
-        
-        if has_shift_today:
-            return Response(
-                {"error": "Guard already has a shift for today", "has_shift": True},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Get checkpoints from shift's checkpoint_template
-        checkpoints = []
-        if shift.checkpoint_template:
-            template = shift.checkpoint_template
-            if template.checkpoints:
-                checkpoints = template.checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
-        
-        # Determine assignment date range
-        start_date = today
-        if shift.end_time <= shift.start_time:
-            # Overnight shift - end date is next day
-            end_date = today + timedelta(days=1)
-        else:
-            # Regular shift - same day
-            end_date = today
-        
-        # Create assignment
-        assignment = Assignment.objects.create(
-            guard=guard,
-            location=shift.location,
-            shift=shift,
-            start_date=start_date,
-            end_date=end_date,
-            checkpoints=checkpoints
-        )
-        
-        return Response({
-            "message": "Assignment created successfully",
-            "assignment_id": str(assignment.id),
-            "guard_id": str(guard.id),
-            "guard_name": guard.name if hasattr(guard, 'name') else guard.username,
-            "shift_id": str(shift.id),
-            "shift_name": shift.name,
-            "location_id": str(shift.location.id) if shift.location else None,
-            "location_name": shift.location.name if shift.location else None,
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-            "checkpoints_count": len(checkpoints)
-        }, status=status.HTTP_201_CREATED)
 
 
     # ----------------------
@@ -1309,14 +525,15 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
     else:
         raise ValueError("Invalid filter or missing dates")
     
-    # Get assignments that overlap with the date range
-    # Extend 1 day before filter start to capture overnight shifts from previous day
-    # whose after-midnight checkpoints fall within the filter range
-    query_start_date = start_dt_user.date() - timedelta(days=1)
-    query_end_date = end_dt_user.date()
+    # Convert user timezone date range to UTC for database queries
+    start_utc, end_utc = convert_date_range_to_utc(start_dt_user.date(), end_dt_user.date(), user_tz)
+    # Adjust end_utc to include the full end day
+    end_utc = end_utc + timedelta(days=1)
+    
+    # Get assignments that overlap with the date range (using UTC dates for query)
     assignments = Assignment.objects.filter(
-        start_date__lte=query_end_date,
-        end_date__gte=query_start_date
+        start_date__lte=end_utc.date(),
+        end_date__gte=start_utc.date()
     ).select_related('guard', 'location', 'shift')
     
     if user_id:
@@ -1373,15 +590,13 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
             is_overnight = shift.end_time <= shift.start_time
             
             # For each date in the range where the assignment is active
-            # For ALL filters (not just today), check the day before filter start
-            # to catch overnight shift checkpoints that spill into the filter range
-            # Example: Feb 2 filter → also check Feb 1's overnight shift for 3 AM Feb 2 checkpoints
+            # For "today" filter, we also need to check the previous day's shift for overnight checkpoints
             dates_to_check = list(date_range)
-            if is_overnight:
-                prev_day = start_dt_user.date() - timedelta(days=1)
+            if filter_type == 'today' and is_overnight:
+                # Also check previous day for overnight shifts (to catch checkpoints after midnight)
+                prev_day = today - timedelta(days=1)
                 if assignment.start_date <= prev_day <= assignment.end_date:
-                    if prev_day not in dates_to_check:
-                        dates_to_check.insert(0, prev_day)
+                    dates_to_check.insert(0, prev_day)
             
             for check_date in dates_to_check:
                 # Skip future dates - don't process shifts that haven't started yet
@@ -1407,15 +622,32 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     # Normal shift - checkpoint is on the same day
                     checkpoint_date = check_date
                 
-                # UNIFIED FILTER: Include checkpoint only if it actually occurs within the filter date range
-                # This works consistently for ALL filter types (today, custom, this_week, this_month)
-                if not (start_dt_user.date() <= checkpoint_date <= end_date):
-                    continue
+                # FIX: For "today" filter - include ALL checkpoints that occur on today's calendar date
+                # This includes:
+                # 1. Checkpoints from yesterday's overnight shift that occur today (e.g., 1:30 AM Jan 10 from Jan 9 shift)
+                # 2. Checkpoints from today's shift that occur today (e.g., 8:00 PM Jan 10 from Jan 10 shift)
+                # We use checkpoint_date (the actual calendar date the checkpoint occurs) to determine this
+                if filter_type == 'today':
+                    # Include if checkpoint occurs on today's calendar date (regardless of which shift it belongs to)
+                    if checkpoint_date != today:
+                        continue
                 
                 # Calculate expected time for this specific date in user timezone
                 expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
                 
-                # Define ±30 min search window around expected time (in UTC) to find matching CheckIn
+                # Define the search window for this specific date's check-in (convert to UTC)
+                # For overnight shifts, we need to search across two days
+                if is_overnight and expected_time_obj < shift.start_time:
+                    # Checkpoint is on next day, so search window starts from checkpoint date
+                    day_start_user = datetime.combine(checkpoint_date, datetime.min.time())
+                    day_end_user = datetime.combine(checkpoint_date, datetime.max.time())
+                else:
+                    # Normal case or checkpoint before midnight in overnight shift
+                    day_start_user = datetime.combine(check_date, datetime.min.time())
+                    day_end_user = datetime.combine(check_date, datetime.max.time())
+                
+                day_start_utc, day_end_utc = convert_date_range_to_utc(day_start_user.date(), day_end_user.date(), user_tz)
+                day_end_utc = day_end_utc + timedelta(days=1)
                 search_start_utc = (expected_datetime_user - timedelta(minutes=30)).astimezone(pytz.UTC)
                 search_end_utc = (expected_datetime_user + timedelta(minutes=30)).astimezone(pytz.UTC)
 
@@ -1487,11 +719,24 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                 else:
                     actual_time_display = None
                 
-                # Use checkpoint_date as the report date
-                # This is the actual calendar date the checkpoint occurs on
-                # For overnight shifts: after-midnight checkpoints show on the next day
-                # For normal shifts: same as check_date
-                report_date = checkpoint_date
+                # Use checkpoint_date for report date (handles overnight shifts correctly)
+                # For overnight shifts, use check_date (when shift started) for report date
+                # This ensures all checkpoints from the same shift show the same date
+                if is_overnight:
+                    report_date = check_date  # Use the date the shift started
+                else:
+                    report_date = checkpoint_date
+                
+                # FIX: Only include checkpoints that fall within the filter date range
+                # For "today" filter, we already handled it above for overnight shifts
+                if filter_type == 'today':
+                    # Already handled above, but double-check for normal shifts
+                    if not is_overnight and report_date != today:
+                        continue
+                elif filter_type in ['this_week', 'this_month', 'custom']:
+                    # For other filters, ensure report_date is within the date range
+                    if not (start_dt_user.date() <= report_date <= end_dt_user.date()):
+                        continue  # Skip checkpoints outside the filter range
                 
                 report.append({
                     'date': report_date.strftime('%Y-%m-%d'),
@@ -2707,4 +1952,3 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
     #     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     #     wb.save(response)
     #     return response
-

@@ -20,9 +20,12 @@ from patrol_backend.utils.timezone_utils import (
     convert_date_range_to_utc,
     to_user_timezone
 )
+import logging
 import os
 import cloudinary
 import cloudinary.uploader
+
+logger = logging.getLogger(__name__)
 
 # Cloudinary configuration (can also be placed in settings.py)
 # cloudinary.config(
@@ -61,9 +64,6 @@ class IncidentReportView(APIView):
                     video_url = upload_result.get('secure_url')
                     media_urls.append(video_url)
 
-                # Twilio client setup
-                client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
-
                 # Convert timestamp to location timezone for display
                 # Use incident's location timezone if available
                 location_id = str(incident.location.id) if incident.location else None
@@ -80,36 +80,47 @@ class IncidentReportView(APIView):
                     f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
                 )
 
-                # Send WhatsApp message with photo or text
-                if photo_url:
-                    client.messages.create(
-                        body=whatsapp_body,
-                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                        to='whatsapp:' + settings.ADMIN_WHATSAPP,
-                        media_url=[photo_url]
-                    )
-                else:
-                    client.messages.create(
-                        body=whatsapp_body,
-                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                        to='whatsapp:' + settings.ADMIN_WHATSAPP
-                    )
+                # Twilio notification is non-blocking for incident creation.
+                # If Twilio auth/config fails, incident is still saved and API returns 201.
+                try:
+                    client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
 
-                # Send video separately if present
-                if video_url:
-                    client.messages.create(
-                        body=f"🎥 Incident Video for Ticket {incident.ticket_number}",
-                        from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                        to='whatsapp:' + settings.ADMIN_WHATSAPP,
-                        media_url=[video_url]
-                    )
+                    # Send WhatsApp message with photo or text
+                    if photo_url:
+                        client.messages.create(
+                            body=whatsapp_body,
+                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                            media_url=[photo_url]
+                        )
+                    else:
+                        client.messages.create(
+                            body=whatsapp_body,
+                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP
+                        )
 
-                # Trigger phone call
-                client.calls.create(
-                    twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
-                    to=settings.ADMIN_PHONE,
-                    from_=settings.TWILIO_PHONE
-                )
+                    # Send video separately if present
+                    if video_url:
+                        client.messages.create(
+                            body=f"🎥 Incident Video for Ticket {incident.ticket_number}",
+                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                            media_url=[video_url]
+                        )
+
+                    # Trigger phone call
+                    client.calls.create(
+                        twiml=f'<Response><Say>Alert! A {incident.severity} incident has been reported. Ticket {incident.ticket_number}.</Say></Response>',
+                        to=settings.ADMIN_PHONE,
+                        from_=settings.TWILIO_PHONE
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "[INCIDENT_REPORT] Twilio notification failed for ticket %s: %s",
+                        incident.ticket_number,
+                        str(exc),
+                    )
 
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
 
