@@ -38,13 +38,13 @@ class IncidentReportView(APIView):
         parser_classes = [MultiPartParser]
 
         def post(self, request):
-            data = request.data.copy()
-            data['created_by'] = request.user.id
-            data['location'] = request.user.location_id
-            serializer = IncidentSerializer(data=data, context={'request': request})
+            serializer = IncidentSerializer(data=request.data, context={'request': request})
 
             if serializer.is_valid():
-                incident = serializer.save()
+                incident = serializer.save(
+                    created_by=request.user,
+                    location=request.user.location
+                )
 
                 # Upload media to Cloudinary
                 media_urls = []
@@ -122,7 +122,8 @@ class IncidentReportView(APIView):
                         str(exc),
                     )
 
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
+                response_serializer = IncidentSerializer(incident, context={'request': request})
+                return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
