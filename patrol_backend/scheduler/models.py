@@ -335,9 +335,31 @@ class Checkpoint(models.Model):
 
 class SiteSetting(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    key = models.CharField(max_length=255, unique=True)
+    key = models.CharField(max_length=255)
     value = models.TextField(blank=True)
-    unit = models.CharField(max_length=10, null=True, blank=True)  # ✅ Optional unit
+    unit = models.CharField(max_length=10, null=True, blank=True)
+    location = models.ForeignKey('Location', on_delete=models.CASCADE, null=True, blank=True, related_name="site_settings")
+    is_deleted = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ('key', 'location')
+        ordering = ['key']
+        indexes = [
+            models.Index(fields=["is_deleted"]),
+            models.Index(fields=["key", "location"]),
+        ]
+
+    @classmethod
+    def get_setting(cls, key, location_id=None, default_value=None):
+        """
+        Get setting value for a specific location or fallback to global setting.
+        Logic: Specific Location > Global (location is NULL) > default_value
+        """
+        setting = cls.objects.filter(key=key).filter(
+            models.Q(location_id=location_id) | models.Q(location_id__isnull=True)
+        ).order_by(models.F('location_id').desc(nulls_last=True)).first()
+        
+        return setting.value if setting else default_value
 
     # Audit and soft delete fields as before...
 
@@ -390,6 +412,7 @@ class SiteSetting(models.Model):
         return self.key
 
     class Meta:
+        unique_together = ('key', 'location')
         indexes = [
             models.Index(fields=["is_deleted"]),
         ]

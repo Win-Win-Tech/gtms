@@ -317,15 +317,21 @@ class CheckInViewSet(viewsets.ModelViewSet):
             user_coords = (latitude, longitude)
             distance = geodesic(checkpoint_coords, user_coords).meters
 
-            settings = list(site_settings.values())
+            # Fetch allowed distance from SiteSetting (with fallback)
+            allowed_distance_str = SiteSetting.get_setting(
+                key='distance', 
+                location_id=guard.location_id, 
+                default_value="150"
+            )
+            allowed_distance = int(allowed_distance_str)
 
             logger.info(
                 "[SCAN_CHECKPOINT_API] Distance calculation → "
                 f"user_coords={user_coords}, checkpoint_coords={checkpoint_coords}, "
-                f"distance={distance:.2f}m, allowed={settings[1]['value']}m"
+                f"distance={distance:.2f}m, allowed={allowed_distance}m"
             )
 
-            if distance > int(settings[1]['value']):
+            if distance > allowed_distance:
                 logger.error("[SCAN_CHECKPOINT_API] Distance validation FAILED")
                 return Response(
                     {"error": f"Check-in location is too far from checkpoint ({int(distance)}m)"},
@@ -409,12 +415,20 @@ class CheckInViewSet(viewsets.ModelViewSet):
                     min_time_diff = time_diff
                     best_match = checkpoint_time
 
-            delayed = min_time_diff > int(settings[0]['value'])
+            # Fetch allowed delay from SiteSetting (with fallback)
+            allowed_delay_str = SiteSetting.get_setting(
+                key='time', 
+                location_id=guard.location_id, 
+                default_value="15"
+            )
+            allowed_delay = int(allowed_delay_str)
+
+            delayed = min_time_diff > allowed_delay
 
             logger.info(
                 "[SCAN_CHECKPOINT_API] Delay decision → "
                 f"min_diff={min_time_diff:.2f}, "
-                f"allowed={settings[0]['value']}, delayed={delayed}"
+                f"allowed={allowed_delay}, delayed={delayed}"
             )
 
             serializer = self.get_serializer(data=data)

@@ -14,7 +14,7 @@ from .serializers import (
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.utils.timezone import now, make_aware
-from django.core.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError
 from datetime import datetime, timedelta
 import pytz
 import logging
@@ -608,33 +608,158 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
     queryset = SiteSetting.objects.all()
     serializer_class = SiteSettingSerializer
 
+    def get_queryset(self):
+        """Simple, fast queryset for retrieving settings."""
+        queryset = SiteSetting.objects.filter(is_deleted=False)
+        loc_param = self.request.query_params.get('location')
+        
+        # 1. Superuser logic
+        if self.request.user.is_superuser:
+            if loc_param:
+                if loc_param.lower() == 'null':
+                    return queryset.filter(location__isnull=True)
+                return queryset.filter(location_id=loc_param)
+            
+            # For detail actions, don't filter by location so lookup by ID works
+            if self.action in ['retrieve', 'update', 'partial_update', 'destroy']:
+                return queryset
+                
+            # Default to Global for Superuser list view
+            return queryset.filter(location__isnull=True)
+
+        # 2. Regular users are strictly bound to their location
+        if getattr(self.request.user, 'location', None):
+            return queryset.filter(location_id=self.request.user.location_id)
+        
+        # 3. Fallback: Show Global
+        return queryset.filter(location__isnull=True)
+
+    def list(self, request, *args, **kwargs):
+        """Override list to trigger auto-sync for the current context."""
+        user = request.user
+        loc_param = request.query_params.get('location')
+        
+        # Target for sync: 
+        # - If superuser and viewing a specific location
+        # - If regular user with a location
+        target_sync_id = None
+        if user.is_superuser:
+            if loc_param and loc_param.lower() != 'null':
+                target_sync_id = loc_param
+        elif getattr(user, 'location', None):
+            target_sync_id = user.location_id
+
+        if target_sync_id:
+            try:
+                self._sync_settings(target_sync_id, user)
+            except Exception as e:
+                # Log but don't crash the list view
+                logger.error(f"[SITE_SETTING_SYNC_ERROR] {e}", exc_info=True)
+
+        return super().list(request, *args, **kwargs)
+
+    def _sync_settings(self, location_id, user):
+        """Ensures location has overrides for every global key."""
+        # Find global keys that don't have a local counterpart
+        # Optimization: Use a subquery to find missing keys
+        from django.db.models import Exists, OuterRef
+        
+        missing_settings = SiteSetting.objects.filter(
+            location__isnull=True, 
+            is_deleted=False
+        ).exclude(
+            Exists(
+                SiteSetting.objects.filter(
+                    key=OuterRef('key'), 
+                    location_id=location_id, 
+                    is_deleted=False
+                )
+            )
+        )
+
+        to_create = []
+        for g_set in missing_settings:
+            to_create.append(SiteSetting(
+                key=g_set.key,
+                value=g_set.value,
+                unit=g_set.unit,
+                location_id=location_id,
+                created_by=user
+            ))
+        
+        if to_create:
+            SiteSetting.objects.bulk_create(to_create, ignore_conflicts=True)
+
+    def partial_update(self, request, *args, **kwargs):
+        return super().partial_update(request, *args, **kwargs)
+
+
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        # Only Super Admin (no location) can create new keys/settings
+        # 1. Permission check: Only Super Admin can create new setting keys
+        if not user.is_superuser:
+             raise ValidationError("Only Super Admin can create new setting keys.")
+        
+        # Super admin creations are global (location=NULL)
+        serializer.save(created_by=user, location=None)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        user = self.request.user
+        
+        # 1. Prevent key name editing
+        if 'key' in self.request.data and self.request.data['key'] != instance.key:
+            raise ValidationError("Editing the 'key' name is not allowed.")
+            
+        # 2. Permission check: Location admins can only edit their own settings
+        # 2. Permission check: Admin can edit anything, Location admins only their own
+        if not user.is_superuser and user.location and instance.location_id != user.location_id:
+            raise ValidationError("You do not have permission to edit settings for another location.")
+            
+        serializer.save(modified_by=user)
+
     def destroy(self, request, *args, **kwargs):
+        user = self.request.user
+        instance = self.get_object()
+        
+        # Only Super Admin can delete settings
+        # Only Super Admin can delete settings
+        if not user.is_superuser:
+            return Response({'error': 'Only Super Admin can delete settings.'}, status=http_status.HTTP_403_FORBIDDEN)
+            
         try:
-            instance = self.get_object()
             instance.delete(user=request.user)
-            return Response(status=status.HTTP_204_NO_CONTENT)
+            return Response(status=http_status.HTTP_204_NO_CONTENT)
         except Exception as e:
             logger.error(f"Error deleting site setting: {e}", exc_info=True)
-            return Response({'error': 'Failed to delete site setting.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to delete site setting.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='bulk-create')
     def bulk_create(self, request):
+        user = self.request.user
+        if user.location:
+            return Response({'error': 'Only Super Admin can bulk create setting keys.'}, status=http_status.HTTP_403_FORBIDDEN)
+            
         try:
             serializer = SiteSettingSerializer(data=request.data, many=True)
             serializer.is_valid(raise_exception=True)
-            serializer.save(created_by=request.user)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            # Ensure all are global
+            serializer.save(created_by=user, location=None)
+            return Response(serializer.data, status=http_status.HTTP_201_CREATED)
         except ValidationError as ve:
-            return Response({'error': ve.message_dict}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': ve.message_dict}, status=http_status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             logger.error(f"Error during bulk create: {e}", exc_info=True)
-            return Response({'error': 'Failed to create site settings.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to create site settings.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['patch'], url_path='bulk-update')
     def bulk_update(self, request):
+        user = self.request.user
         data = request.data
         if not isinstance(data, list):
-            return Response({'detail': 'Expected a list of objects.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Expected a list of objects.'}, status=http_status.HTTP_400_BAD_REQUEST)
 
         updated_items = []
         try:
@@ -643,16 +768,25 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
                     instance = SiteSetting.objects.get(id=item.get('id'))
                 except SiteSetting.DoesNotExist:
                     continue
+                
+                # Permission Check
+                if user.location and instance.location_id != user.location_id:
+                    continue # Skip settings that don't belong to the user
+                
+                # Prevent key change
+                if 'key' in item and item['key'] != instance.key:
+                    return Response({'error': f"Editing the 'key' name for '{instance.key}' is not allowed."}, 
+                                   status=http_status.HTTP_400_BAD_REQUEST)
 
                 serializer = SiteSettingSerializer(instance, data=item, partial=True)
                 serializer.is_valid(raise_exception=True)
-                serializer.save(modified_by=request.user)
+                serializer.save(modified_by=user)
                 updated_items.append(serializer.data)
 
-            return Response(updated_items, status=status.HTTP_200_OK)
+            return Response(updated_items, status=http_status.HTTP_200_OK)
         except Exception as e:
             logger.error(f"Error during bulk update: {e}", exc_info=True)
-            return Response({'error': 'Failed to update site settings.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to update site settings.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=False, methods=['post'], url_path='bulk-delete')
     def bulk_delete(self, request):
