@@ -29,31 +29,40 @@ class LiveTrackingViewSet(viewsets.ViewSet):
                 return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
 
             role = getattr(user, 'role', None)
-            user_location = getattr(user, 'location', None)
-            user_location_id = user_location.id if user_location else None
+            user_location_id = getattr(user, 'location_id', None)
+            
+            # Get location_id from query params
+            param_location_id = request.query_params.get('location_id')
 
-            # Build queryset based on role
-            if role == 'superadmin' or (hasattr(user, 'is_superuser') and user.is_superuser):
-                # Superadmin sees all guards
-                queryset = UserLiveLocation.objects.filter(
-                    user__role='guard',
-                    user__is_active=True,
-                    user__is_deleted=False,
-                    latitude__isnull=False,
-                    longitude__isnull=False
-                ).select_related('user', 'location')
-            elif role in ['admin', 'so', 'fo'] and user_location_id:
-                # Admin/SO/FO see guards from their location
-                queryset = UserLiveLocation.objects.filter(
-                    user__role='guard',
-                    user__is_active=True,
-                    user__is_deleted=False,
-                    location_id=user_location_id,
-                    latitude__isnull=False,
-                    longitude__isnull=False
-                ).select_related('user', 'location')
+            logger.info(f"[LKL] User: {user.email}, Role: {role}, UserLoc: {user_location_id}, ParamLoc: {param_location_id}")
+
+            # Initial base queryset
+            queryset = UserLiveLocation.objects.filter(
+                user__role='guard',
+                user__is_active=True,
+                user__is_deleted=False,
+                latitude__isnull=False,
+                longitude__isnull=False
+            ).select_related('user', 'location')
+
+            # Build queryset based on role and parameters
+            is_super = role in ['superadmin', 'super_admin'] or user.is_superuser
+            
+            if is_super:
+                # Superadmin sees all guards by default, or filtered by param
+                if param_location_id and param_location_id != 'All':
+                    queryset = queryset.filter(location_id=param_location_id)
+                logger.info(f"[LKL] Superadmin access. Queryset count: {queryset.count()}")
+            elif role in ['admin', 'so', 'fo']:
+                # Admin/SO/FO strictly see guards from their assigned location
+                if user_location_id:
+                    queryset = queryset.filter(location_id=user_location_id)
+                    logger.info(f"[LKL] Filtered by location_id: {user_location_id}. Count: {queryset.count()}")
+                else:
+                    logger.warning(f"[LKL] Admin {user.email} has no location assigned.")
+                    queryset = queryset.none()
             else:
-                # No access or invalid role
+                logger.warning(f"[LKL] Access denied for role: {role}")
                 return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
 
             # Convert to response format matching WebSocket payload

@@ -5,6 +5,9 @@ from django.utils.timezone import now
 from .models import UserLiveLocation, UserLocationHistory
 from patrol_backend.utils.timezone_utils import to_user_timezone
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LocationConsumer(AsyncWebsocketConsumer):
     # =========================================================================
@@ -24,21 +27,27 @@ class LocationConsumer(AsyncWebsocketConsumer):
         # Identify User Context
         role = getattr(self.user, 'role', None)
         location_id = getattr(self.user, 'location_id', None)
+        
+        # Check if is superuser or has superadmin role
+        is_super = role in ['superadmin', 'super_admin'] or getattr(self.user, 'is_superuser', False)
 
         # 1. Superadmins join a global group to see everything
-        if role == 'superadmin':
+        if is_super:
             await self.channel_layer.group_add("all_locations", self.channel_name)
+            logger.info(f"[WS_CONN] Superadmin {self.user.email} joined 'all_locations'")
         
         # 2. Admins, SOs, and FOs join their specific location group
         elif role in ['admin', 'so', 'fo']:
             if location_id:
-                self.loc_group = f"location_{location_id}"
-                await self.channel_layer.group_add(self.loc_group, self.channel_name)
+                loc_group = f"location_{location_id}"
+                await self.channel_layer.group_add(loc_group, self.channel_name)
+                logger.info(f"[WS_CONN] User:{self.user.email} Role:{role} joined '{loc_group}'")
+            else:
+                logger.warning(f"[WS_CONN] User:{self.user.email} Role:{role} has NO location_id. No group joined.")
         
-        # 3. Guards join their location group (used for sending updates to their admins)
+        # 3. Guards don't need to join listening groups for updates
         elif role == 'guard':
-            if location_id:
-                self.loc_group = f"location_{location_id}"
+            logger.info(f"[WS_CONN] Guard {self.user.email} connected (Loc:{location_id})")
         
         await self.accept()
 
@@ -49,8 +58,9 @@ class LocationConsumer(AsyncWebsocketConsumer):
         """
         if not self.user.is_anonymous:
             role = getattr(self.user, 'role', None)
+            is_super = role in ['superadmin', 'super_admin'] or getattr(self.user, 'is_superuser', False)
             
-            if role == 'superadmin':
+            if is_super:
                 await self.channel_layer.group_discard("all_locations", self.channel_name)
             
             elif role in ['admin', 'so', 'fo']:
@@ -133,12 +143,18 @@ class LocationConsumer(AsyncWebsocketConsumer):
         """
         Sends a message to both the global superadmin pool and the local admin pool.
         """
+        # Always send to all_locations (superadmins)
         await self.channel_layer.group_send("all_locations", payload)
 
+        # Send to specific location group (admins of that location)
         location_id = getattr(self.user, 'location_id', None)
         if location_id:
             loc_group = f"location_{location_id}"
             await self.channel_layer.group_send(loc_group, payload)
+            # logger.info(f"[WS_BC] From {self.user.email} to '{loc_group}'")
+        else:
+            # logger.info(f"[WS_BC] From {self.user.email} to 'all_locations' ONLY")
+            pass
 
     # =========================================================================
     # OUTGOING EVENT HANDLERS (Sending to Client)

@@ -362,6 +362,11 @@ LOGGING = {
             'level': 'INFO',
             'propagate': False,
         },
+        'livetracking': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': False,
+        },
     },
 }
 
