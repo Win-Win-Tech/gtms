@@ -145,7 +145,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     # ===== V2 APIs (enhanced with overnight shift + auto-assignment support) =====
 
     def get_today_assignment_v2(self, user, request=None):
-        """V2: Enhanced assignment lookup with overnight shift support"""
+        """V2: Enhanced assignment lookup with overnight shift support.
+           Returns a tuple: (assignment, logical_start_date)
+        """
         if request:
             user_tz = get_user_timezone_from_request(request)
         else:
@@ -173,22 +175,42 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             
             # Check if this is yesterday's overnight shift still active today
             if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    return assignment  # Still active from yesterday
+                # Add 30 min grace period for late checkout
+                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=30)
+                if user_now <= shift_end_dt:
+                    return assignment, yesterday  # Still active from yesterday
             
             # Check if this is today's shift (regular or overnight starting today)
             if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+                # Add 30 min early checkin grace period
+                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz) - timedelta(minutes=30)
+                
                 if is_overnight:
-                    if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                        return assignment
+                    # For overnight shifts, calculate logical start and end boundaries including grace periods
+                    actual_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+                    actual_end_dt = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
+                    
+                    window_start = actual_start_dt - timedelta(minutes=30)
+                    window_end = actual_end_dt + timedelta(minutes=30)
+                    
+                    # Also check if it's past midnight and we are in yesterday's shift window
+                    yesterday_start_dt = combine_date_time_in_user_tz(yesterday, shift.start_time, user_tz)
+                    yesterday_end_dt = combine_date_time_in_user_tz(yesterday + timedelta(days=1), shift.end_time, user_tz)
+                    
+                    yesterday_window_start = yesterday_start_dt - timedelta(minutes=30)
+                    yesterday_window_end = yesterday_end_dt + timedelta(minutes=30)
+
+                    if yesterday_window_start <= user_now <= yesterday_window_end:
+                        return assignment, yesterday
+                    elif window_start <= user_now <= window_end:
+                         return assignment, today
                 else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
+                    # Regular shift boundaries
+                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=30)
                     if shift_start_dt <= user_now <= shift_end_dt:
-                        return assignment
+                        return assignment, today
         
-        return None
+        return None, None
 
     def find_and_create_default_assignment(self, user, checkin_time_user, user_tz, location_lat, location_lon):
         """
@@ -600,11 +622,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Use shift_start_date (could be yesterday for overnight) for UTC conversion
         start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
         
-        # Check attendance in expanded date range (yesterday + today + tomorrow for overnight)
+        # Expanded search window to encompass the full shift, same logic as checkin_v2/checkout_v2
+        search_start_utc = start_utc - timedelta(days=1)
+        search_end_utc = end_utc + timedelta(days=2)
+
         attendance = AttendanceCheckin.objects.filter(
             guard=user, shift=shift, assignment=assignment,
-            checkin_time__gte=start_utc - timedelta(days=1),  # Include yesterday
-            checkin_time__lt=end_utc + timedelta(days=2)  # Include tomorrow
+            checkin_time__gte=search_start_utc,
+            checkin_time__lt=search_end_utc
         ).first()
 
         show_checkin = False
@@ -656,16 +681,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 if user_now <= shift_end_dt_user:
                     # Check if user has checked in again after checkout
                     # Use expanded date range for query
-                    start_utc_expanded = start_utc - timedelta(days=1)
-                    end_utc_expanded = end_utc + timedelta(days=2)
                     latest_checkin = CheckInLog.objects.filter(
                         guard=user,
                         assignment=assignment,
                         shift=shift,
                         org_location=location,
                         type="checkin",
-                        timestamp__gte=start_utc_expanded,
-                        timestamp__lt=end_utc_expanded,
+                        timestamp__gte=search_start_utc,
+                        timestamp__lt=search_end_utc,
                         timestamp__gt=attendance.checkout_time
                     ).order_by("-timestamp").first()
 
@@ -826,16 +849,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         user = request.user
         user_tz = get_user_timezone_from_request(request)
         user_now = get_user_now(user_tz)
-        assignment = self.get_today_assignment_v2(user, request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
 
         # If no assignment, try to create one from default shift
         if not assignment:
-            lat = float(request.data.get("latitude", 0))
-            lon = float(request.data.get("longitude", 0))
-            assignment = self.find_and_create_default_assignment(user, user_now, user_tz, lat, lon)
+            # lat = float(request.data.get("latitude", 0))
+            # lon = float(request.data.get("longitude", 0))
+            # assignment = self.find_and_create_default_assignment(user, user_now, user_tz, lat, lon)
             
-            if not assignment:
-                return Response({"message": "No shifts today and no default shift found"}, status=status.HTTP_400_BAD_REQUEST)
+            # if not assignment:
+            #     return Response({"message": "No shifts today and no default shift found"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
 
         shift = assignment.shift
         org_location = assignment.location
@@ -849,12 +873,13 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             if distance > 100:
                 return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Get expanded date range (yesterday + today + tomorrow for overnight shifts)
-        user_today = get_user_today(user_tz)
-        yesterday = user_today - timedelta(days=1)
-        start_utc, _ = convert_date_range_to_utc(yesterday, yesterday, user_tz)
-        _, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        end_utc = end_utc + timedelta(days=2)
+        # Use shift_start_date (could be yesterday for overnight) for precise UTC conversion
+        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
+        
+        # Expanded search window to encompass the full shift, same logic as shift_today_v2
+        # Includes yesterday, today, and tomorrow surrounding the shift's logical start date
+        search_start_utc = start_utc - timedelta(days=1)
+        search_end_utc = end_utc + timedelta(days=2)
 
         CheckInLog.objects.create(
             guard=user,
@@ -879,8 +904,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__gte=start_utc,
-            created_on__lt=end_utc
+            created_on__gte=search_start_utc,
+            created_on__lt=search_end_utc
         )
         if attendance_list.exists():
             attendance = attendance_list.first()
@@ -891,8 +916,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             shift=shift,
             org_location=org_location,
             type="checkin",
-            timestamp__gte=start_utc,
-            timestamp__lt=end_utc
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
         ).order_by("timestamp").first()
 
         if earliest_checkin:
@@ -908,7 +933,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         """V2: Enhanced checkout with overnight shift support"""
         user = request.user
         user_tz = get_user_timezone_from_request(request)
-        assignment = self.get_today_assignment_v2(user, request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
 
         if not assignment:
             return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
@@ -918,19 +943,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
-        user_today = get_user_today(user_tz)
-        yesterday = user_today - timedelta(days=1)
-        start_utc, _ = convert_date_range_to_utc(yesterday, yesterday, user_tz)
-        _, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        end_utc = end_utc + timedelta(days=2)
+        # Use shift_start_date (could be yesterday for overnight) for precise UTC conversion
+        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
+        
+        # Expanded search window to encompass the full shift, same logic as shift_today_v2
+        search_start_utc = start_utc - timedelta(days=1)
+        search_end_utc = end_utc + timedelta(days=2)
 
         attendance = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__gte=start_utc,
-            created_on__lt=end_utc
+            created_on__gte=search_start_utc,
+            created_on__lt=search_end_utc
         ).first()
 
         if not attendance or not attendance.checkin_time:
@@ -952,8 +978,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             shift=shift,
             org_location=org_location,
             type="checkout",
-            timestamp__gte=start_utc,
-            timestamp__lt=end_utc
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
         ).order_by("-timestamp").first()
 
         if latest_checkout:
