@@ -622,9 +622,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Use shift_start_date (could be yesterday for overnight) for UTC conversion
         start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
         
-        # Expanded search window to encompass the full shift, same logic as checkin_v2/checkout_v2
-        search_start_utc = start_utc - timedelta(days=1)
-        search_end_utc = end_utc + timedelta(days=2)
+        # Exact logical boundary search window (D 00:00:00 to D+1 23:59:59)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
 
         attendance = AttendanceCheckin.objects.filter(
             guard=user, shift=shift, assignment=assignment,
@@ -876,10 +876,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Use shift_start_date (could be yesterday for overnight) for precise UTC conversion
         start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
         
-        # Expanded search window to encompass the full shift, same logic as shift_today_v2
-        # Includes yesterday, today, and tomorrow surrounding the shift's logical start date
-        search_start_utc = start_utc - timedelta(days=1)
-        search_end_utc = end_utc + timedelta(days=2)
+        # Exact logical boundary search window (D 00:00:00 to D+1 23:59:59)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
 
         CheckInLog.objects.create(
             guard=user,
@@ -946,9 +945,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Use shift_start_date (could be yesterday for overnight) for precise UTC conversion
         start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
         
-        # Expanded search window to encompass the full shift, same logic as shift_today_v2
-        search_start_utc = start_utc - timedelta(days=1)
-        search_end_utc = end_utc + timedelta(days=2)
+        # Exact logical boundary search window (D 00:00:00 to D+1 23:59:59)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
 
         attendance = AttendanceCheckin.objects.filter(
             guard=user,
@@ -1183,13 +1182,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 checkpoints = template.checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
         
         # Determine assignment date range
+        # Even for overnight shifts, the assignment is conceptually bound to a single logical day.
+        # The get_today_assignment_v2 API will still fetch it correctly tomorrow morning
+        # because it specifically queries `end_date__gte=yesterday`.
         start_date = today
-        if shift.end_time <= shift.start_time:
-            # Overnight shift - end date is next day
-            end_date = today + timedelta(days=1)
-        else:
-            # Regular shift - same day
-            end_date = today
+        end_date = today
         
         # Create assignment
         assignment = Assignment.objects.create(
