@@ -551,52 +551,27 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         today = user_now.date()
         yesterday = today - timedelta(days=1)
 
-        assignments = Assignment.objects.filter(
-            guard_id=user_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location').order_by('-start_date', '-created_on')
-        assignment = None
-        shift_start_date = today
-        
-        # 1) Prefer the assignment that is active right now.
-        for assgn in assignments:
-            shift = assgn.shift
-            if not shift:
-                continue
-                
-            is_overnight = shift.end_time <= shift.start_time
+        # 1) Try to find currently active shift via the exact same v2 helper used by checkin/checkout
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
 
-            if is_overnight:
-                # If it's after midnight and before shift end, active shift instance started yesterday.
-                logical_start_date = yesterday if user_now.time() < shift.end_time else today
-                if not (assgn.start_date <= logical_start_date <= assgn.end_date):
-                    continue
-                if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                    assignment = assgn
-                    shift_start_date = logical_start_date
-                    break
-            else:
-                if not (assgn.start_date <= today <= assgn.end_date):
-                    continue
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if shift_start_dt <= user_now <= shift_end_dt:
-                    assignment = assgn
-                    shift_start_date = today
-                    break
-
-        # 2) If nothing is active, still return today's scheduled shift (pre-shift behavior).
+        # 2) If nothing is currently "active" inside the grace period, find the closest upcoming scheduled shift for TODAY
         if not assignment:
+            today = get_user_today(user_tz)
+            user_now = get_user_now(user_tz)
+            assignments = Assignment.objects.filter(
+                guard_id=user.id,
+                start_date__lte=today,
+                end_date__gte=today
+            ).select_related('shift', 'location')
+
             best_scheduled = None
             best_distance = None
             for assgn in assignments:
                 shift = assgn.shift
                 if not shift:
                     continue
-                if not (assgn.start_date <= today <= assgn.end_date):
-                    continue
-
+                
+                # Check distance to start time
                 shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
                 distance_seconds = abs((shift_start_dt - user_now).total_seconds())
 
@@ -611,7 +586,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if not assignment:
             return Response({
                 "has_shift": False,
-                "show_checkin": True,
+                "show_checkin": False,
                 "show_checkout": False,
                 "message": "No shifts today"
             }, status=status.HTTP_200_OK)
@@ -669,7 +644,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             if attendance.checkin_time and not attendance.checkout_time:
                 # Convert stored UTC time to user timezone for comparison
                 checkin_time_user = to_user_timezone(attendance.checkin_time, user_tz)
-                if user_now <= shift_end_dt_user:
+                if user_now <= latest_checkout:
                     # Scenario 2: Checked in, not yet checked out
                     show_checkout = True
                     message = "You are checked in, checkout when done"
@@ -678,7 +653,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     message = "Shift ended"
             elif attendance.checkin_time and attendance.checkout_time:
                 checkout_time_user = to_user_timezone(attendance.checkout_time, user_tz)
-                if user_now <= shift_end_dt_user:
+                if user_now <= latest_checkout:
                     # Check if user has checked in again after checkout
                     # Use expanded date range for query
                     latest_checkin = CheckInLog.objects.filter(
