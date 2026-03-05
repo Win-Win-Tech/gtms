@@ -174,14 +174,19 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             is_overnight = shift.end_time <= shift.start_time
             
             # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
+            # Only valid if assignment actually includes yesterday.
+            if (
+                is_overnight
+                and assignment.start_date <= yesterday <= assignment.end_date
+            ):
                 # Add 30 min grace period for late checkout
                 shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=30)
                 if user_now <= shift_end_dt:
                     return assignment, yesterday  # Still active from yesterday
             
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
+            # Check if this is today's shift (regular or overnight starting today).
+            # Do not evaluate today's time window unless assignment includes today.
+            if assignment.start_date <= today <= assignment.end_date:
                 # Add 30 min early checkin grace period
                 shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz) - timedelta(minutes=30)
                 
@@ -200,7 +205,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     yesterday_window_start = yesterday_start_dt - timedelta(minutes=30)
                     yesterday_window_end = yesterday_end_dt + timedelta(minutes=30)
 
-                    if yesterday_window_start <= user_now <= yesterday_window_end:
+                    if (
+                        assignment.start_date <= yesterday <= assignment.end_date
+                        and yesterday_window_start <= user_now <= yesterday_window_end
+                    ):
                         return assignment, yesterday
                     elif window_start <= user_now <= window_end:
                          return assignment, today
