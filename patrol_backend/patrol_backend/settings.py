@@ -220,8 +220,10 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 # Twilio credentials
-TWILIO_SID = 'AC2f6c622ec954be8536e4b4ae1a913e90'
-TWILIO_AUTH_TOKEN = '8c0b864a3d79371cbbdb9571c4c8964b'
+# TWILIO_SID = 'AC2f6c622ec954be8536e4b4ae1a913e90'
+TWILIO_SID = 'ACf6536d328a204ec62b62648f58e17263'
+TWILIO_AUTH_TOKEN = 'd06e6cbf817377658ad96c672d3e5c68'
+# TWILIO_AUTH_TOKEN = '8c0b864a3d79371cbbdb9571c4c8964b'
 
 # Twilio phone numbers
 TWILIO_PHONE = '+12543453221'  # Twilio voice-enabled number
