@@ -1082,10 +1082,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         """
         Create assignment for guard with specified shift.
         Only creates if guard has no shift for today.
-        Body: guard_id, shift_id
+        Body: guard_id, shift_id, checkpoint_template_id (optional)
         """
         guard_id = request.data.get("guard_id")
         shift_id = request.data.get("shift_id")
+        checkpoint_template_id = request.data.get("checkpoint_template_id")
         
         if not guard_id or not shift_id:
             return Response(
@@ -1157,12 +1158,37 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get checkpoints from shift's checkpoint_template
+        # Get checkpoints from selected checkpoint template (if provided).
+        # Fallback to shift's prelinked checkpoint_template.
         checkpoints = []
-        if shift.checkpoint_template:
-            template = shift.checkpoint_template
-            if template.checkpoints:
-                checkpoints = template.checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
+        selected_template = None
+        if checkpoint_template_id:
+            try:
+                selected_template = CheckpointTemplate.objects.get(
+                    id=checkpoint_template_id,
+                    is_deleted=False
+                )
+            except CheckpointTemplate.DoesNotExist:
+                return Response(
+                    {"error": "Checkpoint template not found"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            if selected_template.location_id != shift.location_id:
+                return Response(
+                    {"error": "Checkpoint template location does not match shift location"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            if selected_template.shift_id != shift.id:
+                return Response(
+                    {"error": "Checkpoint template shift does not match selected shift"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        template_to_use = selected_template or shift.checkpoint_template
+        if template_to_use and template_to_use.checkpoints:
+            checkpoints = template_to_use.checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
         
         # Determine assignment date range
         # Even for overnight shifts, the assignment is conceptually bound to a single logical day.
@@ -1188,13 +1214,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "guard_name": guard.name if hasattr(guard, 'name') else guard.username,
             "shift_id": str(shift.id),
             "shift_name": shift.name,
+            "checkpoint_template_id": str(template_to_use.id) if template_to_use else None,
+            "checkpoint_template_name": template_to_use.template_name if template_to_use else None,
             "location_id": str(shift.location.id) if shift.location else None,
             "location_name": shift.location.name if shift.location else None,
             "start_date": str(start_date),
             "end_date": str(end_date),
             "checkpoints_count": len(checkpoints)
         }, status=status.HTTP_201_CREATED)
-
 
     # ----------------------
     # DASHBOARD (with date range filter)
