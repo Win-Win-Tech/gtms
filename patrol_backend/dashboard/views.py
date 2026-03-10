@@ -993,49 +993,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Check if guard has shift for today
-        user_tz = get_user_timezone_from_request(request)
-        today = get_user_today(user_tz)
-        yesterday = today - timedelta(days=1)
-        user_now = get_user_now(user_tz)
-        
-        # Check assignments that overlap with today OR yesterday (for overnight shifts)
-        assignments = Assignment.objects.filter(
-            guard_id=guard_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location')
-        
-        # Check if guard has active shift today
-        has_shift_today = False
-        for assignment in assignments:
-            shift = assignment.shift
-            if not shift:
-                continue
-                
-            is_overnight = shift.end_time <= shift.start_time
-            
-            # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    has_shift_today = True
-                    break
-            
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                if is_overnight:
-                    if user_now.time() >= shift.start_time or user_now.time() < shift.end_time:
-                        has_shift_today = True
-                        break
-                else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-                    if shift_start_dt <= user_now <= shift_end_dt:
-                        has_shift_today = True
-                        break
-        
-        if has_shift_today:
+        # Use same helper as shift_today_v2/checkin_v2/checkout_v2 for consistency.
+        active_assignment, _ = self.get_today_assignment_v2(guard, request)
+        if active_assignment:
             return Response(
                 {"message": "Guard already has a shift for today", "has_shift": True},
                 status=status.HTTP_200_OK
@@ -1110,49 +1070,12 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Check if guard has shift for today
         user_tz = get_user_timezone_from_request(request)
         today = get_user_today(user_tz)
-        yesterday = today - timedelta(days=1)
-        user_now = get_user_now(user_tz)
-        
-        # Check assignments that overlap with today OR yesterday (for overnight shifts)
-        assignments = Assignment.objects.filter(
-            guard_id=guard_id,
-            start_date__lte=today,
-            end_date__gte=yesterday
-        ).select_related('shift', 'location')
-        
-        # Check if guard has active shift today
-        has_shift_today = False
-        for assignment in assignments:
-            assignment_shift = assignment.shift
-            if not assignment_shift:
-                continue
-                
-            is_overnight = assignment_shift.end_time <= assignment_shift.start_time
-            
-            # Check if this is yesterday's overnight shift still active today
-            if assignment.start_date <= yesterday and is_overnight:
-                shift_end_dt = combine_date_time_in_user_tz(today, assignment_shift.end_time, user_tz)
-                if user_now < shift_end_dt:
-                    has_shift_today = True
-                    break
-            
-            # Check if this is today's shift (regular or overnight starting today)
-            if assignment.start_date <= today:
-                shift_start_dt = combine_date_time_in_user_tz(today, assignment_shift.start_time, user_tz)
-                if is_overnight:
-                    if user_now.time() >= assignment_shift.start_time or user_now.time() < assignment_shift.end_time:
-                        has_shift_today = True
-                        break
-                else:
-                    shift_end_dt = combine_date_time_in_user_tz(today, assignment_shift.end_time, user_tz)
-                    if shift_start_dt <= user_now <= shift_end_dt:
-                        has_shift_today = True
-                        break
-        
-        if has_shift_today:
+
+        # Use same helper as shift_today_v2/checkin_v2/checkout_v2 for consistency.
+        active_assignment, _ = self.get_today_assignment_v2(guard, request)
+        if active_assignment:
             return Response(
                 {"error": "Guard already has a shift for today", "has_shift": True},
                 status=status.HTTP_400_BAD_REQUEST
