@@ -93,7 +93,8 @@ class LoginView(APIView):
             user = authenticate(request, email=email, password=password)
             if user:
                 refresh = RefreshToken.for_user(user)
-                
+                # From location: False = use other check-in flow (no QR). No location = False so app doesn't assume QR.
+                is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
                 return Response(api_response("success", "Login successful", {
                     'access': str(refresh.access_token),
                     'refresh': str(refresh),
@@ -102,7 +103,8 @@ class LoginView(APIView):
                     'role': user.role,
                     'is_superuser': user.is_superuser,
                     'location_id': str(user.location.id) if user.location else None,
-                    'timezone': user.timezone
+                    'timezone': user.timezone,
+                    'is_qr_scan_enabled': is_qr_scan_enabled
                 }, status.HTTP_200_OK))
             return Response(api_response("error", "Invalid credentials", None, status.HTTP_401_UNAUTHORIZED))
         except Exception as e:

@@ -45,6 +45,7 @@ class Location(models.Model):
         )
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
+    is_qr_scan_enable = models.BooleanField(default=True)
 
     # Managers
     objects = ActiveManager()        # default: only active
