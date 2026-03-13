@@ -471,3 +471,103 @@ class CheckpointTemplate(models.Model):
 
     def __str__(self):
         return self.template_name
+
+
+class ChecklistItem(models.Model):
+    """
+    Master checklist items (e.g. 'Close gate', 'Switch off lights').
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey('Location', on_delete=models.CASCADE, related_name='checklist_items')
+    label = models.CharField(max_length=255)
+
+    # Audit fields
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklistitem_created"
+    )
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklistitem_modified"
+    )
+
+    # Soft delete
+    is_deleted = models.BooleanField(default=False)
+    deleted_on = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklistitem_deleted"
+    )
+
+    def delete(self, user=None, using=None, keep_parents=False):
+        self.is_deleted = True
+        self.deleted_on = timezone.now()
+        if user:
+            self.deleted_by = user
+        self.save()
+
+    def __str__(self):
+        return self.label
+
+
+class ChecklistTemplate(models.Model):
+    """
+    Checklist templates (groups of checklist items) per location/shift.
+    Stores item list as JSON referencing ChecklistItem IDs.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey('Location', on_delete=models.CASCADE, related_name='checklist_templates')
+    name = models.CharField(max_length=255)
+
+    # Example: [{"checklist_item_id": "uuid", "sort_order": 1}]
+    checklist_items = models.JSONField(default=list)
+
+    # Audit fields
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklisttemplate_master_created"
+    )
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklisttemplate_master_modified"
+    )
+
+    # Soft delete
+    is_deleted = models.BooleanField(default=False)
+    deleted_on = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checklisttemplate_master_deleted"
+    )
+
+    def delete(self, user=None, using=None, keep_parents=False):
+        self.is_deleted = True
+        self.deleted_on = timezone.now()
+        if user:
+            self.deleted_by = user
+        self.save()
+
+    def __str__(self):
+        return self.name

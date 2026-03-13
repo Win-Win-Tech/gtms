@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Location, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate
+from .models import Location, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate, ChecklistItem, ChecklistTemplate
 from django.utils.timezone import now
 from uuid import UUID
 
@@ -63,10 +63,15 @@ class AssignmentSerializer(serializers.ModelSerializer):
             )
 
         result = []
-        
         for cp in obj.checkpoints:
             checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
-            result.append({
+            checklist_template_id = cp.get('checklist_template_id')
+            checklist_template_name = None
+            if checklist_template_id:
+                ct = ChecklistTemplate.objects.filter(id=checklist_template_id, is_deleted=False).first()
+                if ct:
+                    checklist_template_name = ct.name
+            item = {
                 'checkpoint_id': cp['checkpoint_id'],
                 'label': checkpoint_obj.label if checkpoint_obj else '',
                 'time': cp['time'],
@@ -74,7 +79,12 @@ class AssignmentSerializer(serializers.ModelSerializer):
                 'lon': checkpoint_obj.longitude if checkpoint_obj else None,
                 'qr': checkpoint_obj.data if checkpoint_obj else None,
                 'status': 'completed' if UUID(cp['checkpoint_id']) in completed_ids else 'pending'
-            })
+            }
+            if checklist_template_id:
+                item['checklist_template_id'] = str(checklist_template_id)
+            if checklist_template_name:
+                item['checklist_template_name'] = checklist_template_name
+            result.append(item)
         return result
         
 
@@ -139,11 +149,21 @@ class SiteSettingSerializer(serializers.ModelSerializer):
         fields = '__all__'        
 
 
-from rest_framework import serializers
-from .models import CheckpointTemplate
-
 class CheckpointTemplateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CheckpointTemplate
+        fields = '__all__'
+        read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_on', 'deleted_by', 'is_deleted']
+
+
+class ChecklistItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChecklistItem
+        fields = '__all__'
+
+
+class ChecklistTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChecklistTemplate
         fields = '__all__'
         read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_on', 'deleted_by', 'is_deleted']

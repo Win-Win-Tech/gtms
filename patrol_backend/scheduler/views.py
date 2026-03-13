@@ -798,8 +798,8 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
 from rest_framework import viewsets, permissions
 from rest_framework.response import Response
 from rest_framework import status
-from .models import CheckpointTemplate
-from .serializers import CheckpointTemplateSerializer
+from .models import CheckpointTemplate, ChecklistItem, ChecklistTemplate
+from .serializers import CheckpointTemplateSerializer, ChecklistItemSerializer, ChecklistTemplateSerializer
 
 class CheckpointTemplateViewSet(viewsets.ModelViewSet):
 
@@ -859,9 +859,18 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
             for item in template.checkpoints:
                 checkpoint_id = item.get("checkpoint_id")
                 time = item.get("time")
+                checklist_template_id = item.get("checklist_template_id")
+
                 checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+                checklist_template = None
+                if checklist_template_id:
+                    checklist_template = ChecklistTemplate.objects.filter(
+                        id=checklist_template_id,
+                        is_deleted=False
+                    ).first()
+
                 if checkpoint:
-                    enriched_checkpoints.append({
+                    enriched = {
                         "time": time,
                         "checkpoint": {
                             "id": str(checkpoint.id),
@@ -871,8 +880,13 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
                             "latitude": checkpoint.latitude,
                             "longitude": checkpoint.longitude,
                             "location_id": checkpoint.location_id,
-                        }
-                    })
+                        },
+                    }
+                    if checklist_template:
+                        enriched["checklist_template_id"] = str(checklist_template.id)
+                        enriched["checklist_template_name"] = checklist_template.name
+                    enriched_checkpoints.append(enriched)
+
             result.append({
                 "template_id": str(template.id),
                 "template_name": template.template_name,
@@ -890,9 +904,18 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
         for item in template.checkpoints:
             checkpoint_id = item.get("checkpoint_id")
             time = item.get("time")
+            checklist_template_id = item.get("checklist_template_id")
+
             checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+            checklist_template = None
+            if checklist_template_id:
+                checklist_template = ChecklistTemplate.objects.filter(
+                    id=checklist_template_id,
+                    is_deleted=False
+                ).first()
+
             if checkpoint:
-                enriched_checkpoints.append({
+                enriched = {
                     "time": time,
                     "checkpoint": {
                         "id": str(checkpoint.id),
@@ -902,8 +925,13 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
                         "latitude": checkpoint.latitude,
                         "longitude": checkpoint.longitude,
                         "location_id": checkpoint.location_id,
-                    }
-                })
+                    },
+                }
+                if checklist_template:
+                    enriched["checklist_template_id"] = str(checklist_template.id)
+                    enriched["checklist_template_name"] = checklist_template.name
+                enriched_checkpoints.append(enriched)
+
         return {
             "template_id": str(template.id),
             "template_name": template.template_name,
@@ -911,6 +939,102 @@ class CheckpointTemplateViewSet(viewsets.ModelViewSet):
             "location_id": str(template.location_id),
             "checkpoints": enriched_checkpoints
         }
+
+    def perform_update(self, serializer):
+        serializer.save(modified_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        instance.delete(user=self.request.user)
+
+
+class ChecklistItemViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for checklist master items.
+    """
+    serializer_class = ChecklistItemSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Location-scoped + optional search.
+        - Superadmin: can see all or filter by ?location_id=
+        - Location admins/others: restricted to their own location only.
+        """
+        user = self.request.user
+        qs = ChecklistItem.objects.filter(is_deleted=False)
+
+        # Restrict by role/location
+        user_location_id = getattr(user, 'location_id', None)
+        is_super = getattr(user, 'role', None) in ['superadmin', 'super_admin'] or user.is_superuser
+
+        param_location_id = self.request.query_params.get('location_id')
+
+        if is_super:
+            if param_location_id and param_location_id != 'All':
+                qs = qs.filter(location_id=param_location_id)
+        else:
+            # Non-super users only see their own location's items
+            if user_location_id:
+                qs = qs.filter(location_id=user_location_id)
+            else:
+                qs = qs.none()
+
+        # Simple search by label
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(label__icontains=search)
+
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(modified_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        instance.delete(user=self.request.user)
+
+
+class ChecklistTemplateViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for checklist templates (groups of items).
+    """
+    serializer_class = ChecklistTemplateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        """
+        Location-scoped + optional search.
+        - Superadmin: can see all or filter by ?location_id=
+        - Location admins/others: restricted to their own location only.
+        """
+        user = self.request.user
+        qs = ChecklistTemplate.objects.filter(is_deleted=False)
+
+        user_location_id = getattr(user, 'location_id', None)
+        is_super = getattr(user, 'role', None) in ['superadmin', 'super_admin'] or user.is_superuser
+
+        param_location_id = self.request.query_params.get('location_id')
+
+        if is_super:
+            if param_location_id and param_location_id != 'All':
+                qs = qs.filter(location_id=param_location_id)
+        else:
+            if user_location_id:
+                qs = qs.filter(location_id=user_location_id)
+            else:
+                qs = qs.none()
+
+        # Simple search by template name
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(name__icontains=search)
+
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
 
     def perform_update(self, serializer):
         serializer.save(modified_by=self.request.user)
