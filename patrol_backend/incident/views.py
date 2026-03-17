@@ -50,6 +50,7 @@ class IncidentReportView(APIView):
                 media_urls = []
                 photo_url = None
                 video_url = None
+                description_audio_url = None
 
                 if incident.photo:
                     upload_result = cloudinary.uploader.upload(incident.photo.file)
@@ -64,6 +65,17 @@ class IncidentReportView(APIView):
                     video_url = upload_result.get('secure_url')
                     media_urls.append(video_url)
 
+                # Audio description is generally uploaded under Cloudinary resource_type="video"
+                # (Cloudinary treats audio as a video resource type).
+                if getattr(incident, "description_audio", None):
+                    upload_result = cloudinary.uploader.upload(
+                        incident.description_audio.file,
+                        resource_type="video"
+                    )
+                    description_audio_url = upload_result.get('secure_url')
+                    if description_audio_url:
+                        media_urls.append(description_audio_url)
+
                 # Convert timestamp to location timezone for display
                 # Use incident's location timezone if available
                 location_id = str(incident.location.id) if incident.location else None
@@ -77,7 +89,9 @@ class IncidentReportView(APIView):
                     f"Ticket: {incident.ticket_number}\n"
                     f"Status: {incident.status}\n"
                     f"Timestamp: {created_on_user.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}"
+                    f"Photo: {os.path.basename(incident.photo.name) if incident.photo else 'N/A'}\n"
+                    f"Video: {os.path.basename(incident.video.name) if incident.video else 'N/A'}\n"
+                    f"Description Audio: {os.path.basename(incident.description_audio.name) if getattr(incident, 'description_audio', None) else 'N/A'}"
                 )
 
                 # Twilio notification is non-blocking for incident creation.
@@ -107,6 +121,16 @@ class IncidentReportView(APIView):
                             from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
                             to='whatsapp:' + settings.ADMIN_WHATSAPP,
                             media_url=[video_url]
+                        )
+
+                    # Send description-audio separately if present (Twilio/WhatsApp may support it depending on media type).
+                    # If it fails, exception handler below will log but incident remains created.
+                    if description_audio_url:
+                        client.messages.create(
+                            body=f"🎧 Incident Description Audio for Ticket {incident.ticket_number}",
+                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                            media_url=[description_audio_url]
                         )
 
                     # Trigger phone call

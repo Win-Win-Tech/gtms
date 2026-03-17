@@ -12,6 +12,7 @@ from .models import CheckIn, CheckInChecklistAnswer
 from .serializers import CheckInSerializer
 from scheduler.models import Assignment, Checkpoint, Shift, SiteSetting, ChecklistTemplate, ChecklistItem
 from django.utils.timezone import make_aware
+import pytz
 import uuid
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
@@ -546,7 +547,24 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             ), None
 
-        checkin_time_utc = now()
+        # Use scan timestamp from request if present (from scan_v2 scan_context); else use now().
+        # submit_checklist_v2 must send the timestamp returned by scan_v2 so we validate against scan time, not submit time.
+        scan_timestamp_str = data.get("timestamp")
+        if scan_timestamp_str:
+            try:
+                # Parse ISO format (e.g. from scan_context.timestamp)
+                if isinstance(scan_timestamp_str, str) and scan_timestamp_str.strip():
+                    s = scan_timestamp_str.strip().replace("Z", "+00:00")
+                    parsed = datetime.fromisoformat(s)
+                    if parsed.tzinfo is None:
+                        parsed = make_aware(parsed, pytz.UTC)
+                    checkin_time_utc = parsed
+                else:
+                    checkin_time_utc = now()
+            except (ValueError, TypeError):
+                checkin_time_utc = now()
+        else:
+            checkin_time_utc = now()
         checkin_time_user = to_user_timezone(checkin_time_utc, user_tz)
         is_overnight = shift.end_time <= shift.start_time
 
@@ -598,6 +616,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             "shift_id": shift_id,
             "assigned_id": assigned_id,
             "checkpoint_id": checkpoint_id,
+            'timestamp': checkin_time_user,
         }
         return None, ctx
 
@@ -652,7 +671,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
                     "checkpoint_id": str(ctx["checkpoint"].id),
                     "latitude": ctx["latitude"],
                     "longitude": ctx["longitude"],
-                    "timestamp": ctx["data"].get("timestamp"),
+                    "timestamp": ctx["checkin_time_utc"].isoformat(),
                     "data": ctx["data"].get("data"),
                 },
             }, status=status.HTTP_200_OK)
@@ -771,9 +790,10 @@ class CheckInViewSet(viewsets.ModelViewSet):
                     pass
             answers_with_labels.append(entry)
 
-        # Create CheckIn with has_checklist=True
+        # Create CheckIn with has_checklist=True; use validated scan time as check-in timestamp
         payload = dict(ctx["data"])
         payload["has_checklist"] = True
+        payload["timestamp"] = ctx["checkin_time_utc"]
         serializer = self.get_serializer(data=payload)
         serializer.is_valid(raise_exception=True)
         serializer.context["request"] = request
@@ -794,3 +814,39 @@ class CheckInViewSet(viewsets.ModelViewSet):
         response_data["message"] = "Checklist submitted successfully"
         response_data["success"] = True
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="checklist")
+    def checklist(self, request, pk=None):
+        """
+        Returns checklist details for a check-in (only if has_checklist=True).
+        """
+        checkin = self.get_queryset().filter(id=pk).first()
+        if not checkin:
+            return Response({"error": "CheckIn not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not checkin.has_checklist:
+            return Response({"error": "This check-in has no checklist"}, status=status.HTTP_400_BAD_REQUEST)
+
+        answer = CheckInChecklistAnswer.objects.filter(
+            checkin=checkin,
+            is_deleted=False
+        ).select_related("checklist_template").first()
+
+        if not answer:
+            return Response({"error": "Checklist answers not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        items = []
+        answers = answer.answers or []
+        # Ensure stable ordering if sort_order exists
+        try:
+            items = sorted(answers, key=lambda x: x.get("sort_order", 10**9))
+        except Exception:
+            items = answers
+
+        return Response({
+            "checkin_id": str(checkin.id),
+            "checklist_template_id": str(answer.checklist_template.id) if answer.checklist_template else None,
+            "checklist_template_name": answer.checklist_template.name if answer.checklist_template else None,
+            "remarks": answer.remarks or "",
+            "answers": items,
+        }, status=status.HTTP_200_OK)

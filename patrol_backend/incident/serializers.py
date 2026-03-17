@@ -69,6 +69,21 @@ class IncidentSerializer(serializers.ModelSerializer):
         
         return data
 
+    def validate(self, attrs):
+        """
+        Require at least one description input:
+        - incident_description (text) OR
+        - description_audio (file)
+        """
+        # Use initial_data because incident_description has default="" at model level.
+        text = (self.initial_data.get("incident_description") or "").strip()
+        audio = self.initial_data.get("description_audio") or self.initial_data.get("audio")
+        if not text and not audio:
+            raise serializers.ValidationError(
+                {"incident_description": "Provide incident_description text or description_audio file."}
+            )
+        return attrs
+
 
     # class Meta:
     #     model = incidentreport

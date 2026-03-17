@@ -39,7 +39,8 @@ from rest_framework.viewsets import ViewSet
 
 # Local app imports
 from authapp.models import User
-from checkin.models import CheckIn
+from checkin.models import CheckIn, CheckInChecklistAnswer
+from scheduler.models import ChecklistTemplate
 from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate
 from tourlog.models import TourLog
 from patrol_backend.utils.timezone_utils import (
@@ -1433,6 +1434,32 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                         else:
                             status = "Missed"
                 
+                # Checklist fields (only meaningful when a CheckIn exists)
+                checkin_id = str(checkin.id) if checkin else None
+                has_checklist = bool(checkin.has_checklist) if checkin else False
+                checklist_template_name = None
+                checklist_remarks = None
+                checklist_checked_count = None
+                checklist_total_count = None
+
+                checklist_answers = None
+                if checkin and has_checklist:
+                    answer = CheckInChecklistAnswer.objects.filter(
+                        checkin=checkin,
+                        is_deleted=False
+                    ).select_related('checklist_template').first()
+
+                    if answer:
+                        checklist_template_name = answer.checklist_template.name if answer.checklist_template else None
+                        checklist_remarks = answer.remarks
+                        checklist_answers = answer.answers or []
+                        try:
+                            checklist_total_count = len(checklist_answers)
+                            checklist_checked_count = sum(1 for a in checklist_answers if a.get("checked") is True)
+                        except Exception:
+                            checklist_total_count = None
+                            checklist_checked_count = None
+
                 # Add to report (convert times to user timezone for display)
                 expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
                 if actual_time:
@@ -1462,7 +1489,14 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     'expected_time': expected_time_display,  # In user timezone
                     'actual_checkin_time': actual_time_display,  # In user timezone
                     'status': status,
-                    'delay_minutes': delay
+                    'delay_minutes': delay,
+                    'checkin_id': checkin_id,
+                    'has_checklist': has_checklist,
+                    'checklist_template_name': checklist_template_name,
+                    'checklist_remarks': checklist_remarks,
+                    'checklist_checked_count': checklist_checked_count,
+                    'checklist_total_count': checklist_total_count,
+                    'checklist_answers': checklist_answers,
                 })
     
     # Sort report by date, then by guard_name, then by checkpoint_name, then by expected_time
@@ -1782,10 +1816,22 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
     ws = wb.active
     ws.title = "Check-In Report"
 
+    def format_checklist_cell(report_item):
+        answers = report_item.get('checklist_answers')
+        if isinstance(answers, list) and len(answers) > 0:
+            lines = []
+            for a in answers:
+                label = (a or {}).get('label') or 'Item'
+                checked = (a or {}).get('checked') is True
+                lines.append(f"{label} : {'✓' if checked else '✗'}")
+            return "\n".join(lines)
+        return report_item.get('checklist_template_name') or ""
+
     # Header row
     headers = [
         'Shift Date', 'Guard', 'Shift Name', 'Checkpoint Name',
-        'Scheduled', 'Scanned', 'Status', 'Delay (minutes)'
+        'Scheduled', 'Scanned', 'Status', 'Delay (minutes)',
+        'Has Checklist', 'Checklist', 'Checklist Remarks'
     ]
     ws.append(headers)
 
@@ -1799,9 +1845,23 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
             item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
             item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
             item['status'],
-            item['delay_minutes'] if item['delay_minutes'] is not None else ""
+            item['delay_minutes'] if item['delay_minutes'] is not None else "",
+            "Yes" if item.get('has_checklist') else "No",
+            format_checklist_cell(item),
+            item.get('checklist_remarks') or "",
         ])
         row_count += 1
+
+    # Wrap text for the Checklist column (so items show line-by-line)
+    try:
+        from openpyxl.styles import Alignment
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=10, max_col=10):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.column_dimensions['J'].width = 55
+        ws.column_dimensions['K'].width = 35
+    except Exception:
+        pass
 
     # Save to in-memory buffer
     buffer = BytesIO()
@@ -1858,10 +1918,22 @@ class DashboardCheckInReportExcelView(APIView):
             ws = wb.active
             ws.title = "Check-In Report"
 
+            def format_checklist_cell(report_item):
+                answers = report_item.get('checklist_answers')
+                if isinstance(answers, list) and len(answers) > 0:
+                    lines = []
+                    for a in answers:
+                        label = (a or {}).get('label') or 'Item'
+                        checked = (a or {}).get('checked') is True
+                        lines.append(f"{label} : {'✓' if checked else '✗'}")
+                    return "\n".join(lines)
+                return report_item.get('checklist_template_name') or ""
+
             # Header row
             headers = [
                 'Date', 'Guard', 'Shift Name', 'Checkpoint Name',
-                'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)'
+                'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)',
+                'Has Checklist', 'Checklist', 'Checklist Remarks'
             ]
             ws.append(headers)
 
@@ -1875,8 +1947,22 @@ class DashboardCheckInReportExcelView(APIView):
                     item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
                     item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
                     item['status'],
-                    item['delay_minutes'] if item['delay_minutes'] is not None else ""
+                    item['delay_minutes'] if item['delay_minutes'] is not None else "",
+                    "Yes" if item.get('has_checklist') else "No",
+                    format_checklist_cell(item),
+                    item.get('checklist_remarks') or "",
                 ])
+
+            # Wrap text for the Checklist column (so items show line-by-line)
+            try:
+                from openpyxl.styles import Alignment
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=10, max_col=10):
+                    for cell in row:
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.column_dimensions['J'].width = 55
+                ws.column_dimensions['K'].width = 35
+            except Exception:
+                pass
 
             # Save to in-memory buffer
             buffer = BytesIO()

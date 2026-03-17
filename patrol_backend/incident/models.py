@@ -36,7 +36,9 @@ class incidentreport(models.Model):
     default='Medium')
     #incident_description = models.TextField(help_text="Details about the incident")
     incident_description = models.TextField(
-    default="Incident description not provided",
+    null=True,
+    blank=True,
+    default="",
     help_text="Details about the incident")
     #closure_description = models.TextField(blank=True, null=True, help_text="Details about the resolution")
     closure_description = models.TextField(
@@ -45,6 +47,8 @@ class incidentreport(models.Model):
 
     photo = models.ImageField(upload_to=media_upload_path, null=True, blank=True)
     video = models.FileField(upload_to=media_upload_path, null=True, blank=True)
+    # Optional audio description (alternative to incident_description text)
+    description_audio = models.FileField(upload_to=media_upload_path, null=True, blank=True)
     
     # Status tracking
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Open')
