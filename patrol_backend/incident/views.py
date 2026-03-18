@@ -82,7 +82,7 @@ class IncidentReportView(APIView):
                 user_tz = get_user_timezone_from_request(request, location_id=location_id)
                 created_on_user = to_user_timezone(incident.created_on, user_tz)
 
-                whatsapp_body = (
+                whatsapp_body_full = (
                     f"🚨 Incident Alert 🚨\n"
                     f"Severity: {incident.severity}\n"
                     f"Description: {incident.incident_description}\n"
@@ -93,44 +93,73 @@ class IncidentReportView(APIView):
                     f"Video: {os.path.basename(incident.video.name) if incident.video else 'N/A'}\n"
                     f"Description Audio: {os.path.basename(incident.description_audio.name) if getattr(incident, 'description_audio', None) else 'N/A'}"
                 )
+                whatsapp_body_short = f"Ticket {incident.ticket_number} ({incident.severity})"
 
                 # Twilio notification is non-blocking for incident creation.
                 # If Twilio auth/config fails, incident is still saved and API returns 201.
                 try:
                     client = Client(settings.TWILIO_SID, settings.TWILIO_AUTH_TOKEN)
 
-                    # Send WhatsApp message with photo or text
-                    if photo_url:
+                    # WhatsApp supports only one media attachment per message.
+                    # Send order + "full details" payload depends on which media is present:
+                    # 1) If audio present: full details + audio, then short+video, short+photo
+                    # 2) If no audio but photo present: full details + photo, then short+video
+                    # 3) If only video: full details + video
+
+                    if description_audio_url:
+                        # Full details + audio
                         client.messages.create(
-                            body=whatsapp_body,
+                            body=whatsapp_body_full,
+                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                            media_url=[description_audio_url]
+                        )
+                        # Short + video
+                        if video_url:
+                            client.messages.create(
+                                body=f"🎥 Video: {whatsapp_body_short}",
+                                from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                                to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                                media_url=[video_url]
+                            )
+                        # Short + photo
+                        if photo_url:
+                            client.messages.create(
+                                body=f"🖼️ Photo: {whatsapp_body_short}",
+                                from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                                to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                                media_url=[photo_url]
+                            )
+                    elif photo_url:
+                        # Full details + photo
+                        client.messages.create(
+                            body=whatsapp_body_full,
                             from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
                             to='whatsapp:' + settings.ADMIN_WHATSAPP,
                             media_url=[photo_url]
                         )
-                    else:
+                        # Short + video
+                        if video_url:
+                            client.messages.create(
+                                body=f"🎥 Video: {whatsapp_body_short}",
+                                from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
+                                to='whatsapp:' + settings.ADMIN_WHATSAPP,
+                                media_url=[video_url]
+                            )
+                    elif video_url:
+                        # Full details + video (only)
                         client.messages.create(
-                            body=whatsapp_body,
-                            from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                            to='whatsapp:' + settings.ADMIN_WHATSAPP
-                        )
-
-                    # Send video separately if present
-                    if video_url:
-                        client.messages.create(
-                            body=f"🎥 Incident Video for Ticket {incident.ticket_number}",
+                            body=whatsapp_body_full,
                             from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
                             to='whatsapp:' + settings.ADMIN_WHATSAPP,
                             media_url=[video_url]
                         )
-
-                    # Send description-audio separately if present (Twilio/WhatsApp may support it depending on media type).
-                    # If it fails, exception handler below will log but incident remains created.
-                    if description_audio_url:
+                    else:
+                        # No media at all: full details as text
                         client.messages.create(
-                            body=f"🎧 Incident Description Audio for Ticket {incident.ticket_number}",
+                            body=whatsapp_body_full,
                             from_='whatsapp:' + settings.TWILIO_WHATSAPP_NUMBER,
-                            to='whatsapp:' + settings.ADMIN_WHATSAPP,
-                            media_url=[description_audio_url]
+                            to='whatsapp:' + settings.ADMIN_WHATSAPP
                         )
 
                     # Trigger phone call
