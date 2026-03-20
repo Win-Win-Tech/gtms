@@ -233,10 +233,11 @@ class Assignment(models.Model):
 
     def clean(self):
         """Validate that all checkpoint_ids exist and times are valid."""
-        checkpoint_ids = [item.get('checkpoint_id') for item in self.checkpoints if item.get('checkpoint_id')]
+        checkpoints = self.checkpoints or []
+        checkpoint_ids = [item.get('checkpoint_id') for item in checkpoints if item.get('checkpoint_id')]
         existing_ids = set(Checkpoint.objects.filter(id__in=checkpoint_ids).values_list('id', flat=True))
 
-        for item in self.checkpoints:
+        for item in checkpoints:
             cp_id = item.get('checkpoint_id')
             cp_time = item.get('time')
 
@@ -259,14 +260,15 @@ class Assignment(models.Model):
                     raise ValidationError(f"Checkpoint time {cp_time} is outside overnight shift hours.")
 
     def get_checkpoint_objects(self):
-        checkpoint_ids = [item['checkpoint_id'] for item in self.checkpoints if 'checkpoint_id' in item]
+        checkpoints_data = self.checkpoints or []
+        checkpoint_ids = [item['checkpoint_id'] for item in checkpoints_data if 'checkpoint_id' in item]
         checkpoints = Checkpoint.objects.in_bulk(checkpoint_ids)
         return [
             {
                 "checkpoint": checkpoints.get(item['checkpoint_id']),
                 "time": item['time']
             }
-            for item in self.checkpoints if item['checkpoint_id'] in checkpoints
+            for item in checkpoints_data if item['checkpoint_id'] in checkpoints
         ]
 
     def __str__(self):

@@ -8,6 +8,8 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from io import BytesIO
 
+from django.core.files.base import ContentFile
+
 # Third-party imports
 import pytz
 from geopy.distance import geodesic
@@ -31,7 +33,8 @@ from django.utils.timezone import (
 
 # Django REST Framework imports
 from rest_framework import generics, status, viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import action, parser_classes
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -41,7 +44,7 @@ from rest_framework.viewsets import ViewSet
 from authapp.models import User
 from checkin.models import CheckIn, CheckInChecklistAnswer
 from scheduler.models import ChecklistTemplate
-from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate
+from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate, SiteSetting
 from tourlog.models import TourLog
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
@@ -61,6 +64,24 @@ from .serializers import (
 
 # Setup logger
 logger = logging.getLogger(__name__)
+
+
+def _get_site_setting_int(key, location_id=None, default_value=None):
+    """
+    Read integer values from SiteSetting (stored as strings).
+    Returns default_value when missing/invalid.
+    """
+    try:
+        raw = SiteSetting.get_setting(
+            key=key,
+            location_id=location_id,
+            default_value=default_value,
+        )
+        if raw is None:
+            return default_value
+        return int(raw)
+    except Exception:
+        return default_value
 
 class GuardPerformanceView(APIView):
     def get(self, request):
@@ -122,6 +143,171 @@ class PatrolRouteView(APIView):
         ]
         return Response(route)
 
+
+def _attendance_v3_compute_from_logs(user, assignment, shift, org_location, search_start_utc, search_end_utc):
+    """
+    Derive last check-in/checkout and total worked minutes from CheckInLog within the v2 search window.
+    Pairs checkin→checkout in order; duplicate checkin before checkout replaces open checkin.
+    Open checkin adds provisional time up to min(now, window end).
+    """
+    logs = list(
+        CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc,
+        ).order_by("timestamp")
+    )
+
+    if not logs:
+        return {
+            "last_checkin_time": None,
+            "last_checkout_time": None,
+            "duration_minutes": None,
+        }
+
+    last_checkin_time = None
+    last_checkout_time = None
+    for log in logs:
+        if log.type == "checkin":
+            last_checkin_time = log.timestamp
+        elif log.type == "checkout":
+            last_checkout_time = log.timestamp
+
+    open_ts = None
+    total_seconds = 0.0
+    now_utc = timezone.now()
+    # search_end_utc is exclusive in queries; cap inside window
+    window_cap = search_end_utc - timedelta(microseconds=1)
+
+    for log in logs:
+        if log.type == "checkin":
+            open_ts = log.timestamp
+        elif log.type == "checkout":
+            if open_ts is not None and log.timestamp > open_ts:
+                total_seconds += (log.timestamp - open_ts).total_seconds()
+            open_ts = None
+
+    if open_ts is not None:
+        cap = min(now_utc, window_cap)
+        if cap > open_ts:
+            total_seconds += (cap - open_ts).total_seconds()
+
+    duration_minutes = int(total_seconds // 60) if total_seconds > 0 else 0
+    if last_checkin_time is None:
+        duration_minutes = None
+
+    return {
+        "last_checkin_time": last_checkin_time,
+        "last_checkout_time": last_checkout_time,
+        "duration_minutes": duration_minutes,
+    }
+
+def _attendance_v3_compute_pa_status_from_duration(duration_minutes, location_id=None):
+    """
+    Map worked duration to P/HA (A is handled by missing check-in/checkout).
+
+    Rules (your requirement):
+    - A  : duration_hours <= absent_max_hours
+    - HA : absent_max_hours < duration_hours <= half_day_max_hours
+    - P  : duration_hours > half_day_max_hours
+
+    Values are read from SiteSetting (per-location), with safe defaults:
+    - absent_max_hours default 2
+    - half_day_max_hours default 6
+    - present_min_hours default 8 (kept for future compatibility)
+    """
+    if duration_minutes is None:
+        return None
+    try:
+        hours = float(duration_minutes) / 60.0
+    except (TypeError, ValueError):
+        return None
+
+    absent_max_hours = _get_site_setting_int(
+        key="absent_max_hours",
+        location_id=location_id,
+        default_value=2,
+    )
+    half_day_max_hours = _get_site_setting_int(
+        key="half_day_max_hours",
+        location_id=location_id,
+        default_value=6,
+    )
+    _present_min_hours = _get_site_setting_int(
+        key="present_min_hours",
+        location_id=location_id,
+        default_value=8,
+    )
+
+    if hours <= absent_max_hours:
+        return "A"
+    if hours <= half_day_max_hours:
+        return "HA"
+    return "P"
+
+
+def _attendance_v3_compute_pa_status_from_summary(summary, location_id=None):
+    """
+    Only mark P/HA/A when shift has a checkout (final duration).
+    While a guard is still on shift (no checkout yet), pa_status stays null.
+    """
+    if not summary:
+        return None
+    if not summary.get("last_checkout_time"):
+        return None
+    return _attendance_v3_compute_pa_status_from_duration(summary.get("duration_minutes"), location_id=location_id)
+
+
+def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc):
+    """Persist v3 metrics on AttendanceCheckin from logs (does not clear images)."""
+    summary = _attendance_v3_compute_from_logs(
+        user, assignment, shift, org_location, search_start_utc, search_end_utc
+    )
+    attendance.last_checkin_time = summary["last_checkin_time"]
+    attendance.last_checkout_time = summary["last_checkout_time"]
+    attendance.duration_minutes = summary["duration_minutes"]
+    attendance.pa_status = _attendance_v3_compute_pa_status_from_summary(
+        summary, location_id=getattr(org_location, "id", None)
+    )
+    attendance.save()
+
+
+def _attendance_v3_response_extras(attendance, summary, user_tz, request):
+    """Build flat dict for shift_today_v3 / nested under attendance in checkin_v3 responses."""
+    req = request
+
+    def _iso(dt):
+        if not dt:
+            return None
+        return to_user_timezone(dt, user_tz).isoformat()
+
+    def _img_url(field):
+        if not field or not getattr(field, "name", None):
+            return None
+        try:
+            url = field.url
+        except Exception:
+            return None
+        if req:
+            return req.build_absolute_uri(url)
+        return url
+
+    return {
+        "last_checkin": _iso(summary.get("last_checkin_time")),
+        "last_checkout": _iso(summary.get("last_checkout_time")),
+        "duration_minutes": summary.get("duration_minutes"),
+        "pa_status": _attendance_v3_compute_pa_status_from_summary(
+            summary,
+            location_id=getattr(attendance, "org_location_id", None),
+        ),
+        "checkin_image": _img_url(attendance.checkin_image) if attendance else None,
+        "checkout_image": _img_url(attendance.checkout_image) if attendance else None,
+    }
+
+
 class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     queryset = AttendanceCheckin.objects.all()
     serializer_class = AttendanceCheckinSerializer
@@ -173,6 +359,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 continue
                 
             is_overnight = shift.end_time <= shift.start_time
+            grace_minutes = _get_site_setting_int(
+                key="shift_grace_time",
+                location_id=getattr(assignment, "location_id", None) or getattr(user, "location_id", None),
+                default_value=30,
+            )
             
             # Check if this is yesterday's overnight shift still active today
             # Only valid if assignment actually includes yesterday.
@@ -181,7 +372,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 and assignment.start_date <= yesterday <= assignment.end_date
             ):
                 # Add 30 min grace period for late checkout
-                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=30)
+                shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=grace_minutes)
                 if user_now <= shift_end_dt:
                     return assignment, yesterday  # Still active from yesterday
             
@@ -189,22 +380,22 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             # Do not evaluate today's time window unless assignment includes today.
             if assignment.start_date <= today <= assignment.end_date:
                 # Add 30 min early checkin grace period
-                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz) - timedelta(minutes=30)
+                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz) - timedelta(minutes=grace_minutes)
                 
                 if is_overnight:
                     # For overnight shifts, calculate logical start and end boundaries including grace periods
                     actual_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
                     actual_end_dt = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
                     
-                    window_start = actual_start_dt - timedelta(minutes=30)
-                    window_end = actual_end_dt + timedelta(minutes=30)
+                    window_start = actual_start_dt - timedelta(minutes=grace_minutes)
+                    window_end = actual_end_dt + timedelta(minutes=grace_minutes)
                     
                     # Also check if it's past midnight and we are in yesterday's shift window
                     yesterday_start_dt = combine_date_time_in_user_tz(yesterday, shift.start_time, user_tz)
                     yesterday_end_dt = combine_date_time_in_user_tz(yesterday + timedelta(days=1), shift.end_time, user_tz)
                     
-                    yesterday_window_start = yesterday_start_dt - timedelta(minutes=30)
-                    yesterday_window_end = yesterday_end_dt + timedelta(minutes=30)
+                    yesterday_window_start = yesterday_start_dt - timedelta(minutes=grace_minutes)
+                    yesterday_window_end = yesterday_end_dt + timedelta(minutes=grace_minutes)
 
                     if (
                         assignment.start_date <= yesterday <= assignment.end_date
@@ -215,7 +406,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                          return assignment, today
                 else:
                     # Regular shift boundaries
-                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=30)
+                    shift_end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz) + timedelta(minutes=grace_minutes)
                     if shift_start_dt <= user_now <= shift_end_dt:
                         return assignment, today
         
@@ -700,6 +891,149 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "message": message
             }, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["get"], url_path="shift_today_v3")
+    def shift_today_v3(self, request):
+        """Same as shift_today_v2 plus last_checkin, last_checkout, duration_minutes, image URLs."""
+        user = request.user
+
+        user_tz = get_user_timezone_from_request(request)
+        user_now = get_user_now(user_tz)
+        today = user_now.date()
+
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
+
+        if not assignment:
+            today = get_user_today(user_tz)
+            user_now = get_user_now(user_tz)
+            assignments = Assignment.objects.filter(
+                guard_id=user.id,
+                start_date__lte=today,
+                end_date__gte=today
+            ).select_related('shift', 'location')
+
+            best_scheduled = None
+            best_distance = None
+            for assgn in assignments:
+                shift = assgn.shift
+                if not shift:
+                    continue
+                shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+                distance_seconds = abs((shift_start_dt - user_now).total_seconds())
+                if best_distance is None or distance_seconds < best_distance:
+                    best_distance = distance_seconds
+                    best_scheduled = assgn
+
+            if best_scheduled:
+                assignment = best_scheduled
+                shift_start_date = today
+
+        if not assignment:
+            return Response({
+                "has_shift": False,
+                "show_checkin": False,
+                "show_checkout": False,
+                "message": "No shifts today",
+                "last_checkin": None,
+                "last_checkout": None,
+                "duration_minutes": None,
+                "checkin_image": None,
+                "checkout_image": None,
+            }, status=status.HTTP_200_OK)
+
+        shift = assignment.shift
+        location = assignment.location
+
+        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
+
+        attendance = AttendanceCheckin.objects.filter(
+            guard=user, shift=shift, assignment=assignment,
+            checkin_time__gte=search_start_utc,
+            checkin_time__lt=search_end_utc
+        ).first()
+
+        show_checkin = False
+        show_checkout = False
+        message = ""
+
+        shift_start_dt_user = combine_date_time_in_user_tz(shift_start_date, shift.start_time, user_tz)
+        shift_start_dt_user = shift_start_dt_user.astimezone(user_tz)
+
+        if shift.end_time <= shift.start_time:
+            shift_end_dt_user = combine_date_time_in_user_tz(shift_start_date + timedelta(days=1), shift.end_time, user_tz)
+            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
+        else:
+            shift_end_dt_user = combine_date_time_in_user_tz(shift_start_date, shift.end_time, user_tz)
+            shift_end_dt_user = shift_end_dt_user.astimezone(user_tz)
+
+        grace_minutes = _get_site_setting_int(
+            key="shift_grace_time",
+            location_id=getattr(location, "id", None),
+            default_value=30,
+        )
+
+        earliest_checkin = shift_start_dt_user - timedelta(minutes=grace_minutes)
+        latest_checkin = shift_end_dt_user
+        earliest_checkout = shift_start_dt_user
+        latest_checkout = shift_end_dt_user + timedelta(minutes=grace_minutes)
+
+        if not attendance:
+            if earliest_checkin <= user_now <= latest_checkin:
+                show_checkin = True
+                message = "You can check in"
+            elif user_now < earliest_checkin:
+                message = "Too early to check in"
+            else:
+                message = "Shift ended"
+        else:
+            if attendance.checkin_time and not attendance.checkout_time:
+                if user_now <= latest_checkout:
+                    show_checkout = True
+                    message = "You are checked in, checkout when done"
+                else:
+                    message = "Shift ended"
+            elif attendance.checkin_time and attendance.checkout_time:
+                if user_now <= latest_checkout:
+                    latest_checkin_log = CheckInLog.objects.filter(
+                        guard=user,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=location,
+                        type="checkin",
+                        timestamp__gte=search_start_utc,
+                        timestamp__lt=search_end_utc,
+                        timestamp__gt=attendance.checkout_time
+                    ).order_by("-timestamp").first()
+
+                    if latest_checkin_log:
+                        show_checkin = False
+                        show_checkout = True
+                        message = "You have checked-in. You can check-out"
+                    else:
+                        show_checkin = True
+                        show_checkout = False
+                        message = "You are checked out already but can check in again"
+                else:
+                    message = "Shift ended"
+
+        summary = _attendance_v3_compute_from_logs(
+            user, assignment, shift, location, search_start_utc, search_end_utc
+        )
+        extras = _attendance_v3_response_extras(attendance, summary, user_tz, request)
+
+        return Response({
+            "has_shift": True,
+            "shift_id": str(shift.id),
+            "shift_start": shift.start_time,
+            "shift_end": shift.end_time,
+            "location_name": location.name,
+            "show_checkin": show_checkin,
+            "show_checkout": show_checkout,
+            "message": message,
+            **extras,
+        }, status=status.HTTP_200_OK)
+
   
     @action(detail=False, methods=["post"])
     def checkin(self, request):
@@ -854,8 +1188,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         # Validate location if location has coordinates
         if org_location.latitude and org_location.longitude:
             distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-            if distance > 100:
-                return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
+            allowed_distance = _get_site_setting_int(
+                key="attendance_distance",
+                location_id=getattr(org_location, "id", None),
+                default_value=100,
+            )
+            if distance > allowed_distance:
+                return Response(
+                    {"error": f"Not within >{allowed_distance}m of assigned location"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Use shift_start_date (could be yesterday for overnight) for precise UTC conversion
         start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
@@ -969,7 +1311,195 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             attendance.checkout_time = latest_checkout.timestamp
         attendance.save()
 
+        # Populate v3 summary fields and working-duration mark for web P/HA/A.
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
         return Response(AttendanceCheckinSerializer(attendance).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="checkin_v3")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkin_v3(self, request):
+        """V3: checkin_v2 + optional image (multipart). Updates v3 summary fields on AttendanceCheckin."""
+        user = request.user
+        user_tz = get_user_timezone_from_request(request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
+
+        if not assignment:
+            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+        shift = assignment.shift
+        org_location = assignment.location
+
+        lat = float(request.data.get("latitude"))
+        lon = float(request.data.get("longitude"))
+
+        if org_location.latitude and org_location.longitude:
+            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+            if distance > 100:
+                return Response({"error": "Not within >100m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
+
+        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
+
+        image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
+        raw_bytes = None
+        img_name = "checkin.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+            raw_bytes = image_file.read()
+
+        log = CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            latitude=lat,
+            longitude=lon,
+        )
+        if raw_bytes is not None:
+            log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+        attendance, _ = AttendanceCheckin.objects.get_or_create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            defaults={'created_on': timezone.now()}
+        )
+
+        attendance_list = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            created_on__gte=search_start_utc,
+            created_on__lt=search_end_utc
+        )
+        if attendance_list.exists():
+            attendance = attendance_list.first()
+
+        earliest_checkin = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
+        ).order_by("timestamp").first()
+
+        if earliest_checkin:
+            attendance.checkin_time = earliest_checkin.timestamp
+            attendance.latitude = earliest_checkin.latitude
+            attendance.longitude = earliest_checkin.longitude
+
+        if raw_bytes is not None:
+            attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
+
+        attendance.save()
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
+        return Response(
+            AttendanceCheckinSerializer(attendance, context={'request': request}).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=False, methods=["post"], url_path="checkout_v3")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkout_v3(self, request):
+        """V3: checkout_v2 + optional image (multipart). Updates v3 summary fields on AttendanceCheckin."""
+        user = request.user
+        user_tz = get_user_timezone_from_request(request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
+
+        if not assignment:
+            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+        shift = assignment.shift
+        org_location = assignment.location
+        lat = float(request.data.get("latitude"))
+        lon = float(request.data.get("longitude"))
+
+        # Enforce same 100m distance rule as checkin_v3.
+        if org_location.latitude and org_location.longitude:
+            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+            allowed_distance = _get_site_setting_int(
+                key="attendance_distance",
+                location_id=getattr(org_location, "id", None),
+                default_value=100,
+            )
+            if distance > allowed_distance:
+                return Response(
+                    {"error": f"Not within >{allowed_distance}m of assigned location"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        start_utc, end_utc = convert_date_range_to_utc(shift_start_date, shift_start_date, user_tz)
+        search_start_utc = start_utc
+        search_end_utc = end_utc + timedelta(days=1)
+
+        attendance = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            created_on__gte=search_start_utc,
+            created_on__lt=search_end_utc
+        ).first()
+
+        if not attendance or not attendance.checkin_time:
+            return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
+
+        image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
+        raw_bytes = None
+        img_name = "checkout.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+            raw_bytes = image_file.read()
+
+        log = CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            latitude=lat,
+            longitude=lon,
+        )
+        if raw_bytes is not None:
+            log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+        if raw_bytes is not None:
+            attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
+
+        latest_checkout = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
+        ).order_by("-timestamp").first()
+
+        if latest_checkout:
+            attendance.checkout_time = latest_checkout.timestamp
+        attendance.save()
+
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
+        return Response(
+            AttendanceCheckinSerializer(attendance, context={'request': request}).data,
+            status=status.HTTP_200_OK
+        )
 
     @action(detail=False, methods=["get"])
     def list_default_shifts(self, request):
@@ -1082,8 +1612,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get checkpoints from selected checkpoint template (if provided).
-        # Fallback to shift's prelinked checkpoint_template.
+        # Get checkpoints only from selected checkpoint template (if provided).
+        # If no checkpoint_template_id is sent, create assignment without checkpoints.
         checkpoints = []
         selected_template = None
         if checkpoint_template_id:
@@ -1110,9 +1640,15 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-        template_to_use = selected_template or shift.checkpoint_template
-        if template_to_use and template_to_use.checkpoints:
-            checkpoints = template_to_use.checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
+        template_to_use = selected_template
+        if template_to_use:
+            template_checkpoints = template_to_use.checkpoints or []
+            if not isinstance(template_checkpoints, list):
+                return Response(
+                    {"error": "Checkpoint template checkpoints must be a list"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            checkpoints = template_checkpoints  # Format: [{"checkpoint_id": "uuid", "time": "HH:MM"}]
         
         # Determine assignment date range
         # Even for overnight shifts, the assignment is conceptually bound to a single logical day.
@@ -1146,6 +1682,100 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "end_date": str(end_date),
             "checkpoints_count": len(checkpoints)
         }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="assign-checkpoint-template")
+    def assign_checkpoint_template(self, request):
+        """
+        Assign checkpoint template for an existing active assignment only when
+        assignment has no checkpoints yet.
+        Useful for flow where assignment is created first (without checkpoints),
+        and checkpoints are attached later from mobile.
+
+        Body:
+          - guard_id (required)
+          - checkpoint_template_id (required)
+          - shift_id (optional, used to verify target shift)
+        """
+        guard_id = request.data.get("guard_id")
+        checkpoint_template_id = request.data.get("checkpoint_template_id")
+        shift_id = request.data.get("shift_id")
+
+        if not guard_id or not checkpoint_template_id:
+            return Response(
+                {"error": "guard_id and checkpoint_template_id are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            guard = User.objects.get(id=guard_id)
+        except User.DoesNotExist:
+            return Response({"error": "Guard not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Find current active assignment using same v2 logic as shift/checkin APIs
+        assignment, _ = self.get_today_assignment_v2(guard, request)
+        if not assignment:
+            return Response(
+                {"error": "No active assignment found for this guard today"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        if shift_id and str(assignment.shift_id) != str(shift_id):
+            return Response(
+                {"error": "Active assignment does not match provided shift_id"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            template = CheckpointTemplate.objects.get(
+                id=checkpoint_template_id,
+                is_deleted=False
+            )
+        except CheckpointTemplate.DoesNotExist:
+            return Response(
+                {"error": "Checkpoint template not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Validate template vs assignment shift/location
+        if assignment.location_id and template.location_id != assignment.location_id:
+            return Response(
+                {"error": "Checkpoint template location does not match assignment location"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if template.shift_id != assignment.shift_id:
+            return Response(
+                {"error": "Checkpoint template shift does not match assignment shift"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        existing_checkpoints = assignment.checkpoints or []
+        if isinstance(existing_checkpoints, list) and len(existing_checkpoints) > 0:
+            return Response(
+                {"error": "Assignment already has checkpoints. Update is not allowed from this API."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        checkpoints = template.checkpoints or []
+        if not isinstance(checkpoints, list):
+            return Response(
+                {"error": "Checkpoint template checkpoints must be a list"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        assignment.checkpoints = checkpoints
+        assignment.modified_by = request.user
+        assignment.save(update_fields=["checkpoints", "modified_by", "modified_on"])
+
+        return Response({
+            "message": "Checkpoint template assigned successfully",
+            "assignment_id": str(assignment.id),
+            "guard_id": str(guard.id),
+            "shift_id": str(assignment.shift_id),
+            "checkpoint_template_id": str(template.id),
+            "checkpoint_template_name": template.template_name,
+            "checkpoints_count": len(checkpoints),
+        }, status=status.HTTP_200_OK)
 
     # ----------------------
     # DASHBOARD (with date range filter)
@@ -1305,7 +1935,7 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         location = assignment.location
         
         # For each checkpoint in the assignment
-        for cp in assignment.checkpoints:
+        for cp in (assignment.checkpoints or []):
             checkpoint_id = cp.get('checkpoint_id')
             expected_time_str = cp.get('time')
             
@@ -2378,14 +3008,28 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
 
             # Convert date to UTC range for query using user timezone
             start_utc, end_utc = convert_date_range_to_utc(date, date, user_tz)
-            has_checkin = AttendanceCheckin.objects.filter(
+            attendance_qs = AttendanceCheckin.objects.filter(
                 guard=guard,
                 assignment__in=active_assignments,
                 checkin_time__gte=start_utc,
-                checkin_time__lt=end_utc + timedelta(days=1)
-            ).exists()
+                checkin_time__lt=end_utc + timedelta(days=1),
+            ).order_by("-last_checkout_time", "-checkout_time", "-modified_on")
 
-            row[date.strftime("%d-%b")] = "P" if has_checkin else "A"
+            attendance = attendance_qs.first()
+            if not attendance:
+                row[date.strftime("%d-%b")] = "A"
+                continue
+
+            # Prefer persisted pa_status (set after checkout_v2/v3 refresh).
+            if attendance.pa_status:
+                row[date.strftime("%d-%b")] = attendance.pa_status
+            elif attendance.checkout_time or attendance.last_checkout_time:
+                # Fallback for any records created before the new persist logic.
+                row[date.strftime("%d-%b")] = _attendance_v3_compute_pa_status_from_duration(attendance.duration_minutes) or "HA"
+            else:
+                # Still on duty (checked in but no checkout yet): keep old behavior as "P".
+                # If there's no checkin at all, mark as "A".
+                row[date.strftime("%d-%b")] = "P" if (attendance.checkin_time or attendance.last_checkin_time) else "A"
 
         summary_data.append(row)
 

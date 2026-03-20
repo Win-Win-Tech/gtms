@@ -359,7 +359,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             # -------- CHECKPOINT TIMES --------
             def get_all_checkpoint_times(assignment, checkpoint_id):
                 times = []
-                for cp in assignment.checkpoints:
+                for cp in (assignment.checkpoints or []):
                     if cp.get("checkpoint_id") == checkpoint_id:
                         times.append(cp.get("time"))
                 return times
@@ -538,7 +538,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             return Response({"error": "Shift not found"}, status=status.HTTP_400_BAD_REQUEST), None
 
         def get_all_checkpoint_times(assignment, cid):
-            return [cp.get("time") for cp in assignment.checkpoints if cp.get("checkpoint_id") == cid]
+            return [cp.get("time") for cp in (assignment.checkpoints or []) if cp.get("checkpoint_id") == cid]
 
         checkpoint_times_str = get_all_checkpoint_times(assignment, checkpoint_id)
         if not checkpoint_times_str:
@@ -590,7 +590,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
 
         matched_entry = None
         if best_match_str is not None:
-            for cp in assignment.checkpoints:
+            for cp in (assignment.checkpoints or []):
                 if str(cp.get("checkpoint_id")) == str(checkpoint_id) and cp.get("time") == best_match_str:
                     matched_entry = cp
                     break

@@ -365,7 +365,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                             continue
 
                     # 5. PROCESS CHECKPOINTS
-                    for cp in assignment.checkpoints:
+                    for cp in (assignment.checkpoints or []):
                         checkpoint_id_str = cp.get('checkpoint_id')
                         try:
                             checkpoint_id = uuid.UUID(checkpoint_id_str)

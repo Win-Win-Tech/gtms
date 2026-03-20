@@ -54,17 +54,21 @@ class AssignmentSerializer(serializers.ModelSerializer):
 
         completed_ids = set()
         if user_id:
+            checkpoints = obj.checkpoints or []
             completed_ids = set(
                 CheckIn.objects.filter(
                     guard_id=user_id,
                     shift_id=obj.shift.id,
-                    checkpoint_id__in=[cp['checkpoint_id'] for cp in obj.checkpoints]
+                    checkpoint_id__in=[cp['checkpoint_id'] for cp in checkpoints if cp.get('checkpoint_id')]
                 ).values_list('checkpoint_id', flat=True)
             )
 
         result = []
-        for cp in obj.checkpoints:
-            checkpoint_obj = Checkpoint.objects.filter(id=cp['checkpoint_id']).first()
+        for cp in (obj.checkpoints or []):
+            checkpoint_id = cp.get('checkpoint_id')
+            if not checkpoint_id:
+                continue
+            checkpoint_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
             checklist_template_id = cp.get('checklist_template_id')
             checklist_template_name = None
             if checklist_template_id:
@@ -72,14 +76,18 @@ class AssignmentSerializer(serializers.ModelSerializer):
                 if ct:
                     checklist_template_name = ct.name
             item = {
-                'checkpoint_id': cp['checkpoint_id'],
+                'checkpoint_id': checkpoint_id,
                 'label': checkpoint_obj.label if checkpoint_obj else '',
                 'time': cp['time'],
                 'lat': checkpoint_obj.latitude if checkpoint_obj else None,
                 'lon': checkpoint_obj.longitude if checkpoint_obj else None,
                 'qr': checkpoint_obj.data if checkpoint_obj else None,
-                'status': 'completed' if UUID(cp['checkpoint_id']) in completed_ids else 'pending'
+                'status': 'pending'
             }
+            try:
+                item['status'] = 'completed' if UUID(str(checkpoint_id)) in completed_ids else 'pending'
+            except (ValueError, TypeError):
+                item['status'] = 'pending'
             if checklist_template_id:
                 item['checklist_template_id'] = str(checklist_template_id)
             if checklist_template_name:
