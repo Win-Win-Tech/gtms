@@ -18,8 +18,10 @@ urlpatterns = [
     path('', include(router.urls)),
     path('dashboard-checkin-report/', DashboardCheckInReportView.as_view(), name='dashboard-checkin-report'),
     path("api/attendance/", AttendanceCheckinListView.as_view(), name="attendance-api"),
+    path("api/attendance_v3/", AttendanceCheckinV3ListView.as_view(), name="attendance-api-v3"),
     path('dashboard-checkin-report-excel/', DashboardCheckInReportExcelView.as_view(), name='dashboard-checkin-report-excel'),
     path("api/attendance/export/", AttendanceCheckinExportView.as_view(), name="attendance-export-api"),
+    path("api/attendance/export_v3/", AttendanceCheckinV3ExportView.as_view(), name="attendance-export-api-v3"),
   
 ]
 

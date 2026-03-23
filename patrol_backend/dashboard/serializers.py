@@ -1,6 +1,12 @@
 from rest_framework import serializers
-from .models import AttendanceCheckin
-from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, to_user_timezone
+import pytz
+from datetime import datetime, timedelta
+from .models import AttendanceCheckin, CheckInLog
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    to_user_timezone,
+    convert_date_range_to_utc,
+)
 
 class AttendanceCheckinSerializer(serializers.ModelSerializer):
     status = serializers.ReadOnlyField()
@@ -84,8 +90,6 @@ class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
             "checkin_time",
             "checkout_time",
             "status",
-            "duration_minutes",
-            "pa_status",
             "remarks",
             "od_remarks",
             "location_name",
@@ -113,6 +117,114 @@ class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
             if instance.checkout_time:
                 data['checkout_time'] = to_user_timezone(instance.checkout_time, user_tz).isoformat()
         
+        return data
+
+
+class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
+    guard_name = serializers.CharField(source="guard.name", read_only=True)
+    shift_name = serializers.CharField(source="shift.name", read_only=True)
+    location_name = serializers.CharField(source="org_location.name", read_only=True)
+    shift_time = serializers.SerializerMethodField()
+    live_state = serializers.SerializerMethodField()
+    log_pairs = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AttendanceCheckin
+        fields = [
+            "id",
+            "guard",
+            "guard_name",
+            "checkin_time",
+            "checkout_time",
+            "last_checkin_time",
+            "last_checkout_time",
+            "status",
+            "duration_minutes",
+            "checkin_count",
+            "checkout_count",
+            "live_state",
+            "log_pairs",
+            "pa_status",
+            "remarks",
+            "od_remarks",
+            "location_name",
+            "shift_name",
+            "assignment",
+            "shift_time",
+        ]
+
+    def get_shift_time(self, obj):
+        return f"{obj.shift.start_time}–{obj.shift.end_time}"
+
+    def get_live_state(self, obj):
+        if obj.last_checkin_time and (not obj.last_checkout_time or obj.last_checkin_time > obj.last_checkout_time):
+            return "checked_in"
+        return "checked_out"
+
+    def get_log_pairs(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return []
+        user_tz = get_user_timezone_from_request(request)
+        source_dt = obj.checkin_time or obj.created_on
+        if not source_dt:
+            return []
+
+        shift_day = to_user_timezone(source_dt, user_tz).date()
+        shift_start_local = user_tz.localize(datetime.combine(shift_day, obj.shift.start_time))
+        if obj.shift.end_time <= obj.shift.start_time:
+            shift_end_local = user_tz.localize(datetime.combine(shift_day + timedelta(days=1), obj.shift.end_time))
+        else:
+            shift_end_local = user_tz.localize(datetime.combine(shift_day, obj.shift.end_time))
+        # Keep small grace so near-boundary events still appear in popup.
+        search_start_utc = (shift_start_local - timedelta(minutes=30)).astimezone(pytz.UTC)
+        search_end_utc = (shift_end_local + timedelta(minutes=30)).astimezone(pytz.UTC)
+
+        logs = CheckInLog.objects.filter(
+            guard=obj.guard,
+            assignment=obj.assignment,
+            shift=obj.shift,
+            org_location=obj.org_location,
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc,
+        ).order_by("timestamp")
+
+        pairs = []
+        open_checkin = None
+        for log in logs:
+            if log.type == "checkin":
+                open_checkin = log.timestamp
+                continue
+            if log.type == "checkout" and open_checkin is not None and log.timestamp > open_checkin:
+                duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
+                pairs.append({
+                    "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                    "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
+                    "duration_minutes": duration_minutes,
+                })
+                open_checkin = None
+
+        if open_checkin is not None:
+            pairs.append({
+                "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                "checkout_time": None,
+                "duration_minutes": None,
+            })
+        return pairs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        if request:
+            user_tz = get_user_timezone_from_request(request)
+            if instance.checkin_time:
+                data['checkin_time'] = to_user_timezone(instance.checkin_time, user_tz).isoformat()
+            if instance.checkout_time:
+                data['checkout_time'] = to_user_timezone(instance.checkout_time, user_tz).isoformat()
+            if instance.last_checkin_time:
+                data['last_checkin_time'] = to_user_timezone(instance.last_checkin_time, user_tz).isoformat()
+            if instance.last_checkout_time:
+                data['last_checkout_time'] = to_user_timezone(instance.last_checkout_time, user_tz).isoformat()
         return data
 
 class CheckInReportSerializer(serializers.Serializer):

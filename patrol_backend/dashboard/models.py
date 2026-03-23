@@ -49,6 +49,8 @@ class AttendanceCheckin(models.Model):
     last_checkin_time = models.DateTimeField(null=True, blank=True)
     last_checkout_time = models.DateTimeField(null=True, blank=True)
     duration_minutes = models.IntegerField(null=True, blank=True)
+    checkin_count = models.IntegerField(default=0)
+    checkout_count = models.IntegerField(default=0)
     # Working-duration based attendance mark for web P/HA/A view.
     # - computed from CheckInLog pairs inside the shift window
     # - set after checkout (while check-in only, may remain null)
