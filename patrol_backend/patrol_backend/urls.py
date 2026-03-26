@@ -26,6 +26,7 @@ urlpatterns = [
     path('checkin/', include('checkin.urls')),
     path('tourlog/', include('tourlog.urls')),
     path('dashboard/', include('dashboard.urls')),
+    path('payslip/', include('payslip.urls')),
     path('incident/', include('incident.urls')),
     path('livetracking/', include('livetracking.urls')),
 ]

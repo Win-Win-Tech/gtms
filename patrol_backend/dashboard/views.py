@@ -348,6 +348,35 @@ def _attendance_v3_response_extras(attendance, summary, user_tz, request):
     }
 
 
+def _apply_attendance_v3_status_filter(queryset, status_value):
+    """
+    Map UI status filter values to v3 fields.
+    """
+    if not status_value:
+        return queryset
+    v = str(status_value).strip().lower()
+    if v == "present":
+        return queryset.filter(pa_status="P")
+    if v in ("half_day", "halfday"):
+        return queryset.filter(pa_status="HA")
+    if v == "absent":
+        return queryset.filter(pa_status="A")
+    if v == "checked_out":
+        return queryset.filter(
+            Q(last_checkin_time__isnull=False) &
+            Q(last_checkout_time__isnull=False) &
+            Q(last_checkout_time__gte=F("last_checkin_time"))
+        )
+    if v == "checked_in":
+        return queryset.filter(
+            Q(last_checkin_time__isnull=False) & (
+                Q(last_checkout_time__isnull=True) | Q(last_checkin_time__gt=F("last_checkout_time"))
+            )
+        )
+    # Backward compatibility for legacy status field values.
+    return queryset.filter(status=status_value)
+
+
 def _attendance_v3_build_session_lines_for_export(attendance_obj, user_tz):
     """
     Build compact multiline session text:
@@ -2786,7 +2815,7 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
 
         status = self.request.query_params.get("status")
         if status:
-            queryset = queryset.filter(status=status)
+            queryset = _apply_attendance_v3_status_filter(queryset, status)
 
         defaulters = self.request.query_params.get("defaulters")
         if defaulters == "true":
@@ -3344,7 +3373,7 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
     if status_filter:
-        queryset = queryset.filter(status=status_filter)
+        queryset = _apply_attendance_v3_status_filter(queryset, status_filter)
     if defaulters:
         start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
         queryset = queryset.filter(

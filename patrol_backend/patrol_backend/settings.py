@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'checkin',
     'tourlog',
     'dashboard',
+    'payslip',
     'reports',  # Added for Celery tasks
     'corsheaders',
     'incident',

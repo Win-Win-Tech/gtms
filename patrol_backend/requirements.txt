@@ -43,6 +43,7 @@ kombu==5.5.4
 msgpack==1.1.2
 multidict==6.7.0
 mysqlclient==2.2.7
+num2words==0.5.14
 openpyxl==3.1.5
 packaging==25.0
 pillow==11.3.0
@@ -59,6 +60,7 @@ python-crontab==3.3.0
 python-dateutil==2.9.0.post0
 pytz==2025.2
 redis==7.0.1
+reportlab==4.4.6
 requests==2.32.5
 service-identity==24.2.0
 six==1.17.0

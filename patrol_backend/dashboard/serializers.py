@@ -157,7 +157,10 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
         return f"{obj.shift.start_time}–{obj.shift.end_time}"
 
     def get_live_state(self, obj):
-        if obj.last_checkin_time and (not obj.last_checkout_time or obj.last_checkin_time > obj.last_checkout_time):
+        # Fallback to first checkin/checkout when denormalized last_* fields are stale.
+        checkin_ref = obj.last_checkin_time or obj.checkin_time
+        checkout_ref = obj.last_checkout_time or obj.checkout_time
+        if checkin_ref and (not checkout_ref or checkin_ref > checkout_ref):
             return "checked_in"
         return "checked_out"
 
@@ -215,6 +218,18 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get('request')
+        # Keep count fields meaningful even if stored counters are stale.
+        pairs = data.get("log_pairs") or []
+        if (data.get("checkin_count") in (None, 0)) and pairs:
+            data["checkin_count"] = len(pairs)
+        if (data.get("checkout_count") in (None, 0)) and pairs:
+            data["checkout_count"] = sum(1 for p in pairs if p.get("checkout_time"))
+
+        # Derive live state from effective checkin/checkout refs.
+        eff_checkin = data.get("last_checkin_time") or data.get("checkin_time")
+        eff_checkout = data.get("last_checkout_time") or data.get("checkout_time")
+        data["live_state"] = "checked_in" if (eff_checkin and (not eff_checkout or eff_checkin > eff_checkout)) else "checked_out"
+
         if request:
             user_tz = get_user_timezone_from_request(request)
             if instance.checkin_time:
