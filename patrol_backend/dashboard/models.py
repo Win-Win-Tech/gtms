@@ -39,6 +39,8 @@ class AttendanceCheckin(models.Model):
         on_delete=models.CASCADE,
         related_name="attendance_records"
     )
+    # Logical shift-start date in business timezone (used for report bucketing).
+    shift_date = models.DateField(null=True, blank=True, db_index=True)
 
     checkin_time = models.DateTimeField(null=True, blank=True)
     checkout_time = models.DateTimeField(null=True, blank=True)

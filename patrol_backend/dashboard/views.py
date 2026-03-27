@@ -377,6 +377,19 @@ def _apply_attendance_v3_status_filter(queryset, status_value):
     return queryset.filter(status=status_value)
 
 
+def _attendance_v3_compute_shift_date(local_dt, shift):
+    """
+    Return logical shift date (shift start day) from a localized datetime.
+    For overnight shifts, times after midnight and before shift end belong to previous date.
+    """
+    if not local_dt or not shift:
+        return None
+    shift_day = local_dt.date()
+    if shift.end_time <= shift.start_time and local_dt.time() < shift.end_time:
+        return shift_day - timedelta(days=1)
+    return shift_day
+
+
 def _attendance_v3_build_session_lines_for_export(attendance_obj, user_tz):
     """
     Build compact multiline session text:
@@ -385,7 +398,11 @@ def _attendance_v3_build_session_lines_for_export(attendance_obj, user_tz):
     source_dt = attendance_obj.checkin_time or attendance_obj.created_on
     if not source_dt:
         return ""
-    shift_day = to_user_timezone(source_dt, user_tz).date()
+    shift_day = attendance_obj.shift_date or _attendance_v3_compute_shift_date(
+        to_user_timezone(source_dt, user_tz), attendance_obj.shift
+    )
+    if not shift_day:
+        return ""
     search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
         shift_day,
         attendance_obj.shift,
@@ -1502,7 +1519,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            defaults={'created_on': timezone.now()}
+            defaults={
+                "created_on": timezone.now(),
+                "shift_date": shift_start_date,
+            }
         )
 
         attendance_list = AttendanceCheckin.objects.filter(
@@ -1510,8 +1530,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__gte=search_start_utc,
-            created_on__lt=search_end_utc
+            shift_date=shift_start_date,
         )
         if attendance_list.exists():
             attendance = attendance_list.first()
@@ -1530,6 +1549,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             attendance.checkin_time = earliest_checkin.timestamp
             attendance.latitude = earliest_checkin.latitude
             attendance.longitude = earliest_checkin.longitude
+
+        attendance.shift_date = shift_start_date
 
         if raw_bytes is not None:
             attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
@@ -1583,8 +1604,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__gte=search_start_utc,
-            created_on__lt=search_end_utc
+            shift_date=shift_start_date,
         ).first()
 
         if not attendance or not attendance.checkin_time:
@@ -1624,6 +1644,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         if latest_checkout:
             attendance.checkout_time = latest_checkout.timestamp
+        attendance.shift_date = shift_start_date
         attendance.save()
 
         _attendance_v3_refresh_saved_fields(
@@ -1695,7 +1716,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 assignment=assignment,
                 shift=shift,
                 org_location=org_location,
-            ).order_by("-created_on").first()
+            ).order_by("-shift_date", "-created_on").first()
 
         if not getattr(actor, "is_superuser", False):
             if str(getattr(actor, "location_id", "")) != str(getattr(guard, "location_id", "")):
@@ -1723,8 +1744,12 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             return Response({"error": "Invalid latitude/longitude"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if attendance and attendance.checkin_time:
-            shift_start_date = to_user_timezone(attendance.checkin_time, guard_tz).date()
+        if attendance and attendance.shift_date:
+            shift_start_date = attendance.shift_date
+        elif attendance and attendance.checkin_time:
+            shift_start_date = _attendance_v3_compute_shift_date(
+                to_user_timezone(attendance.checkin_time, guard_tz), shift
+            )
         elif attendance:
             shift_start_date = to_user_timezone(attendance.created_on, guard_tz).date()
         else:
@@ -1829,6 +1854,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
 
         attendance.checkout_time = selected_checkout_utc
+        attendance.shift_date = shift_start_date
         if raw_bytes is not None:
             attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
         attendance.save()
@@ -2772,13 +2798,11 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
         user_today = get_user_today(user_tz)
 
         if date_filter == "today":
-            start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+            queryset = queryset.filter(shift_date=user_today)
         elif date_filter == "week":
             start_week = user_today - timedelta(days=user_today.weekday())
             end_week = min(start_week + timedelta(days=6), user_today)
-            start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
-            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+            queryset = queryset.filter(shift_date__gte=start_week, shift_date__lte=end_week)
         elif date_filter == "month":
             start_of_month = user_today.replace(day=1)
             end_of_month = min(
@@ -2786,8 +2810,7 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
                 else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
                 user_today
             )
-            start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
-            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+            queryset = queryset.filter(shift_date__gte=start_of_month, shift_date__lte=end_of_month)
         elif date_filter == "custom":
             start_date = self.request.query_params.get("start_date")
             end_date = self.request.query_params.get("end_date")
@@ -2796,8 +2819,7 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
                     start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
                     end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
                     end_date_obj = min(end_date_obj, user_today)
-                    start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
-                    queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+                    queryset = queryset.filter(shift_date__gte=start_date_obj, shift_date__lte=end_date_obj)
                 except ValueError:
                     pass
 
@@ -2830,7 +2852,7 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
             )
 
         # Enforce stable latest-first ordering for dashboard table.
-        return queryset.order_by("-checkin_time", "-last_checkin_time", "-modified_on", "-id")
+        return queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
 
 
 def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None, request=None):
@@ -3341,13 +3363,11 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
         user_today = get_user_today(user_tz)
 
     if date_filter == "today":
-        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+        queryset = queryset.filter(shift_date=user_today)
     elif date_filter == "week":
         start_week = user_today - timedelta(days=user_today.weekday())
         end_week = min(start_week + timedelta(days=6), user_today)
-        start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
-        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+        queryset = queryset.filter(shift_date__gte=start_week, shift_date__lte=end_week)
     elif date_filter == "month":
         start_of_month = user_today.replace(day=1)
         end_of_month = min(
@@ -3355,15 +3375,13 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
             else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
             user_today
         )
-        start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
-        queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+        queryset = queryset.filter(shift_date__gte=start_of_month, shift_date__lte=end_of_month)
     elif date_filter == "custom" and start_date and end_date:
         try:
             start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
             end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
             end_date_obj = min(end_date_obj, user_today)
-            start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
-            queryset = queryset.filter(checkin_time__gte=start_utc, checkin_time__lte=end_utc)
+            queryset = queryset.filter(shift_date__gte=start_date_obj, shift_date__lte=end_date_obj)
         except ValueError:
             raise ValueError("Invalid custom date format. Use YYYY-MM-DD.")
 
@@ -3385,7 +3403,7 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
         )
 
     # Match dashboard ordering in export: newest first.
-    queryset = queryset.order_by("-checkin_time", "-last_checkin_time", "-modified_on", "-id")
+    queryset = queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
 
     wb = Workbook()
     ws = wb.active
@@ -3434,13 +3452,13 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
                 to_user_timezone(obj.created_on, user_tz) if obj.created_on else None
             )
         )
-        shift_date_key = effective_dt.date() if effective_dt else date.min
+        shift_date_key = obj.shift_date or (effective_dt.date() if effective_dt else date.min)
         shift_dt_key = effective_dt if effective_dt else datetime.min.replace(tzinfo=user_tz)
         rows.append((
             shift_date_key,
             shift_dt_key,
             [
-                first_checkin.strftime('%Y-%m-%d') if first_checkin else "",
+                shift_date_key.strftime('%Y-%m-%d') if shift_date_key != date.min else "",
                 obj.guard.name,
                 obj.shift.name if obj.shift else "",
                 obj.org_location.name if obj.org_location else "",

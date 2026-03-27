@@ -127,6 +127,7 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     shift_time = serializers.SerializerMethodField()
     live_state = serializers.SerializerMethodField()
     log_pairs = serializers.SerializerMethodField()
+    shift_date = serializers.DateField(read_only=True)
 
     class Meta:
         model = AttendanceCheckin
@@ -151,6 +152,7 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             "shift_name",
             "assignment",
             "shift_time",
+            "shift_date",
         ]
 
     def get_shift_time(self, obj):
@@ -172,8 +174,11 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
         source_dt = obj.checkin_time or obj.created_on
         if not source_dt:
             return []
-
-        shift_day = to_user_timezone(source_dt, user_tz).date()
+        shift_day = obj.shift_date or to_user_timezone(source_dt, user_tz).date()
+        if obj.shift.end_time <= obj.shift.start_time and obj.shift_date is None:
+            local_dt = to_user_timezone(source_dt, user_tz)
+            if local_dt.time() < obj.shift.end_time:
+                shift_day = shift_day - timedelta(days=1)
         shift_start_local = user_tz.localize(datetime.combine(shift_day, obj.shift.start_time))
         if obj.shift.end_time <= obj.shift.start_time:
             shift_end_local = user_tz.localize(datetime.combine(shift_day + timedelta(days=1), obj.shift.end_time))
