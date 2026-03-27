@@ -180,12 +180,18 @@ def calculate_salary_fields(gross_salary, field_rows, attendance_snapshot):
     - FORMULA: python expression referencing computed fields + attendance vars
     """
     gross = _to_decimal(gross_salary, "0")
+    half_days_count = _to_decimal(attendance_snapshot.get("half_days"), "0")
+    half_days_paid = half_days_count * Decimal("0.5")
     context = {
         "gross_salary": gross,
         "month_days": _to_decimal(attendance_snapshot.get("month_days"), "0"),
         "working_days": _to_decimal(attendance_snapshot.get("working_days"), "0"),
         "present_days": _to_decimal(attendance_snapshot.get("present_days"), "0"),
-        "half_days": _to_decimal(attendance_snapshot.get("half_days"), "0"),
+        # Keep half_days as paid-day contribution (count * 0.5) so formulas
+        # like present_days + half_days behave as users expect.
+        "half_days": half_days_paid,
+        "half_days_count": half_days_count,
+        "half_days_paid": half_days_paid,
         "absent_days": _to_decimal(attendance_snapshot.get("absent_days"), "0"),
         "paid_days": _to_decimal(attendance_snapshot.get("paid_days"), "0"),
     }

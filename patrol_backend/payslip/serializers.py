@@ -59,6 +59,8 @@ class PayslipFieldSerializer(serializers.ModelSerializer):
         "working_days",
         "present_days",
         "half_days",
+        "half_days_count",
+        "half_days_paid",
         "absent_days",
         "paid_days",
         "Decimal",
@@ -264,4 +266,31 @@ class PayslipApproveSerializer(serializers.Serializer):
 
 class PayslipReopenSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class PayslipRecordAttendanceEditSerializer(serializers.Serializer):
+    present_days = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=0)
+    half_days = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=0)
+    absent_days = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=0)
+
+    def validate(self, attrs):
+        # For manual corrections:
+        # - present/absent can be in 0.5 steps (e.g., 15.5)
+        # - half_days is a count of half-day occurrences (whole number)
+        for key in ("present_days", "absent_days"):
+            value = attrs.get(key)
+            if value is None:
+                continue
+            doubled = value * Decimal("2")
+            if doubled != doubled.to_integral_value():
+                raise serializers.ValidationError(
+                    {key: f"{key} must be in 0.5 steps (example: 15, 15.5, 16)."}
+                )
+
+        half_days = attrs.get("half_days")
+        if half_days is not None and half_days != half_days.to_integral_value():
+            raise serializers.ValidationError(
+                {"half_days": "half_days must be a whole number (0, 1, 2, ...)."}
+            )
+        return attrs
 

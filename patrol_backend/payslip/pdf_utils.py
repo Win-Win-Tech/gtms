@@ -59,11 +59,23 @@ def _fmt_rs_cell(val) -> str:
     return s
 
 
+def _fmt_day_1(val) -> str:
+    if val is None or val == "":
+        return "-"
+    try:
+        d = val if isinstance(val, Decimal) else Decimal(str(val))
+    except Exception:
+        return str(val)
+    return f"{d:.1f}"
+
+
 def _fmt_display(field, raw) -> str:
     if raw is None or raw == "":
         return "-"
     if field.field_type in ("EARNING", "DEDUCTION"):
         return _fmt_rs_cell(raw)
+    if getattr(field, "field_code", "") in {"MONTH_DAYS", "WORKING_DAYS", "PRESENT_DAYS", "HALF_DAYS", "ABSENT_DAYS", "PAID_DAYS"}:
+        return _fmt_day_1(raw)
     return str(raw)
 
 
@@ -103,8 +115,8 @@ def _meta_line(record, template, field_values: dict) -> dict:
         "code": profile.employee_code or "-",
         "team": pick("TEAM", "team", em_keys=("team", "Team")),
         "designation": pick("DESIGNATION", "designation", em_keys=("designation", "Designation")),
-        "working_days": str(record.working_days),
-        "net_payable_days": str(record.paid_days),
+        "working_days": _fmt_day_1(record.working_days),
+        "net_payable_days": _fmt_day_1(record.paid_days),
         "doj": pick("DOJ", "doj", "DATE_OF_JOINING", em_keys=("doj", "date_of_joining")),
         "uan": profile.uan or pick("UAN", "PF_UAN", em_keys=("uan",)),
         "pay_mode": pick("PAY_MODE", "pay_mode", em_keys=("pay_mode",)),
@@ -596,8 +608,8 @@ def _build_fallback_raw_pdf(record) -> bytes:
         f"Location: {getattr(record.location, 'name', '')}",
         f"Status: {record.status}",
         "",
-        f"Month Days: {record.month_days}  Working: {record.working_days}",
-        f"Present: {record.present_days}  Half: {record.half_days}  Absent: {record.absent_days}  Paid: {record.paid_days}",
+        f"Month Days: {_fmt_day_1(record.month_days)}  Working: {_fmt_day_1(record.working_days)}",
+        f"Present: {_fmt_day_1(record.present_days)}  Half: {_fmt_day_1(record.half_days)}  Absent: {_fmt_day_1(record.absent_days)}  Paid: {_fmt_day_1(record.paid_days)}",
         "",
         f"Gross: {record.gross_salary}  Earnings: {record.total_earnings}",
         f"Deductions: {record.total_deductions}  Net: {record.net_pay}",

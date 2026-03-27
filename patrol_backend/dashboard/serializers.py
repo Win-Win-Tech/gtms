@@ -218,17 +218,29 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get('request')
-        # Keep count fields meaningful even if stored counters are stale.
+        # Keep count/state meaningful even when denormalized DB summary fields are stale.
         pairs = data.get("log_pairs") or []
-        if (data.get("checkin_count") in (None, 0)) and pairs:
-            data["checkin_count"] = len(pairs)
-        if (data.get("checkout_count") in (None, 0)) and pairs:
-            data["checkout_count"] = sum(1 for p in pairs if p.get("checkout_time"))
+        if pairs:
+            checkins_from_pairs = len(pairs)
+            checkouts_from_pairs = sum(1 for p in pairs if p.get("checkout_time"))
+            if (data.get("checkin_count") in (None, 0)):
+                data["checkin_count"] = checkins_from_pairs
+            if (data.get("checkout_count") in (None, 0)):
+                data["checkout_count"] = checkouts_from_pairs
 
-        # Derive live state from effective checkin/checkout refs.
-        eff_checkin = data.get("last_checkin_time") or data.get("checkin_time")
-        eff_checkout = data.get("last_checkout_time") or data.get("checkout_time")
-        data["live_state"] = "checked_in" if (eff_checkin and (not eff_checkout or eff_checkin > eff_checkout)) else "checked_out"
+            has_open_session = any(not p.get("checkout_time") for p in pairs)
+            data["live_state"] = "checked_in" if has_open_session else "checked_out"
+
+            if not data.get("last_checkin_time"):
+                data["last_checkin_time"] = pairs[-1].get("checkin_time")
+            if not data.get("last_checkout_time"):
+                closed = [p for p in pairs if p.get("checkout_time")]
+                if closed:
+                    data["last_checkout_time"] = closed[-1].get("checkout_time")
+        else:
+            eff_checkin = data.get("last_checkin_time") or data.get("checkin_time")
+            eff_checkout = data.get("last_checkout_time") or data.get("checkout_time")
+            data["live_state"] = "checked_in" if (eff_checkin and (not eff_checkout or eff_checkin > eff_checkout)) else "checked_out"
 
         if request:
             user_tz = get_user_timezone_from_request(request)

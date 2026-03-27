@@ -28,9 +28,11 @@ from .serializers import (
     PayslipMarkPaidSerializer,
     PayslipApproveSerializer,
     PayslipReopenSerializer,
+    PayslipRecordAttendanceEditSerializer,
 )
 from .services import calculate_attendance_from_master, calculate_salary_fields
 from .pdf_utils import build_simple_payslip_pdf_bytes
+from decimal import Decimal
 
 
 def _is_admin_like(user):
@@ -832,4 +834,70 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
 
         download_name = f"payslip_{record.month}_{record.user_id}.pdf"
         return FileResponse(file_handle, as_attachment=True, filename=download_name, content_type="application/pdf")
+
+    @action(detail=True, methods=["post"], url_path="edit-attendance")
+    def edit_attendance(self, request, pk=None):
+        try:
+            record = PayslipRecord.objects.get(pk=pk)
+        except PayslipRecord.DoesNotExist:
+            return Response({"error": "Payslip record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not self._can_edit_record(record):
+            return Response({"error": "This payslip cannot be edited in current state."}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = PayslipRecordAttendanceEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        present_days = Decimal(data["present_days"])
+        half_days = Decimal(data["half_days"])
+        absent_days = Decimal(data["absent_days"])
+        working_days = present_days + absent_days + (half_days * Decimal("0.5"))
+        paid_days = present_days + (half_days * Decimal("0.5"))
+
+        month_days = Decimal(str(record.month_days or 0))
+        if working_days > month_days:
+            return Response(
+                {
+                    "error": (
+                        f"Invalid days: present + absent + (half x 0.5) ({working_days}) "
+                        f"cannot exceed month days ({month_days})."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        attendance_snapshot = {
+            "month_days": record.month_days,
+            "working_days": working_days,
+            "present_days": present_days,
+            "half_days": half_days,
+            "absent_days": absent_days,
+            "paid_days": paid_days,
+        }
+
+        fields = PayslipField.objects.filter(
+            field_config=record.field_config,
+            is_deleted=False,
+            is_visible=True,
+        ).order_by("display_order")
+        calc = calculate_salary_fields(record.gross_salary, fields, attendance_snapshot)
+
+        with transaction.atomic():
+            record.working_days = working_days
+            record.present_days = present_days
+            record.half_days = half_days
+            record.absent_days = absent_days
+            record.paid_days = paid_days
+            record.total_earnings = calc["total_earnings"]
+            record.total_deductions = calc["total_deductions"]
+            record.net_pay = calc["net_pay"]
+            record.field_values = calc["field_values"]
+            record.attendance_snapshot = {
+                k: str(v) if hasattr(v, "quantize") else v for k, v in attendance_snapshot.items()
+            }
+            self._save_pdf_snapshot(record)
+            record.save()
+
+        return Response(PayslipRecordSerializer(record).data, status=status.HTTP_200_OK)
 
