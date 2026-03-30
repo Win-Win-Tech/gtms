@@ -309,7 +309,7 @@ def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org
     attendance.save()
 
 
-def _attendance_v3_response_extras(attendance, summary, user_tz, request):
+def _attendance_v3_response_extras(attendance, summary, user_tz, request, shift=None, window_end_utc=None):
     """Build flat dict for shift_today_v3 / nested under attendance in checkin_v3 responses."""
     req = request
 
@@ -336,7 +336,11 @@ def _attendance_v3_response_extras(attendance, summary, user_tz, request):
         "checkin_count": summary.get("checkin_count") or 0,
         "checkout_count": summary.get("checkout_count") or 0,
         "live_state": summary.get("live_state"),
-        "pa_status": _attendance_v3_compute_pa_status_from_summary(summary, attendance.shift),
+        "pa_status": _attendance_v3_compute_pa_status_from_summary(
+            summary,
+            (attendance.shift if attendance else shift),
+            window_end_utc=window_end_utc,
+        ),
         "checkin_image": _img_url(attendance.checkin_image) if attendance else None,
         "checkout_image": _img_url(attendance.checkout_image) if attendance else None,
     }
@@ -1161,7 +1165,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         summary = _attendance_v3_compute_from_logs(
             user, assignment, shift, location, search_start_utc, search_end_utc
         )
-        extras = _attendance_v3_response_extras(attendance, summary, user_tz, request)
+        extras = _attendance_v3_response_extras(
+            attendance,
+            summary,
+            user_tz,
+            request,
+            shift=shift,
+            window_end_utc=search_end_utc,
+        )
 
         return Response({
             "has_shift": True,
