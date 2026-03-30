@@ -24,9 +24,9 @@ def parse_month(month_str: str):
 
 def calculate_attendance_from_master(user, month_str, user_tz):
     """
-    Current GTMS rule (without LMS):
+    Current GTMS rule:
     - working_days = full month days
-    - present/half/absent derived from AttendanceCheckin.pa_status
+    - present/absent from AttendanceCheckin.pa_status (P/A); OW days do not add to either until closed
     - absent for no-entry days in month
     """
     _, _, month_start, month_end = parse_month(month_str)
@@ -74,7 +74,6 @@ def calculate_attendance_from_master(user, month_str, user_tz):
         }
 
     present_days = Decimal("0")
-    half_days = Decimal("0")
     absent_days = Decimal("0")
 
     current = month_start
@@ -82,9 +81,11 @@ def calculate_attendance_from_master(user, month_str, user_tz):
         st = (day_status.get(current) or {}).get("pa_status")
         if st == "P":
             present_days += Decimal("1")
-        elif st == "HA":
-            half_days += Decimal("1")
-        elif st == "A":
+        elif st == "OW":
+            # Shift not finished in payroll sense — do not count as full present/absent here.
+            pass
+        elif st in ("A", "M"):
+            # Absent or missed checkout should be treated as absent for payroll.
             absent_days += Decimal("1")
         else:
             # no master entry/mark -> absent under current business rule
@@ -92,7 +93,8 @@ def calculate_attendance_from_master(user, month_str, user_tz):
         current += timedelta(days=1)
 
     working_days = Decimal(str(month_days))
-    paid_days = present_days + (half_days * Decimal("0.5"))
+    half_days = Decimal("0")
+    paid_days = present_days
 
     return {
         "month_days": month_days,

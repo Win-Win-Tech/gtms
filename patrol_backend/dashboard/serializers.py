@@ -128,6 +128,8 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     live_state = serializers.SerializerMethodField()
     log_pairs = serializers.SerializerMethodField()
     shift_date = serializers.DateField(read_only=True)
+    checkin_image = serializers.SerializerMethodField()
+    checkout_image = serializers.SerializerMethodField()
 
     class Meta:
         model = AttendanceCheckin
@@ -153,6 +155,8 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             "assignment",
             "shift_time",
             "shift_date",
+            "checkin_image",
+            "checkout_image",
         ]
 
     def get_shift_time(self, obj):
@@ -165,6 +169,24 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
         if checkin_ref and (not checkout_ref or checkin_ref > checkout_ref):
             return "checked_in"
         return "checked_out"
+
+    def _abs_media_url(self, file_field):
+        if not file_field or not getattr(file_field, "name", None):
+            return None
+        try:
+            u = file_field.url
+        except Exception:
+            return None
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(u)
+        return u
+
+    def get_checkin_image(self, obj):
+        return self._abs_media_url(obj.checkin_image)
+
+    def get_checkout_image(self, obj):
+        return self._abs_media_url(obj.checkout_image)
 
     def get_log_pairs(self, obj):
         request = self.context.get('request')
@@ -258,6 +280,20 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             if instance.last_checkout_time:
                 data['last_checkout_time'] = to_user_timezone(instance.last_checkout_time, user_tz).isoformat()
         return data
+
+
+class AttendanceBoundaryEditSerializer(serializers.Serializer):
+    attendance_id = serializers.UUIDField(required=True)
+    first_checkin_time = serializers.CharField(required=False, allow_blank=False)
+    last_checkout_time = serializers.CharField(required=False, allow_blank=False)
+    reason = serializers.CharField(required=True, allow_blank=False, trim_whitespace=True)
+
+    def validate(self, attrs):
+        if not attrs.get("first_checkin_time") and not attrs.get("last_checkout_time"):
+            raise serializers.ValidationError(
+                {"non_field_errors": ["Provide first_checkin_time and/or last_checkout_time."]}
+            )
+        return attrs
 
 class CheckInReportSerializer(serializers.Serializer):
     date = serializers.CharField()

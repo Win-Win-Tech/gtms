@@ -76,6 +76,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'dashboard.middleware.AuditActorMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -272,22 +273,26 @@ CELERY_ENABLE_UTC = True  # Use UTC for Celery to match Django
 from celery.schedules import crontab
 
 CELERY_BEAT_SCHEDULE = {
-    'send-daily-checkin-report': {
-        'task': 'reports.tasks.email_daily_checkin_report',
-        # 'schedule': crontab(hour=8, minute=0),  # Run every day at 8:00 AM
-        # Alternative schedules:
-        'schedule': crontab(hour=23, minute=59),  # Daily at 11:59 PM
-        # 'schedule': crontab(minute='*/2'),  # Every 5 minutes (for testing)
-        # 'schedule': crontab(hour='*/2'),  # Every 2 hours
-        # 'schedule': crontab(day_of_week='monday', hour=9, minute=0),  # Every Monday at 9 AM
-    },
-    'send-monthly-attendance-summary': {
-        'task': 'reports.tasks.email_monthly_attendance_summary',
-        'schedule': crontab(day_of_month=1, hour=0, minute=30),  # 1st of every month at 12:30 AM
-        # This runs on the 1st day of each month and reports on the previous month
-        # Alternative schedules:
-        # 'schedule': crontab(day_of_month=1, hour=9, minute=0),  # 1st of month at 9:00 AM
-        # 'schedule': crontab(minute='*/5'),  # Every 5 minutes (for testing)
+    # 'send-daily-checkin-report': {
+    #     'task': 'reports.tasks.email_daily_checkin_report',
+    #     # 'schedule': crontab(hour=8, minute=0),  # Run every day at 8:00 AM
+    #     # Alternative schedules:
+    #     'schedule': crontab(hour=23, minute=59),  # Daily at 11:59 PM
+    #     # 'schedule': crontab(minute='*/2'),  # Every 5 minutes (for testing)
+    #     # 'schedule': crontab(hour='*/2'),  # Every 2 hours
+    #     # 'schedule': crontab(day_of_week='monday', hour=9, minute=0),  # Every Monday at 9 AM
+    # },
+    # 'send-monthly-attendance-summary': {
+    #     'task': 'reports.tasks.email_monthly_attendance_summary',
+    #     'schedule': crontab(day_of_month=1, hour=0, minute=30),  # 1st of every month at 12:30 AM
+    #     # This runs on the 1st day of each month and reports on the previous month
+    #     # Alternative schedules:
+    #     # 'schedule': crontab(day_of_month=1, hour=9, minute=0),  # 1st of month at 9:00 AM
+    #     # 'schedule': crontab(minute='*/5'),  # Every 5 minutes (for testing)
+    # },
+    'mark-missed-checkout-v3': {
+        'task': 'dashboard.tasks.mark_missed_checkout_v3',
+        'schedule': crontab(minute='*/5'),
     },
 }
 

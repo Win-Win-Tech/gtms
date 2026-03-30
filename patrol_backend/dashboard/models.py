@@ -13,8 +13,9 @@ class AttendanceCheckin(models.Model):
     ]
     PA_STATUS_CHOICES = [
         ("P", "Present"),
-        ("HA", "Half Day"),
         ("A", "Absent"),
+        ("OW", "On Work"),
+        ("M", "Missed Checkout"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -53,7 +54,7 @@ class AttendanceCheckin(models.Model):
     duration_minutes = models.IntegerField(null=True, blank=True)
     checkin_count = models.IntegerField(default=0)
     checkout_count = models.IntegerField(default=0)
-    # Working-duration based attendance mark for web P/HA/A view.
+    # Working-duration based attendance mark for web P/A/OW view.
     # - computed from CheckInLog pairs inside the shift window
     # - set after checkout (while check-in only, may remain null)
     pa_status = models.CharField(
@@ -78,6 +79,15 @@ class AttendanceCheckin(models.Model):
 
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)
+    edited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attendance_edits",
+    )
+    edited_on = models.DateTimeField(null=True, blank=True, db_index=True)
+    edit_reason = models.TextField(null=True, blank=True)
 
     def save(self, *args, **kwargs):
         """Auto update status based on checkin/checkout"""
@@ -115,3 +125,45 @@ class CheckInLog(models.Model):
 
     def __str__(self):
         return f"{self.guard} - {self.type} @ {self.timestamp}"
+
+
+class GlobalAuditLog(models.Model):
+    EVENT_CHOICES = [
+        ("create", "Create"),
+        ("update", "Update"),
+        ("delete", "Delete"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    app_label = models.CharField(max_length=100, db_index=True)
+    model_name = models.CharField(max_length=120, db_index=True)
+    object_pk = models.CharField(max_length=100, db_index=True)
+    event_type = models.CharField(max_length=10, choices=EVENT_CHOICES, db_index=True)
+
+    # requested for fast scoped queries
+    location_id = models.UUIDField(null=True, blank=True, db_index=True)
+
+    old_data = models.JSONField(null=True, blank=True)
+    new_data = models.JSONField(null=True, blank=True)
+    changed_fields = models.JSONField(null=True, blank=True)
+
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="global_audit_logs",
+    )
+    changed_on = models.DateTimeField(auto_now_add=True, db_index=True)
+    source = models.CharField(max_length=30, default="api", db_index=True)  # api/system/celery/unknown
+
+    class Meta:
+        ordering = ["-changed_on"]
+        indexes = [
+            models.Index(fields=["app_label", "model_name", "object_pk"]),
+            models.Index(fields=["location_id", "changed_on"]),
+            models.Index(fields=["event_type", "changed_on"]),
+        ]
+
+    def __str__(self):
+        return f"{self.app_label}.{self.model_name}:{self.object_pk} [{self.event_type}]"

@@ -18,6 +18,7 @@ from openpyxl import Workbook
 # Django imports
 from django.conf import settings
 from django.core.serializers import serialize
+from django.db import transaction
 from django.db.models import Avg, Count, F, Q
 from django.http import HttpResponse
 from django.utils import timezone
@@ -57,6 +58,7 @@ from patrol_backend.utils.timezone_utils import (
 
 from .models import AttendanceCheckin, CheckInLog
 from .serializers import (
+    AttendanceBoundaryEditSerializer,
     AttendanceCheckinDashboardSerializer,
     AttendanceCheckinDashboardV3Serializer,
     AttendanceCheckinSerializer,
@@ -240,60 +242,52 @@ def _attendance_v3_shift_window_utc(shift_start_date, shift, user_tz, location_i
     search_end_utc = (shift_end_dt_user + timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
     return search_start_utc, search_end_utc, shift_start_dt_user, shift_end_dt_user, grace_minutes
 
-def _attendance_v3_compute_pa_status_from_duration(duration_minutes, location_id=None):
+def _shift_required_duration_minutes(shift):
+    """Scheduled shift length in minutes (supports overnight shifts)."""
+    if not shift:
+        return 0
+    base = date(2000, 1, 1)
+    start_dt = datetime.combine(base, shift.start_time)
+    if shift.end_time <= shift.start_time:
+        end_dt = datetime.combine(base + timedelta(days=1), shift.end_time)
+    else:
+        end_dt = datetime.combine(base, shift.end_time)
+    return max(0, int((end_dt - start_dt).total_seconds() // 60))
+
+
+def _attendance_v3_compute_pa_status_from_duration(duration_minutes, shift, _location_id=None):
     """
-    Map worked duration to P/HA (A is handled by missing check-in/checkout).
-
-    Rules (your requirement):
-    - A  : duration_hours <= absent_max_hours
-    - HA : absent_max_hours < duration_hours <= half_day_max_hours
-    - P  : duration_hours > half_day_max_hours
-
-    Values are read from SiteSetting (per-location), with safe defaults:
-    - absent_max_hours default 2
-    - half_day_max_hours default 6
-    - present_min_hours default 8 (kept for future compatibility)
+    After checkout: compare total worked minutes to scheduled shift length.
+    - P : duration >= shift length
+    - A : duration < shift length
     """
     if duration_minutes is None:
         return None
     try:
-        hours = float(duration_minutes) / 60.0
+        worked = int(duration_minutes)
     except (TypeError, ValueError):
         return None
-
-    absent_max_hours = _get_site_setting_int(
-        key="absent_max_hours",
-        location_id=location_id,
-        default_value=2,
-    )
-    half_day_max_hours = _get_site_setting_int(
-        key="half_day_max_hours",
-        location_id=location_id,
-        default_value=6,
-    )
-    _present_min_hours = _get_site_setting_int(
-        key="present_min_hours",
-        location_id=location_id,
-        default_value=8,
-    )
-
-    if hours <= absent_max_hours:
+    required = _shift_required_duration_minutes(shift)
+    if required <= 0:
         return "A"
-    if hours <= half_day_max_hours:
-        return "HA"
-    return "P"
+    return "P" if worked >= required else "A"
 
 
-def _attendance_v3_compute_pa_status_from_summary(summary, location_id=None):
+def _attendance_v3_compute_pa_status_from_summary(summary, shift, _location_id=None, window_end_utc=None):
     """
-    Only mark P/HA/A when shift has a checkout (final duration).
-    While a guard is still on shift (no checkout yet), pa_status stays null.
+    - OW: open session (still checked in / no closing checkout in window).
+    - P/A: after checkout — worked duration vs scheduled shift length.
     """
     if not summary:
         return None
-    if not summary.get("last_checkout_time"):
-        return None
-    return _attendance_v3_compute_pa_status_from_duration(summary.get("duration_minutes"), location_id=location_id)
+    if summary.get("live_state") == "checked_in" or not summary.get("last_checkout_time"):
+        # Still open.
+        if window_end_utc and timezone.now() >= window_end_utc:
+            return "M"
+        return "OW"
+    return _attendance_v3_compute_pa_status_from_duration(
+        summary.get("duration_minutes"), shift
+    )
 
 
 def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc):
@@ -307,7 +301,10 @@ def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org
     attendance.checkin_count = summary.get("checkin_count") or 0
     attendance.checkout_count = summary.get("checkout_count") or 0
     attendance.pa_status = _attendance_v3_compute_pa_status_from_summary(
-        summary, location_id=getattr(org_location, "id", None)
+        summary,
+        shift,
+        _location_id=None,
+        window_end_utc=search_end_utc,
     )
     attendance.save()
 
@@ -339,10 +336,7 @@ def _attendance_v3_response_extras(attendance, summary, user_tz, request):
         "checkin_count": summary.get("checkin_count") or 0,
         "checkout_count": summary.get("checkout_count") or 0,
         "live_state": summary.get("live_state"),
-        "pa_status": _attendance_v3_compute_pa_status_from_summary(
-            summary,
-            location_id=getattr(attendance, "org_location_id", None),
-        ),
+        "pa_status": _attendance_v3_compute_pa_status_from_summary(summary, attendance.shift),
         "checkin_image": _img_url(attendance.checkin_image) if attendance else None,
         "checkout_image": _img_url(attendance.checkout_image) if attendance else None,
     }
@@ -357,8 +351,10 @@ def _apply_attendance_v3_status_filter(queryset, status_value):
     v = str(status_value).strip().lower()
     if v == "present":
         return queryset.filter(pa_status="P")
-    if v in ("half_day", "halfday"):
-        return queryset.filter(pa_status="HA")
+    if v in ("on_work", "onwork", "ow"):
+        return queryset.filter(pa_status="OW")
+    if v in ("missed", "m", "missed_checkout"):
+        return queryset.filter(pa_status="M")
     if v == "absent":
         return queryset.filter(pa_status="A")
     if v == "checked_out":
@@ -1872,6 +1868,151 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         })
         return Response(response_data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["post"], url_path="edit-boundary_v3")
+    def edit_boundary_v3(self, request):
+        """
+        Edit first check-in and/or last checkout boundary for a closed v3 session.
+        Requires reason and admin/SO/FO role.
+        """
+        actor = request.user
+        actor_role = getattr(actor, "role", None)
+        allowed_roles = {"admin", "so", "fo"}
+        if not (getattr(actor, "is_superuser", False) or actor_role in allowed_roles):
+            return Response({"error": "Only admin/SO/FO can edit boundaries"}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = AttendanceBoundaryEditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        attendance = AttendanceCheckin.objects.select_related(
+            "guard", "assignment", "shift", "org_location"
+        ).filter(id=data["attendance_id"]).first()
+        if not attendance:
+            return Response({"error": "Attendance record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(actor, "is_superuser", False):
+            if str(getattr(actor, "location_id", "")) != str(getattr(attendance.guard, "location_id", "")):
+                return Response(
+                    {"error": "You can only edit guards in your organization"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        guard = attendance.guard
+        assignment = attendance.assignment
+        shift = attendance.shift
+        org_location = attendance.org_location
+
+        guard_tz = get_user_timezone_from_request(request, location_id=getattr(guard, "location_id", None))
+        if attendance.shift_date:
+            shift_start_date = attendance.shift_date
+        elif attendance.checkin_time:
+            shift_start_date = _attendance_v3_compute_shift_date(to_user_timezone(attendance.checkin_time, guard_tz), shift)
+        else:
+            shift_start_date = to_user_timezone(attendance.created_on, guard_tz).date()
+
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, guard_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        logs = list(
+            CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("timestamp")
+        )
+        if not logs:
+            return Response({"error": "No checkin/checkout logs found in shift window"}, status=status.HTTP_400_BAD_REQUEST)
+
+        checkins = [l for l in logs if l.type == "checkin"]
+        checkouts = [l for l in logs if l.type == "checkout"]
+        if not checkins or not checkouts:
+            return Response({"error": "Cannot edit boundaries for incomplete session"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(checkins) != len(checkouts):
+            return Response({"error": "Cannot edit while session is open (checkin/checkout count mismatch)"}, status=status.HTTP_400_BAD_REQUEST)
+        if checkouts[-1].timestamp < checkins[-1].timestamp:
+            return Response({"error": "Cannot edit while latest session is still open"}, status=status.HTTP_400_BAD_REQUEST)
+
+        def _parse_to_utc(raw_value, label):
+            if raw_value in (None, ""):
+                return None
+            try:
+                s = str(raw_value).strip().replace("Z", "+00:00")
+                parsed = datetime.fromisoformat(s)
+                if parsed.tzinfo is None:
+                    parsed = guard_tz.localize(parsed)
+                out = parsed.astimezone(pytz.UTC)
+            except Exception:
+                raise ValueError(f"Invalid {label}. Use ISO datetime format.")
+            if out < search_start_utc or out >= search_end_utc:
+                raise ValueError(f"{label} must be inside the shift window.")
+            return out
+
+        try:
+            new_first_checkin_utc = _parse_to_utc(data.get("first_checkin_time"), "first_checkin_time")
+            new_last_checkout_utc = _parse_to_utc(data.get("last_checkout_time"), "last_checkout_time")
+        except ValueError as ex:
+            return Response({"error": str(ex)}, status=status.HTTP_400_BAD_REQUEST)
+
+        first_checkin_log = checkins[0]
+        last_checkout_log = checkouts[-1]
+        final_first = new_first_checkin_utc or first_checkin_log.timestamp
+        final_last = new_last_checkout_utc or last_checkout_log.timestamp
+        if final_last < final_first:
+            return Response(
+                {"error": "last_checkout_time cannot be earlier than first_checkin_time"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            if new_first_checkin_utc:
+                CheckInLog.objects.filter(id=first_checkin_log.id).update(timestamp=new_first_checkin_utc)
+            if new_last_checkout_utc:
+                CheckInLog.objects.filter(id=last_checkout_log.id).update(timestamp=new_last_checkout_utc)
+
+            refreshed_first = CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkin",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("timestamp").first()
+            refreshed_last = CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkout",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("-timestamp").first()
+
+            attendance.checkin_time = refreshed_first.timestamp if refreshed_first else attendance.checkin_time
+            attendance.checkout_time = refreshed_last.timestamp if refreshed_last else attendance.checkout_time
+            attendance.shift_date = shift_start_date
+            attendance.edited_by = actor
+            attendance.edited_on = timezone.now()
+            attendance.edit_reason = data["reason"]
+            attendance.save()
+
+            _attendance_v3_refresh_saved_fields(
+                attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+        response_data = AttendanceCheckinSerializer(attendance, context={"request": request}).data
+        response_data.update({
+            "edited": True,
+            "edited_by": str(actor.id),
+            "edited_by_role": actor_role,
+            "edit_reason": data["reason"],
+        })
+        return Response(response_data, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=["get"])
     def list_default_shifts(self, request):
         """
@@ -3208,30 +3349,24 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
             hours, remainder = divmod(delta.total_seconds(), 3600)
             minutes = remainder // 60
             duration = f"{int(hours):02}:{int(minutes):02}"
+            # Compare first-checkin → last-checkout duration to scheduled shift length (hours).
+            if shift:
+                req_hours = _shift_required_duration_minutes(shift) / 60.0
+                if req_hours > 0:
+                    if total_hours >= req_hours:
+                        attendance_status = "Present"
+                    else:
+                        attendance_status = "Absent"
+                else:
+                    attendance_status = ""
+            else:
+                attendance_status = ""
+
             grace_minutes = _get_site_setting_int(
                 key="shift_grace_time",
                 location_id=getattr(obj, "org_location_id", None),
                 default_value=30,
             )
-
-            absent_max_hours = _get_site_setting_int(
-                key="absent_max_hours",
-                location_id=getattr(obj, "org_location_id", None),
-                default_value=2,
-            )
-            half_day_max_hours = _get_site_setting_int(
-                key="half_day_max_hours",
-                location_id=getattr(obj, "org_location_id", None),
-                default_value=6,
-            )
-
-            # Attendance Status
-            if total_hours <= absent_max_hours:
-                attendance_status = "Absent"
-            elif total_hours <= half_day_max_hours:
-                attendance_status = "Present"
-            else:
-                attendance_status = "Overtime"
 
             # Check-in Timing
             if shift_start:
@@ -3432,7 +3567,7 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
         if obj.duration_minutes is not None:
             minutes_total = int(obj.duration_minutes)
             duration = f"{minutes_total // 60:02}:{minutes_total % 60:02}"
-        pa_map = {"P": "Present", "HA": "Half Day", "A": "Absent"}
+        pa_map = {"P": "Present", "A": "Absent", "OW": "On Work", "M": "Missed Checkout"}
         pa_text = pa_map.get(obj.pa_status, "")
         live_state = "Checked In" if (
             obj.last_checkin_time and (not obj.last_checkout_time or obj.last_checkin_time > obj.last_checkout_time)
@@ -3703,11 +3838,17 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
                 row[date.strftime("%d-%b")] = attendance.pa_status
             elif attendance.checkout_time or attendance.last_checkout_time:
                 # Fallback for any records created before the new persist logic.
-                row[date.strftime("%d-%b")] = _attendance_v3_compute_pa_status_from_duration(attendance.duration_minutes) or "HA"
+                row[date.strftime("%d-%b")] = (
+                    _attendance_v3_compute_pa_status_from_duration(
+                        attendance.duration_minutes, attendance.shift
+                    )
+                    or "A"
+                )
             else:
-                # Still on duty (checked in but no checkout yet): keep old behavior as "P".
-                # If there's no checkin at all, mark as "A".
-                row[date.strftime("%d-%b")] = "P" if (attendance.checkin_time or attendance.last_checkin_time) else "A"
+                # Still on duty (checked in but no checkout yet).
+                row[date.strftime("%d-%b")] = (
+                    "OW" if (attendance.checkin_time or attendance.last_checkin_time) else "A"
+                )
 
         summary_data.append(row)
 
