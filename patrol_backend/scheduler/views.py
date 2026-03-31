@@ -38,6 +38,29 @@ logger = logging.getLogger(__name__)
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
     serializer_class = LocationSerializer
+    
+    def perform_create(self, serializer):
+        # Save the new location
+        instance = serializer.save(created_by=self.request.user)
+        
+        # Explicitly duplicate default roles for this new location
+        try:
+            from authapp.models import Role
+            global_roles = Role.objects.filter(location__isnull=True)
+            for g_role in global_roles:
+                Role.objects.get_or_create(
+                    name=g_role.name,
+                    location=instance,
+                    defaults={
+                        'is_default': g_role.is_default,
+                        'is_allow_webapp': g_role.is_allow_webapp,
+                        'pages': g_role.pages
+                    }
+                )
+            logger.info(f"Successfully duplicated default roles for new organization: {instance.name}")
+        except Exception as e:
+            logger.error(f"Failed to duplicate roles for location {instance.id}: {str(e)}")
+
 
     def get_queryset(self):
         try:

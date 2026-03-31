@@ -4,7 +4,22 @@ from django.db import models
 from django.utils.timezone import now
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 from django.conf import settings
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from scheduler.models import Location  
+
+class Role(models.Model):
+    name = models.CharField(max_length=100)
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, null=True, blank=True, related_name='roles')
+    is_default = models.BooleanField(default=False, help_text="True if this is a system default role (Admin, SO, FO, Guard)")
+    is_allow_webapp = models.BooleanField(default=False, help_text="True if this role allows web panel access")
+    pages = models.JSONField(default=list, blank=True, help_text="List of menu strings (e.g., ['Dashboard', 'Users'])")
+
+    class Meta:
+        unique_together = ('name', 'location')
+
+    def __str__(self):
+        return f"{self.name} - {self.location.name if self.location else 'Global'}"
 
 
 class UserManager(BaseUserManager):
@@ -24,19 +39,15 @@ class UserManager(BaseUserManager):
 
 
 class User(AbstractBaseUser, PermissionsMixin):
-    ROLE_CHOICES = [
-        ('admin', 'Admin'),
-        ('guard', 'Guard'),
-        ('so', 'So'),
-        ('fo', 'Fo'),
-    ]
-
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     aadhar_no = models.CharField(max_length=20, blank=True, null=True, unique=True)
     email = models.EmailField(max_length=255, unique=True, null=True)
     name = models.CharField(max_length=255, blank=True)
     phone_no = models.CharField(max_length=20, blank=True, null=True, unique=True)
-    role = models.CharField(max_length=32, choices=ROLE_CHOICES, default='guard')
+    
+    # Role is sent from the frontend, dynamically driven by the Role table
+    role = models.CharField(max_length=32, default='guard')
+    
     location = models.ForeignKey(
         Location,
         on_delete=models.SET_NULL,
@@ -87,8 +98,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     objects = UserManager()
 
     @classmethod
-    def get_by_roles(cls, roles):
-        return cls.objects.filter(role__in=roles, is_deleted=False)
+    def get_by_roles(cls, role_names):
+        return cls.objects.filter(role__name__in=role_names, is_deleted=False)
 
     def delete(self, user=None, using=None, keep_parents=False):
         """Override delete method for soft delete"""
@@ -104,7 +115,9 @@ class User(AbstractBaseUser, PermissionsMixin):
         old_timezone = None
         location_to_sync = None
         
-        if is_update and self.role == 'admin':
+        is_admin = self.role and self.role.name.lower() == 'admin'
+        
+        if is_update and is_admin:
             try:
                 old_instance = User.objects.get(pk=self.pk)
                 old_timezone = old_instance.timezone
@@ -115,19 +128,38 @@ class User(AbstractBaseUser, PermissionsMixin):
         super().save(*args, **kwargs)
         
         # If admin's timezone changed, update all users in same location
-        if is_update and self.role == 'admin' and location_to_sync:
+        if is_update and is_admin and location_to_sync:
             if old_timezone != self.timezone and self.timezone:
                 # Update all non-admin users in this location
                 User.objects.filter(
                     location=location_to_sync,
-                    role__in=['guard', 'so', 'fo'],
+                    role__name__in=['Guard', 'So', 'Fo'],
                     is_deleted=False
                 ).exclude(id=self.id).update(timezone=self.timezone)
 
     def __str__(self):
-        return f"{self.email} ({self.role})"
+        role_name = self.role.name if self.role else "No Role"
+        return f"{self.email} ({role_name})"
 
     class Meta:
         indexes = [
             models.Index(fields=['is_deleted']),
         ]
+
+
+
+
+@receiver(post_save, sender=Role)
+def propagate_new_global_role(sender, instance, created, **kwargs):
+    """When a global role template is created, copy it to all existing locations."""
+    if created and instance.location is None:
+        for loc in Location.objects.filter(is_deleted=False):
+            Role.objects.get_or_create(
+                name=instance.name,
+                location=loc,
+                defaults={
+                    'is_default': instance.is_default,
+                    'is_allow_webapp': instance.is_allow_webapp,
+                    'pages': instance.pages
+                }
+            )

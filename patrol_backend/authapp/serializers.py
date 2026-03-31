@@ -1,6 +1,12 @@
 from rest_framework import serializers
-from .models import User
+from .models import User, Role
 from scheduler.serializers import LocationSerializer as SchedulerLocationSerializer
+
+class RoleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Role
+        fields = ['id', 'name', 'location', 'is_default', 'is_allow_webapp', 'pages']
+        read_only_fields = ['id', 'location', 'is_default']
 
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)

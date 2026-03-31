@@ -1,13 +1,14 @@
-from rest_framework import generics, permissions, filters, status
+from rest_framework import generics, permissions, filters, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
-from .models import User
-from .serializers import UserSerializer
+from .models import User, Role
+from .serializers import UserSerializer, RoleSerializer
 from patrol_backend.utils.response import api_response
 from django.forms.models import model_to_dict 
+
 
 # 1. Create user
 class UserCreateView(generics.CreateAPIView):
@@ -94,13 +95,33 @@ class LoginView(APIView):
             if user:
                 refresh = RefreshToken.for_user(user)
                 # From location: False = use other check-in flow (no QR). No location = False so app doesn't assume QR.
+                # Fetch dynamic permissions and web app allowance from Role table
+                role_permissions = []
+                is_allow_webapp = False
+                
+                if user.role:
+                    # Look for Role specific to location
+                    role_obj = Role.objects.filter(name__iexact=user.role, location=user.location).first()
+                    
+                    if role_obj:
+                        role_permissions = role_obj.pages
+                        is_allow_webapp = role_obj.is_allow_webapp
+                        
+                # Auto-grant all permissions if user is Master Admin or Superadmin
+                if user.role and user.role.lower() in ['admin', 'superadmin']:
+                    role_permissions = ['Dashboard', 'Users', 'Organization', 'Payslip', 'Live Tracking', 'Incident', 'Settings']
+                    is_allow_webapp = True
+
                 is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
+
                 return Response(api_response("success", "Login successful", {
                     'access': str(refresh.access_token),
                     'refresh': str(refresh),
                     'user':model_to_dict(user, fields=[field.name for field in user._meta.fields]),
                     'user_id': str(user.id),
                     'role': user.role,
+                    'is_allow_webapp': is_allow_webapp,
+                    'permissions': role_permissions,
                     'is_superuser': user.is_superuser,
                     'location_id': str(user.location.id) if user.location else None,
                     'timezone': user.timezone,
@@ -149,12 +170,12 @@ class UserByRoleView(View):
     def get(self, request):
         roles = request.GET.getlist('roles')
         location_id = request.GET.get('location_id', None)
-        valid_roles = dict(User.ROLE_CHOICES).keys()
-        # Filter out invalid roles
-        roles = [role for role in roles if role in valid_roles]
-        print("roles:", roles )
+        
+        # We no longer strictly validate against hardcoded User.ROLE_CHOICES natively
         if not roles:
-            return JsonResponse({'error': 'No valid roles provided.'}, status=400)
+            return JsonResponse({'error': 'No roles provided.'}, status=400)
+        
+        # User.get_by_roles now filters by matching string names
         users = User.get_by_roles(roles)
             
         if location_id:
@@ -202,4 +223,57 @@ class TimezoneListView(APIView):
             },
             status.HTTP_200_OK
         ))
+
+class RoleViewSet(viewsets.ModelViewSet):
+    """
+    CRUD endpoint for Roles. Filters by the token's user.location or Global (superadmin).
+    """
+    serializer_class = RoleSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        location_id = self.request.query_params.get('location_id')
+
+        # If location_id is provided in params, fetch roles for that location
+        if location_id:
+            # Security: Non-superadmins should only fetch for their own location
+            if user.location and str(user.location.id) != location_id and not user.is_superuser:
+                return Role.objects.none()
+            return Role.objects.filter(location_id=location_id)
+        
+        # Default behavior:
+        # Superadmin (no location) manages Global role templates (NULL location)
+        if not user.location or (user.role and user.role.lower() == 'superadmin'):
+            return Role.objects.filter(location__isnull=True)
+
+        # Org Admin: Strictly manage roles for their own location
+        return Role.objects.filter(location=user.location)
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if not user.location or (user.role and user.role.lower() == 'superadmin'):
+            # Superadmin creates global default roles
+            serializer.save(location=None, is_default=True)
+        else:
+            # Org admin creates organization-specific role (override or custom)
+            serializer.save(location=user.location, is_default=False)
+            
+    def perform_update(self, serializer):
+        user = self.request.user
+        instance = self.get_object()
+        old_name = instance.name  # capture before save
+        
+        # Save changes directly (every role in the filtered queryset is already location-specific)
+        updated = serializer.save()
+
+        # If the role name changed, bulk-update all users who had the old role string
+        new_name = updated.name
+        if old_name.lower() != new_name.lower():
+            qs = User.objects.filter(role__iexact=old_name)
+            if user.location:
+                qs = qs.filter(location=user.location)
+            qs.update(role=new_name)
+
+
     
