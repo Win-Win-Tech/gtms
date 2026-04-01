@@ -21,6 +21,11 @@ class Role(models.Model):
     def __str__(self):
         return f"{self.name} - {self.location.name if self.location else 'Global'}"
 
+    def save(self, *args, **kwargs):
+        if self.name:
+            self.name = self.name.lower().strip()
+        super().save(*args, **kwargs)
+
 
 class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
@@ -99,7 +104,9 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     @classmethod
     def get_by_roles(cls, role_names):
-        return cls.objects.filter(role__name__in=role_names, is_deleted=False)
+        # role_names should be a list of lowercase strings
+        lower_roles = [r.lower().strip() for r in role_names]
+        return cls.objects.filter(role__in=lower_roles, is_deleted=False)
 
     def delete(self, user=None, using=None, keep_parents=False):
         """Override delete method for soft delete"""
@@ -111,11 +118,14 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def save(self, *args, **kwargs):
         """Override save to sync timezone for location users when admin timezone changes"""
+        if self.role:
+            self.role = self.role.lower().strip()
+            
         is_update = self.pk is not None
         old_timezone = None
         location_to_sync = None
         
-        is_admin = self.role and self.role.name.lower() == 'admin'
+        is_admin = self.role and self.role.lower() == 'admin'
         
         if is_update and is_admin:
             try:
@@ -133,12 +143,12 @@ class User(AbstractBaseUser, PermissionsMixin):
                 # Update all non-admin users in this location
                 User.objects.filter(
                     location=location_to_sync,
-                    role__name__in=['Guard', 'So', 'Fo'],
+                    role__in=['guard', 'so', 'fo'],
                     is_deleted=False
                 ).exclude(id=self.id).update(timezone=self.timezone)
 
     def __str__(self):
-        role_name = self.role.name if self.role else "No Role"
+        role_name = self.role if self.role else "No Role"
         return f"{self.email} ({role_name})"
 
     class Meta:

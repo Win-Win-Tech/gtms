@@ -107,9 +107,10 @@ class LoginView(APIView):
                         role_permissions = role_obj.pages
                         is_allow_webapp = role_obj.is_allow_webapp
                         
-                # Auto-grant all permissions if user is Master Admin or Superadmin
-                if user.role and user.role.lower() in ['admin', 'superadmin']:
-                    role_permissions = ['Dashboard', 'Users', 'Organization', 'Payslip', 'Live Tracking', 'Incident', 'Settings']
+                # Master superuser (is_superuser=True) gets all permissions if no role found
+                if user.is_superuser and not role_permissions:
+                    # Master fallback for pure superadmins (hardcoded to ensure access)
+                    role_permissions = ['Dashboard', 'Users', 'Organization', 'Payslip', 'Live Tracking', 'Incident', 'Settings', 'Role Management']
                     is_allow_webapp = True
 
                 is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
@@ -240,11 +241,18 @@ class RoleViewSet(viewsets.ModelViewSet):
             # Security: Non-superadmins should only fetch for their own location
             if user.location and str(user.location.id) != location_id and not user.is_superuser:
                 return Role.objects.none()
-            return Role.objects.filter(location_id=location_id)
+            
+            queryset = Role.objects.filter(location_id=location_id)
+            
+            # Security: Only superusers can see/assign the 'Admin' role
+            if not user.is_superuser:
+                queryset = queryset.exclude(name__iexact='admin')
+                
+            return queryset
         
         # Default behavior:
-        # Superadmin (no location) manages Global role templates (NULL location)
-        if not user.location or (user.role and user.role.lower() == 'superadmin'):
+        # Superuser or Superadmin (no location) manages Global role templates (NULL location)
+        if user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
             return Role.objects.filter(location__isnull=True)
 
         # Org Admin: Strictly manage roles for their own location
@@ -252,7 +260,7 @@ class RoleViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
-        if not user.location or (user.role and user.role.lower() == 'superadmin'):
+        if user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
             # Superadmin creates global default roles
             serializer.save(location=None, is_default=True)
         else:
@@ -262,13 +270,38 @@ class RoleViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         user = self.request.user
         instance = self.get_object()
-        old_name = instance.name  # capture before save
+        old_name = instance.name
+        old_pages = instance.pages or []
         
-        # Save changes directly (every role in the filtered queryset is already location-specific)
         updated = serializer.save()
-
-        # If the role name changed, bulk-update all users who had the old role string
         new_name = updated.name
+        new_pages = updated.pages or []
+        new_is_allow_webapp = updated.is_allow_webapp
+
+        # 1. CASCADE SYSTEM: If a Global Role Template (location=None) is modified
+        if updated.location is None:
+            # Sync by name: Update all roles with the same name across all locations
+            local_roles = Role.objects.filter(name__iexact=old_name).exclude(id=updated.id)
+            local_roles.update(
+                name=new_name,
+                pages=new_pages,
+                is_allow_webapp=new_is_allow_webapp
+            )
+
+            # Special case: Global Revocation
+            # If pages were REMOVED from the Global 'Admin' role, remove them from ALL roles globally
+            if old_name.lower() == 'admin':
+                removed_pages = [p for p in old_pages if p not in new_pages]
+                if removed_pages:
+                    all_roles = Role.objects.all().exclude(id=updated.id)
+                    for role in all_roles:
+                        if role.pages:
+                            updated_pages = [p for p in role.pages if p not in removed_pages]
+                            if len(updated_pages) != len(role.pages):
+                                role.pages = updated_pages
+                                role.save()
+
+        # 2. USER SYNC: If the role name changed, update the string field in the User model
         if old_name.lower() != new_name.lower():
             qs = User.objects.filter(role__iexact=old_name)
             if user.location:

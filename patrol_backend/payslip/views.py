@@ -63,20 +63,11 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
     def employees(self, request):
         """
         Return location-scoped employee list with payroll-profile presence.
-        Roles included by default: guard, so, fo (admin excluded).
+        Roles included by default: All non-admin roles (guard, so, fo, etc.)
         """
         requested_location_id = request.query_params.get("location_id")
         search = (request.query_params.get("search") or "").strip()
         roles_param = request.query_params.get("roles")
-
-        allowed_roles = {"guard", "so", "fo"}
-        if roles_param:
-            requested_roles = {r.strip().lower() for r in roles_param.split(",") if r.strip()}
-            roles = [r for r in requested_roles if r in allowed_roles]
-            if not roles:
-                roles = ["guard", "so", "fo"]
-        else:
-            roles = ["guard", "so", "fo"]
 
         if getattr(request.user, "is_superuser", False):
             effective_location_id = requested_location_id
@@ -85,10 +76,15 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             if not effective_location_id:
                 return Response({"error": "User has no assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
-        users_qs = User.objects.filter(
-            is_deleted=False,
-            role__in=roles,
-        ).select_related("location")
+        users_qs = User.objects.filter(is_deleted=False).select_related("location")
+
+        if roles_param:
+            requested_roles = [r.strip().lower() for r in roles_param.split(",") if r.strip()]
+            # This handles case-insensitive lookup since we now store in lowercase
+            users_qs = users_qs.filter(role__in=requested_roles)
+        else:
+            # Default: Show everyone EXCEPT admin
+            users_qs = users_qs.exclude(role__iexact='admin')
 
         if effective_location_id:
             users_qs = users_qs.filter(location_id=effective_location_id)

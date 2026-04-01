@@ -1078,6 +1078,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "show_checkin": False,
                 "show_checkout": False,
                 "message": "No shifts today",
+                "shift_name":None,
+                "shift_start": None,
+                "shift_end": None,
+                "location_name": None,
                 "last_checkin": None,
                 "last_checkout": None,
                 "duration_minutes": None,
@@ -1183,6 +1187,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "show_checkin": show_checkin,
             "show_checkout": show_checkout,
             "message": message,
+            "shift_name":shift.name,
             **extras,
         }, status=status.HTTP_200_OK)
 
