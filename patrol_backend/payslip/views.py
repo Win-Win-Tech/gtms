@@ -68,7 +68,6 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
         requested_location_id = request.query_params.get("location_id")
         search = (request.query_params.get("search") or "").strip()
         roles_param = request.query_params.get("roles")
-
         if getattr(request.user, "is_superuser", False):
             effective_location_id = requested_location_id
         else:
@@ -76,15 +75,26 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             if not effective_location_id:
                 return Response({"error": "User has no assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
-        users_qs = User.objects.filter(is_deleted=False).select_related("location")
+        roles_param = request.query_params.get("roles")
+        role_param = request.query_params.get("role")
+        search = (request.query_params.get("search") or "").strip()
+
+        # Start with base queryset
+        users_qs = User.objects.filter(is_active=True, is_deleted=False).select_related("location")
+
+        # Admin restriction: Only superusers see Admins in employee lists
+        if not request.user.is_superuser:
+            users_qs = users_qs.exclude(role__iexact='admin')
 
         if roles_param:
             requested_roles = [r.strip().lower() for r in roles_param.split(",") if r.strip()]
-            # This handles case-insensitive lookup since we now store in lowercase
             users_qs = users_qs.filter(role__in=requested_roles)
+        elif role_param and role_param.lower() != 'all':
+            users_qs = users_qs.filter(role__iexact=role_param)
         else:
-            # Default: Show everyone EXCEPT admin
-            users_qs = users_qs.exclude(role__iexact='admin')
+            # Re-confirm: Default hide admin if not already excluded
+            if not request.user.is_superuser:
+                users_qs = users_qs.exclude(role__iexact='admin')
 
         if effective_location_id:
             users_qs = users_qs.filter(location_id=effective_location_id)
@@ -93,7 +103,8 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             users_qs = users_qs.filter(
                 Q(name__icontains=search) |
                 Q(email__icontains=search) |
-                Q(phone_no__icontains=search)
+                Q(phone_no__icontains=search) |
+                Q(employee_code__icontains=search)
             )
 
         active_profile_subquery = EmployeePayrollProfile.objects.filter(
@@ -119,6 +130,7 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                 "name": u.name,
                 "email": u.email,
                 "phone_no": u.phone_no,
+                "employee_code": u.employee_code,
                 "role": u.role,
                 "location_id": str(u.location_id) if u.location_id else None,
                 "location_name": getattr(u.location, "name", None),
@@ -536,6 +548,20 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             qs = qs.filter(user_id=user_id)
         if status_q:
             qs = qs.filter(status=status_q)
+        
+        # New advanced filters
+        role = self.request.query_params.get("role")
+        search = self.request.query_params.get("search")
+        
+        if role and role.lower() != 'all':
+            qs = qs.filter(user__role__iexact=role)
+        
+        if search:
+            qs = qs.filter(
+                Q(user__name__icontains=search) | 
+                Q(user__employee_code__icontains=search)
+            )
+            
         return qs
 
     def _resolve_template(self, location_id, template_id):

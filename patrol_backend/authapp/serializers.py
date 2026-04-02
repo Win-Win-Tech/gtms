@@ -17,7 +17,7 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'email', 'password', 'role', 'is_active', 'created_on', 
-                  'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone']
+                  'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone', 'employee_code']
 
     def create(self, validated_data):
         location_id = validated_data.pop('locationId', None)

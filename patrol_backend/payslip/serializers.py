@@ -14,6 +14,7 @@ from .models import (
 class EmployeePayrollProfileSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source="user.name", read_only=True)
     location_name = serializers.CharField(source="location.name", read_only=True)
+    employee_code = serializers.CharField(source="user.employee_code", read_only=True)
 
     class Meta:
         model = EmployeePayrollProfile
@@ -202,6 +203,7 @@ class PayslipFieldSerializer(serializers.ModelSerializer):
 class PayslipRecordSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source="user.name", read_only=True)
     location_name = serializers.CharField(source="location.name", read_only=True)
+    employee_code = serializers.CharField(source="user.employee_code", read_only=True)
 
     class Meta:
         model = PayslipRecord

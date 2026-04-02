@@ -114,7 +114,7 @@ def _meta_line(record, template, field_values: dict) -> dict:
         "name": getattr(record.user, "name", None) or "-",
         "code": profile.employee_code or "-",
         "team": pick("TEAM", "team", em_keys=("team", "Team")),
-        "designation": pick("DESIGNATION", "designation", em_keys=("designation", "Designation")),
+        "designation": pick("DESIGNATION", "designation", em_keys=("designation", "Designation")) or (getattr(record.user, "role", None) or "-").title(),
         "working_days": _fmt_day_1(record.working_days),
         "net_payable_days": _fmt_day_1(record.paid_days),
         "doj": pick("DOJ", "doj", "DATE_OF_JOINING", em_keys=("doj", "date_of_joining")),

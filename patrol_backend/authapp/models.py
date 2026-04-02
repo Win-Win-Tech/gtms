@@ -60,6 +60,7 @@ class User(AbstractBaseUser, PermissionsMixin):
         blank=True,
         related_name="users"
     )
+    employee_code = models.CharField(max_length=64, null=True, blank=True)
     timezone = models.CharField(
         max_length=50,
         default='Asia/Kolkata',
@@ -152,6 +153,7 @@ class User(AbstractBaseUser, PermissionsMixin):
         return f"{self.email} ({role_name})"
 
     class Meta:
+        unique_together = ('location', 'employee_code')
         indexes = [
             models.Index(fields=['is_deleted']),
         ]

@@ -137,14 +137,19 @@ class UserListView(generics.ListAPIView):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter]
-    search_fields = ['name', 'email']
+    search_fields = ['name', 'email', 'employee_code']
 
     def get_queryset(self):
         queryset = User.objects.filter(is_deleted=False)
         role = self.request.query_params.get('role')
         location_id = self.request.query_params.get('location_id')
-        if role:
-            queryset = queryset.filter(role=role)
+        
+        # Admin restriction: Only superusers can see Admin users
+        if not self.request.user.is_superuser:
+            queryset = queryset.exclude(role__iexact='admin')
+
+        if role and role.lower() != 'all':
+            queryset = queryset.filter(role__iexact=role)
         if location_id:
             queryset = queryset.filter(location_id=location_id)
         return queryset
@@ -190,6 +195,7 @@ class UserByRoleView(View):
                 'name': user.name,
                 'role': user.role,
                 'phone_no': user.phone_no,
+                'employee_code': user.employee_code,
             }
             for user in users
         ]
@@ -236,27 +242,23 @@ class RoleViewSet(viewsets.ModelViewSet):
         user = self.request.user
         location_id = self.request.query_params.get('location_id')
 
-        # If location_id is provided in params, fetch roles for that location
         if location_id:
             # Security: Non-superadmins should only fetch for their own location
             if user.location and str(user.location.id) != location_id and not user.is_superuser:
                 return Role.objects.none()
-            
             queryset = Role.objects.filter(location_id=location_id)
-            
-            # Security: Only superusers can see/assign the 'Admin' role
-            if not user.is_superuser:
-                queryset = queryset.exclude(name__iexact='admin')
-                
-            return queryset
-        
-        # Default behavior:
-        # Superuser or Superadmin (no location) manages Global role templates (NULL location)
-        if user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
-            return Role.objects.filter(location__isnull=True)
+        elif user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
+            # Superuser or Global admin: See global roles by default if no location specified
+            queryset = Role.objects.filter(location__isnull=True)
+        else:
+            # Org Admin: Strictly manage roles for their own location
+            queryset = Role.objects.filter(location=user.location)
 
-        # Org Admin: Strictly manage roles for their own location
-        return Role.objects.filter(location=user.location)
+        # Admin restriction: Only superusers can see Admin role
+        if not user.is_superuser:
+            queryset = queryset.exclude(name__iexact='admin')
+        
+        return queryset
 
     def perform_create(self, serializer):
         user = self.request.user

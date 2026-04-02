@@ -19,7 +19,6 @@ class EmployeePayrollProfile(models.Model):
         on_delete=models.CASCADE,
         related_name="payroll_profiles",
     )
-    employee_code = models.CharField(max_length=64)
     salary_type = models.CharField(max_length=20, choices=SALARY_TYPE_CHOICES, default="monthly")
     gross_salary = models.DecimalField(max_digits=12, decimal_places=2)
     default_field_config = models.ForeignKey(
@@ -74,14 +73,12 @@ class EmployeePayrollProfile(models.Model):
     )
 
     class Meta:
-        unique_together = [("location", "employee_code")]
         indexes = [
-            models.Index(fields=["location", "employee_code"]),
             models.Index(fields=["is_active"]),
         ]
 
     def __str__(self):
-        return f"{self.employee_code} - {self.user_id}"
+        return f"{self.user.employee_code} - {self.user_id}"
 
 
 class PayslipTemplate(models.Model):
