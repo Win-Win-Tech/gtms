@@ -503,6 +503,9 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             # Always generate full month days array (01-01 through 31-01, etc.)
             days = [f"{day:02d}-{month:02d}" for day in range(1, num_days + 1)]
 
+            search = request.query_params.get("search")
+            role = request.query_params.get("role")
+
             # Get all assignments for the location
             assignments = Assignment.objects.select_related('guard', 'shift', 'shift__location').filter(
                 shift__location_id=location_id,
@@ -510,16 +513,26 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 end_date__gte=datetime(year, month, 1),
                 is_deleted=False
             )
+            if search and str(search).strip():
+                s = str(search).strip()
+                assignments = assignments.filter(
+                    Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+                )
+            if role and str(role).strip().lower() not in ('', 'all'):
+                assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
 
-            # Build summary map - initialize with all days set to '-'
+            # Build summary map keyed by guard id (avoids merging duplicate names)
             summary_map = defaultdict(lambda: {
                 'name': '',
+                'employee_code': '',
+                'designation': '',
                 'location': '',
                 **{day: '-' for day in days}
             })
 
             for assignment in assignments:
-                guard_name = assignment.guard.name
+                guard = assignment.guard
+                gid = str(guard.id)
                 location_name = assignment.shift.location.name
                 shift_name = assignment.shift.name
 
@@ -528,14 +541,16 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                     current_date = datetime(year, month, day).date()
                     if assignment.start_date <= current_date <= assignment.end_date:
                         key = f"{day:02d}-{month:02d}"
-                        summary_map[guard_name]['name'] = guard_name
-                        summary_map[guard_name]['location'] = location_name
-                        summary_map[guard_name][key] = shift_name
+                        summary_map[gid]['name'] = guard.name
+                        summary_map[gid]['employee_code'] = getattr(guard, 'employee_code', None) or ''
+                        summary_map[gid]['designation'] = (getattr(guard, 'role', None) or '').strip()
+                        summary_map[gid]['location'] = location_name
+                        summary_map[gid][key] = shift_name
 
             # Convert to list format
             result = list(summary_map.values())
             return Response({
-                'headers': ['Name', 'Location'] + days,
+                'headers': ['Name', 'Emp Code', 'Designation', 'Location'] + days,
                 'rows': result
             })
 
@@ -558,21 +573,34 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             # Always generate full month days array (01-01 through 31-01, etc.)
             days = [f"{day:02d}-{month:02d}" for day in range(1, num_days + 1)]
 
+            search = request.query_params.get("search")
+            role = request.query_params.get("role")
+
             assignments = Assignment.objects.select_related('guard', 'shift', 'shift__location').filter(
                 shift__location_id=location_id,
                 start_date__lte=datetime(year, month, num_days),
                 end_date__gte=datetime(year, month, 1),
                 is_deleted=False
             )
+            if search and str(search).strip():
+                s = str(search).strip()
+                assignments = assignments.filter(
+                    Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+                )
+            if role and str(role).strip().lower() not in ('', 'all'):
+                assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
 
             summary_map = defaultdict(lambda: {
                 'name': '',
+                'employee_code': '',
+                'designation': '',
                 'location': '',
                 **{day: '-' for day in days}
             })
 
             for assignment in assignments:
-                guard_name = assignment.guard.name
+                guard = assignment.guard
+                gid = str(guard.id)
                 location_name = assignment.shift.location.name
                 shift_name = assignment.shift.name
 
@@ -581,20 +609,27 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                     current_date = datetime(year, month, day).date()
                     if assignment.start_date <= current_date <= assignment.end_date:
                         key = f"{day:02d}-{month:02d}"
-                        summary_map[guard_name]['name'] = guard_name
-                        summary_map[guard_name]['location'] = location_name
-                        summary_map[guard_name][key] = shift_name
+                        summary_map[gid]['name'] = guard.name
+                        summary_map[gid]['employee_code'] = getattr(guard, 'employee_code', None) or ''
+                        summary_map[gid]['designation'] = (getattr(guard, 'role', None) or '').strip()
+                        summary_map[gid]['location'] = location_name
+                        summary_map[gid][key] = shift_name
 
             # Create Excel workbook
             wb = Workbook()
             ws = wb.active
             ws.title = f"{month:02d}-{year} Summary"
 
-            headers = ['Name', 'Location'] + days
+            headers = ['Name', 'Emp Code', 'Designation', 'Location'] + days
             ws.append(headers)
 
             for row in summary_map.values():
-                ws.append([row['name'], row['location']] + [row[day] for day in days])
+                ws.append([
+                    row['name'],
+                    row['employee_code'],
+                    row['designation'],
+                    row['location'],
+                ] + [row[day] for day in days])
 
             # Adjust column widths
             for i, column in enumerate(headers, 1):

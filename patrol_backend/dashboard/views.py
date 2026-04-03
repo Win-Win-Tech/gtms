@@ -2352,7 +2352,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 # CORE FUNCTION: Shared business logic for check-in reports
 # ============================================================================
 
-def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_str=None, user_id=None, location_id=None, shift_id=None, request=None):
+def _get_checkin_report_data(
+    filter_type='today',
+    start_date_str=None,
+    end_date_str=None,
+    user_id=None,
+    location_id=None,
+    shift_id=None,
+    request=None,
+    search=None,
+    role=None,
+):
     """
     Internal helper function that contains ALL business logic for check-in reports.
     This ensures consistency across JSON API, Excel exports, and Celery tasks.
@@ -2361,10 +2371,12 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         filter_type: 'today', 'this_week', 'this_month', or 'custom'
         start_date_str: For custom filter (YYYY-MM-DD string)
         end_date_str: For custom filter (YYYY-MM-DD string)
-        user_id: Optional UUID string to filter by guard
+        user_id: Optional UUID string to filter by guard (if set, search/role are ignored)
         location_id: Optional UUID string to filter by location
         shift_id: Optional UUID string to filter by shift
         request: Optional request object for timezone detection (for API calls)
+        search: Optional name or employee code substring (icontains)
+        role: Optional guard role / designation (iexact, or 'all' to skip)
     
     Returns:
         List of dicts with report data:
@@ -2434,12 +2446,19 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
         end_date__gte=query_start_date
     ).select_related('guard', 'location', 'shift')
     
-    if user_id:
-        assignments = assignments.filter(guard_id=user_id)
     if location_id:
         assignments = assignments.filter(location_id=location_id)
     if shift_id:
         assignments = assignments.filter(shift_id=shift_id)
+    if user_id:
+        assignments = assignments.filter(guard_id=user_id)
+    elif search and str(search).strip():
+        s = str(search).strip()
+        assignments = assignments.filter(
+            Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+        )
+    if not user_id and role and str(role).strip().lower() not in ('', 'all'):
+        assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
     
     report = []
     
@@ -2638,6 +2657,8 @@ def _get_checkin_report_data(filter_type='today', start_date_str=None, end_date_
                     'date': report_date.strftime('%Y-%m-%d'),
                     'guard_id': str(guard.id),
                     'guard_name': guard.name,
+                    'employee_code': getattr(guard, 'employee_code', None) or '',
+                    'designation': (getattr(guard, 'role', None) or '').strip(),
                     'location_id': str(location.id) if location else None,
                     'location_name': location.name if location else "",
                     'shift_id': str(shift.id) if shift else None,
@@ -2812,6 +2833,8 @@ class DashboardCheckInReportView(APIView):
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
         shift_id = request.query_params.get('shift_id')
+        search = (request.query_params.get('search') or '').strip()
+        role = (request.query_params.get('role') or '').strip()
         
         # Log request details (both logger and print for visibility)
         
@@ -2824,7 +2847,9 @@ class DashboardCheckInReportView(APIView):
                 user_id=user_id,
                 location_id=location_id,
                 shift_id=shift_id,
-                request=request  # Pass request for timezone detection
+                request=request,  # Pass request for timezone detection
+                search=search or None,
+                role=role or None,
             )
             
             # Format datetime fields for JSON response (already in user timezone from _get_checkin_report_data)
@@ -2984,6 +3009,16 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
         if guard_id:
             queryset = queryset.filter(guard_id=guard_id)
 
+        search = (self.request.query_params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(
+                Q(guard__name__icontains=search) | Q(guard__employee_code__icontains=search)
+            )
+
+        role_param = (self.request.query_params.get("role") or "").strip().lower()
+        if role_param and role_param != "all":
+            queryset = queryset.filter(guard__role__iexact=role_param)
+
         location_id = self.request.query_params.get("location")
         if location_id:
             queryset = queryset.filter(org_location_id=location_id)
@@ -3012,7 +3047,17 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
         return queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
 
 
-def generate_checkin_excel_report_internal(filter_type='today', start_date=None, end_date=None, user_id=None, location_id=None, request=None):
+def generate_checkin_excel_report_internal(
+    filter_type='today',
+    start_date=None,
+    end_date=None,
+    user_id=None,
+    location_id=None,
+    shift_id=None,
+    request=None,
+    search=None,
+    role=None,
+):
     """
     Internal helper function to generate check-in Excel report.
     Used by both the API endpoint and Celery tasks.
@@ -3035,7 +3080,10 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
         end_date_str=end_date,
         user_id=user_id,
         location_id=location_id,
-        request=request
+        shift_id=shift_id,
+        request=request,
+        search=search,
+        role=role,
     )
     
     # Create Excel workbook
@@ -3056,7 +3104,7 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
 
     # Header row
     headers = [
-        'Shift Date', 'Guard', 'Shift Name', 'Checkpoint Name',
+        'Shift Date', 'Name', 'Emp Code', 'Designation', 'Shift Name', 'Checkpoint Name',
         'Scheduled', 'Scanned', 'Status', 'Delay (minutes)',
         'Has Checklist', 'Checklist', 'Checklist Remarks'
     ]
@@ -3067,6 +3115,8 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
         ws.append([
             item['date'],
             item['guard_name'],
+            item.get('employee_code') or '',
+            item.get('designation') or '',
             item['shift_name'],
             item['checkpoint_name'],
             item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
@@ -3082,11 +3132,11 @@ def generate_checkin_excel_report_internal(filter_type='today', start_date=None,
     # Wrap text for the Checklist column (so items show line-by-line)
     try:
         from openpyxl.styles import Alignment
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=10, max_col=10):
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=12, max_col=12):
             for cell in row:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.column_dimensions['J'].width = 55
-        ws.column_dimensions['K'].width = 35
+        ws.column_dimensions['L'].width = 55
+        ws.column_dimensions['M'].width = 35
     except Exception:
         pass
 
@@ -3126,6 +3176,8 @@ class DashboardCheckInReportExcelView(APIView):
         user_id = request.query_params.get('user_id')
         location_id = request.query_params.get('location_id')
         shift_id = request.query_params.get('shift_id')
+        search = (request.query_params.get('search') or '').strip()
+        role = (request.query_params.get('role') or '').strip()
         
         
         try:
@@ -3137,7 +3189,9 @@ class DashboardCheckInReportExcelView(APIView):
                 user_id=user_id,
                 location_id=location_id,
                 shift_id=shift_id,
-                request=request
+                request=request,
+                search=search or None,
+                role=role or None,
             )
             
             # Create Excel workbook
@@ -3158,7 +3212,7 @@ class DashboardCheckInReportExcelView(APIView):
 
             # Header row
             headers = [
-                'Date', 'Guard', 'Shift Name', 'Checkpoint Name',
+                'Date', 'Name', 'Emp Code', 'Designation', 'Shift Name', 'Checkpoint Name',
                 'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)',
                 'Has Checklist', 'Checklist', 'Checklist Remarks'
             ]
@@ -3169,6 +3223,8 @@ class DashboardCheckInReportExcelView(APIView):
                 ws.append([
                     item['date'],
                     item['guard_name'],
+                    item.get('employee_code') or '',
+                    item.get('designation') or '',
                     item['shift_name'],
                     item['checkpoint_name'],
                     item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
@@ -3183,11 +3239,11 @@ class DashboardCheckInReportExcelView(APIView):
             # Wrap text for the Checklist column (so items show line-by-line)
             try:
                 from openpyxl.styles import Alignment
-                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=10, max_col=10):
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=12, max_col=12):
                     for cell in row:
                         cell.alignment = Alignment(wrap_text=True, vertical="top")
-                ws.column_dimensions['J'].width = 55
-                ws.column_dimensions['K'].width = 35
+                ws.column_dimensions['L'].width = 55
+                ws.column_dimensions['M'].width = 35
             except Exception:
                 pass
 
@@ -3500,7 +3556,19 @@ class AttendanceCheckinExportView(APIView):
             return Response({"error": f"Failed to generate report: {str(e)}"}, status=500)
 
 
-def generate_attendance_v3_excel_report_internal(date_filter='today', start_date=None, end_date=None, guard_id=None, location_id=None, shift_id=None, status_filter=None, defaulters=False, request=None):
+def generate_attendance_v3_excel_report_internal(
+    date_filter='today',
+    start_date=None,
+    end_date=None,
+    guard_id=None,
+    location_id=None,
+    shift_id=None,
+    status_filter=None,
+    defaulters=False,
+    request=None,
+    search=None,
+    role=None,
+):
     """
     V3 attendance export helper based on AttendanceCheckin master summary fields.
     """
@@ -3538,6 +3606,13 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
 
     if guard_id:
         queryset = queryset.filter(guard_id=guard_id)
+    if search and str(search).strip():
+        s = str(search).strip()
+        queryset = queryset.filter(
+            Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+        )
+    if role and str(role).strip().lower() not in ("", "all"):
+        queryset = queryset.filter(guard__role__iexact=str(role).strip().lower())
     if location_id:
         queryset = queryset.filter(org_location_id=location_id)
     if shift_id:
@@ -3562,6 +3637,8 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
     ws.append([
         "Shift Date",
         "Name",
+        "Emp Code",
+        "Designation",
         "Shift",
         "Location",
         "First Checkin",
@@ -3611,6 +3688,8 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
             [
                 shift_date_key.strftime('%Y-%m-%d') if shift_date_key != date.min else "",
                 obj.guard.name,
+                getattr(obj.guard, "employee_code", None) or "",
+                (getattr(obj.guard, "role", None) or "").strip(),
                 obj.shift.name if obj.shift else "",
                 obj.org_location.name if obj.org_location else "",
                 first_checkin.strftime('%Y-%m-%d %H:%M:%S') if first_checkin else "",
@@ -3633,11 +3712,11 @@ def generate_attendance_v3_excel_report_internal(date_filter='today', start_date
 
     try:
         from openpyxl.styles import Alignment
-        # Sessions column is 10th (J)
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=10, max_col=10):
+        # Sessions column is 12th (L) after Name, Emp Code, Designation
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=12, max_col=12):
             for cell in row:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.column_dimensions['J'].width = 42
+        ws.column_dimensions['L'].width = 42
     except Exception:
         pass
 
@@ -3663,6 +3742,8 @@ class AttendanceCheckinV3ExportView(APIView):
         shift_id = request.query_params.get("shift")
         status_filter = request.query_params.get("status")
         defaulters = request.query_params.get("defaulters") == "true"
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
 
         try:
             result = generate_attendance_v3_excel_report_internal(
@@ -3674,7 +3755,9 @@ class AttendanceCheckinV3ExportView(APIView):
                 shift_id=shift_id,
                 status_filter=status_filter,
                 defaulters=defaulters,
-                request=request
+                request=request,
+                search=search,
+                role=role,
             )
             with open(result['file_path'], 'rb') as f:
                 excel_content = f.read()
@@ -3697,7 +3780,16 @@ class AttendanceCheckinV3ExportView(APIView):
             return Response({"error": f"Failed to generate v3 report: {str(e)}"}, status=500)
 
 
-def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, request=None):
+def _get_monthly_attendance_summary_data(
+    month=None,
+    start_date_str=None,
+    end_date_str=None,
+    location_id=None,
+    user_id=None,
+    search=None,
+    role=None,
+    request=None,
+):
     """
     Internal helper function to generate monthly attendance summary data.
     This contains the business logic shared by both JSON and Excel endpoints.
@@ -3745,6 +3837,13 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
         assignments = assignments.filter(location_id=location_id)
     if user_id:
         assignments = assignments.filter(guard_id=user_id)
+    elif search and str(search).strip():
+        s = str(search).strip()
+        assignments = assignments.filter(
+            Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+        )
+    if not user_id and role and str(role).strip().lower() not in ("", "all"):
+        assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
 
     # Get user timezone and today for future date check
     # IMPORTANT: Get user_today BEFORE generating date_range to ensure correct future date detection
@@ -3791,7 +3890,9 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
         location = data["location"]
         row = {
             "name": guard.name,
-            "location": location
+            "location": location,
+            "employee_code": getattr(guard, "employee_code", None) or "",
+            "designation": (getattr(guard, "role", None) or "").strip(),
         }
 
         # Check attendance for each date
@@ -3876,7 +3977,16 @@ def _get_monthly_attendance_summary_data(month=None, start_date_str=None, end_da
     }
 
 
-def generate_monthly_attendance_summary_excel_internal(month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, request=None):
+def generate_monthly_attendance_summary_excel_internal(
+    month=None,
+    start_date_str=None,
+    end_date_str=None,
+    location_id=None,
+    user_id=None,
+    search=None,
+    role=None,
+    request=None,
+):
     """
     Internal helper function to generate monthly attendance summary Excel report.
     This contains the business logic that both the API endpoint and Celery tasks can use.
@@ -3898,6 +4008,8 @@ def generate_monthly_attendance_summary_excel_internal(month=None, start_date_st
         end_date_str=end_date_str,
         location_id=location_id,
         user_id=user_id,
+        search=search,
+        role=role,
         request=request  # Pass request for timezone detection
     )
     
@@ -3912,13 +4024,18 @@ def generate_monthly_attendance_summary_excel_internal(month=None, start_date_st
     ws.title = "Monthly Attendance Summary"
     
     # Header row
-    headers = ["Name", "Location"] + [date.strftime("%d-%b") for date in date_range]
+    headers = ["Name", "Emp Code", "Designation", "Location"] + [date.strftime("%d-%b") for date in date_range]
     ws.append(headers)
     
     # Data rows
     row_count = 0
     for row_data in summary_data:
-        row = [row_data["name"], row_data["location"]]
+        row = [
+            row_data["name"],
+            row_data.get("employee_code") or "",
+            row_data.get("designation") or "",
+            row_data["location"],
+        ]
         # Add attendance for each date
         for date in date_range:
             row.append(row_data.get(date.strftime("%d-%b"), "-"))
@@ -3957,7 +4074,8 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
         month = request.query_params.get("month")
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
-
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
 
         try:
             # Use internal helper function (pass request for timezone detection)
@@ -3967,6 +4085,8 @@ class MonthlyAttendanceSummaryViewSet(ViewSet):
                 end_date_str=end_date,
                 location_id=location_id,
                 user_id=user_id,
+                search=search,
+                role=role,
                 request=request  # Pass request for timezone detection
             )
             
@@ -4127,6 +4247,8 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
         
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
 
         try:
             # Use Excel helper function (consistent with daily reports pattern)
@@ -4136,7 +4258,9 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
                 end_date_str=end_date,
                 request=request,  # Pass request for timezone detection
                 location_id=location_id,
-                user_id=user_id
+                user_id=user_id,
+                search=search,
+                role=role,
             )
             
             file_path = result['file_path']

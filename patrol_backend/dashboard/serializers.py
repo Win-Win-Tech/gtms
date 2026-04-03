@@ -122,6 +122,8 @@ class AttendanceCheckinDashboardSerializer(serializers.ModelSerializer):
 
 class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     guard_name = serializers.CharField(source="guard.name", read_only=True)
+    employee_code = serializers.CharField(source="guard.employee_code", read_only=True)
+    user_role = serializers.CharField(source="guard.role", read_only=True)
     shift_name = serializers.CharField(source="shift.name", read_only=True)
     location_name = serializers.CharField(source="org_location.name", read_only=True)
     shift_time = serializers.SerializerMethodField()
@@ -137,6 +139,8 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             "id",
             "guard",
             "guard_name",
+            "employee_code",
+            "user_role",
             "checkin_time",
             "checkout_time",
             "last_checkin_time",
@@ -299,6 +303,8 @@ class CheckInReportSerializer(serializers.Serializer):
     date = serializers.CharField()
     guard_id = serializers.UUIDField()
     guard_name = serializers.CharField()
+    employee_code = serializers.CharField(allow_blank=True, required=False)
+    designation = serializers.CharField(allow_blank=True, required=False)
     location_id = serializers.CharField(allow_null=True)
     location_name = serializers.CharField()
     shift_id = serializers.CharField(allow_null=True)
