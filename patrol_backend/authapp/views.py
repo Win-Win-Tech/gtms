@@ -7,7 +7,22 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User, Role
 from .serializers import UserSerializer, RoleSerializer
 from patrol_backend.utils.response import api_response
-from django.forms.models import model_to_dict 
+from django.forms.models import model_to_dict
+
+
+def resolve_role_for_user(user):
+    """
+    Match User.role to a Role row: prefer location-specific copy, then global template (location=NULL).
+    Without this, logins fail open (no webapp / no pages) when a location has no Role rows yet.
+    """
+    if not user or not user.role:
+        return None
+    name = user.role.strip()
+    if user.location_id:
+        role_obj = Role.objects.filter(name__iexact=name, location_id=user.location_id).first()
+        if role_obj:
+            return role_obj
+    return Role.objects.filter(name__iexact=name, location__isnull=True).first()
 
 
 # 1. Create user
@@ -98,15 +113,12 @@ class LoginView(APIView):
                 # Fetch dynamic permissions and web app allowance from Role table
                 role_permissions = []
                 is_allow_webapp = False
-                
-                if user.role:
-                    # Look for Role specific to location
-                    role_obj = Role.objects.filter(name__iexact=user.role, location=user.location).first()
-                    
-                    if role_obj:
-                        role_permissions = role_obj.pages
-                        is_allow_webapp = role_obj.is_allow_webapp
-                        
+
+                role_obj = resolve_role_for_user(user)
+                if role_obj:
+                    role_permissions = list(role_obj.pages or [])
+                    is_allow_webapp = bool(role_obj.is_allow_webapp)
+
                 # Master superuser (is_superuser=True) gets all permissions if no role found
                 if user.is_superuser and not role_permissions:
                     # Master fallback for pure superadmins (hardcoded to ensure access)
@@ -115,10 +127,11 @@ class LoginView(APIView):
 
                 is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
 
+                safe_user_fields = [f.name for f in user._meta.fields if f.name != 'password']
                 return Response(api_response("success", "Login successful", {
                     'access': str(refresh.access_token),
                     'refresh': str(refresh),
-                    'user':model_to_dict(user, fields=[field.name for field in user._meta.fields]),
+                    'user': model_to_dict(user, fields=safe_user_fields),
                     'user_id': str(user.id),
                     'role': user.role,
                     'is_allow_webapp': is_allow_webapp,
@@ -246,13 +259,16 @@ class RoleViewSet(viewsets.ModelViewSet):
             # Security: Non-superadmins should only fetch for their own location
             if user.location and str(user.location.id) != location_id and not user.is_superuser:
                 return Role.objects.none()
-            queryset = Role.objects.filter(location_id=location_id)
+            loc_qs = Role.objects.filter(location_id=location_id)
+            # If this location has no Role rows yet (populate_roles not run), expose global templates
+            queryset = loc_qs if loc_qs.exists() else Role.objects.filter(location__isnull=True)
         elif user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
             # Superuser or Global admin: See global roles by default if no location specified
             queryset = Role.objects.filter(location__isnull=True)
         else:
-            # Org Admin: Strictly manage roles for their own location
-            queryset = Role.objects.filter(location=user.location)
+            # Org admin: own location's roles, else global templates (same as login resolution)
+            loc_qs = Role.objects.filter(location=user.location)
+            queryset = loc_qs if loc_qs.exists() else Role.objects.filter(location__isnull=True)
 
         # Admin restriction: Only superusers can see Admin role
         if not user.is_superuser:
