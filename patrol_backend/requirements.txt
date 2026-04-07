@@ -78,3 +78,7 @@ vine==5.1.0
 wcwidth==0.2.14
 yarl==1.22.0
 zope.interface==8.2
+
+# Face attendance (optional): install dlib first, then:
+#   pip install -r requirements-face-attendance.txt
+# See docs/FACE_ATTENDANCE_INSTALL.md

@@ -1668,6 +1668,250 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK
         )
 
+    @action(detail=False, methods=["post"], url_path="checkin_v4")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkin_v4(self, request):
+        """
+        Same as checkin_v3, plus if location.is_face_attendance_enabled:
+        require live image and match to user's enrolled face_encoding / face_photo.
+        """
+        from patrol_backend.utils.face_utils import (
+            is_face_attendance_available,
+            verify_user_face,
+        )
+
+        user = request.user
+        user_tz = get_user_timezone_from_request(request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
+
+        if not assignment:
+            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+        shift = assignment.shift
+        org_location = assignment.location
+
+        lat = float(request.data.get("latitude"))
+        lon = float(request.data.get("longitude"))
+
+        if org_location.latitude and org_location.longitude:
+            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+            allowed_distance = _get_site_setting_int(
+                key="attendance_distance",
+                location_id=getattr(org_location, "id", None),
+                default_value=100,
+            )
+            if distance > allowed_distance:
+                return Response({"error": f"Not within >{allowed_distance}m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
+
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
+        raw_bytes = image_file.read() if image_file else None
+
+        if getattr(org_location, "is_face_attendance_enabled", False):
+            if not is_face_attendance_available():
+                return Response(
+                    {
+                        "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
+                        "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            if not raw_bytes:
+                return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
+            ok, msg, dist = verify_user_face(user, raw_bytes)
+            if not ok:
+                body = {"error": msg}
+                if dist is not None:
+                    body["face_distance"] = dist
+                return Response(body, status=status.HTTP_400_BAD_REQUEST)
+
+        img_name = "checkin.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+
+        log = CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            latitude=lat,
+            longitude=lon,
+        )
+        if raw_bytes is not None:
+            log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+        attendance, _ = AttendanceCheckin.objects.get_or_create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            defaults={
+                "created_on": timezone.now(),
+                "shift_date": shift_start_date,
+            }
+        )
+
+        attendance_list = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            shift_date=shift_start_date,
+        )
+        if attendance_list.exists():
+            attendance = attendance_list.first()
+
+        earliest_checkin = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
+        ).order_by("timestamp").first()
+
+        if earliest_checkin:
+            attendance.checkin_time = earliest_checkin.timestamp
+            attendance.latitude = earliest_checkin.latitude
+            attendance.longitude = earliest_checkin.longitude
+
+        attendance.shift_date = shift_start_date
+
+        if raw_bytes is not None:
+            attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
+
+        attendance.save()
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
+        data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
+        if isinstance(data, dict):
+            data["face_attendance"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+            data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+        return Response(data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="checkout_v4")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkout_v4(self, request):
+        """
+        Same as checkout_v3, plus optional face match when location.is_face_attendance_enabled.
+        """
+        from patrol_backend.utils.face_utils import (
+            is_face_attendance_available,
+            verify_user_face,
+        )
+
+        user = request.user
+        user_tz = get_user_timezone_from_request(request)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request)
+
+        if not assignment:
+            return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+        shift = assignment.shift
+        org_location = assignment.location
+        lat = float(request.data.get("latitude"))
+        lon = float(request.data.get("longitude"))
+
+        if org_location.latitude and org_location.longitude:
+            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+            allowed_distance = _get_site_setting_int(
+                key="attendance_distance",
+                location_id=getattr(org_location, "id", None),
+                default_value=100,
+            )
+            if distance > allowed_distance:
+                return Response(
+                    {"error": f"Not within >{allowed_distance}m of assigned location"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        attendance = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            shift_date=shift_start_date,
+        ).first()
+
+        if not attendance or not attendance.checkin_time:
+            return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
+
+        image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
+        raw_bytes = image_file.read() if image_file else None
+
+        if getattr(org_location, "is_face_attendance_enabled", False):
+            if not is_face_attendance_available():
+                return Response(
+                    {
+                        "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
+                        "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            if not raw_bytes:
+                return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
+            ok, msg, dist = verify_user_face(user, raw_bytes)
+            if not ok:
+                body = {"error": msg}
+                if dist is not None:
+                    body["face_distance"] = dist
+                return Response(body, status=status.HTTP_400_BAD_REQUEST)
+
+        img_name = "checkout.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+
+        log = CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            latitude=lat,
+            longitude=lon,
+        )
+        if raw_bytes is not None:
+            log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+        if raw_bytes is not None:
+            attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
+
+        latest_checkout = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc
+        ).order_by("-timestamp").first()
+
+        if latest_checkout:
+            attendance.checkout_time = latest_checkout.timestamp
+        attendance.shift_date = shift_start_date
+        attendance.save()
+
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
+        data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
+        if isinstance(data, dict):
+            data["face_attendance"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+            data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+        return Response(data, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=["post"], url_path="force-checkout_v3")
     @parser_classes([MultiPartParser, FormParser])
     def force_checkout_v3(self, request):

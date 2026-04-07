@@ -1,11 +1,12 @@
 from rest_framework import generics, permissions, filters, status, viewsets
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User, Role
-from .serializers import UserSerializer, RoleSerializer
+from .serializers import UserSerializer, RoleSerializer, UserListSerializer
 from patrol_backend.utils.response import api_response
 from django.forms.models import model_to_dict
 
@@ -30,6 +31,7 @@ class UserCreateView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [permissions.AllowAny]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def create(self, request, *args, **kwargs):
         try:
@@ -58,6 +60,7 @@ class UserUpdateView(generics.UpdateAPIView):
     serializer_class = UserSerializer
     permission_classes = [permissions.IsAuthenticated]
     lookup_field = 'id'
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def update(self, request, *args, **kwargs):
         try:
@@ -127,11 +130,38 @@ class LoginView(APIView):
 
                 is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
 
-                safe_user_fields = [f.name for f in user._meta.fields if f.name != 'password']
+                face_photo_url = None
+                try:
+                    if getattr(user, "face_photo", None) and user.face_photo.name:
+                        face_photo_url = request.build_absolute_uri(user.face_photo.url)
+                except Exception:
+                    face_photo_url = None
+
+                user_payload = {
+                    "id": str(user.id),
+                    "last_login": user.last_login,
+                    "is_superuser": user.is_superuser,
+                    "aadhar_no": user.aadhar_no,
+                    "email": user.email,
+                    "name": user.name,
+                    "phone_no": user.phone_no,
+                    "role": user.role,
+                    "location": str(user.location_id) if user.location_id else None,
+                    "employee_code": user.employee_code,
+                    "timezone": user.timezone,
+                    "is_active": user.is_active,
+                    "is_staff": user.is_staff,
+                    "created_by": str(user.created_by_id) if user.created_by_id else None,
+                    "modified_by": str(user.modified_by_id) if user.modified_by_id else None,
+                    "is_deleted": user.is_deleted,
+                    "deleted_on": user.deleted_on,
+                    "deleted_by": str(user.deleted_by_id) if user.deleted_by_id else None,
+                    "face_photo": face_photo_url,
+                }
                 return Response(api_response("success", "Login successful", {
                     'access': str(refresh.access_token),
                     'refresh': str(refresh),
-                    'user': model_to_dict(user, fields=safe_user_fields),
+                    'user': user_payload,
                     'user_id': str(user.id),
                     'role': user.role,
                     'is_allow_webapp': is_allow_webapp,
@@ -147,7 +177,7 @@ class LoginView(APIView):
 
 # 3. List users with search and filter
 class UserListView(generics.ListAPIView):
-    serializer_class = UserSerializer
+    serializer_class = UserListSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter]
     search_fields = ['name', 'email', 'employee_code']

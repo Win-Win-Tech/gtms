@@ -61,6 +61,17 @@ class User(AbstractBaseUser, PermissionsMixin):
         related_name="users"
     )
     employee_code = models.CharField(max_length=64, null=True, blank=True)
+    face_photo = models.ImageField(
+        upload_to="user_faces/",
+        null=True,
+        blank=True,
+        help_text="Reference photo for face attendance (enrollment)",
+    )
+    face_encoding = models.BinaryField(
+        null=True,
+        blank=True,
+        help_text="128-d face_recognition encoding (float64 bytes); computed from face_photo",
+    )
     timezone = models.CharField(
         max_length=50,
         default='Asia/Kolkata',

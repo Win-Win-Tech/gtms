@@ -1,0 +1,6 @@
+# Face attendance optional dependencies.
+# Follow exact server steps in docs/FACE_ATTENDANCE_INSTALL.md
+# Important compatibility pin for face_recognition_models pkg_resources import:
+setuptools<81
+face-recognition==1.3.0
+face-recognition-models==0.3.0

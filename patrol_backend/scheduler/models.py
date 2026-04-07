@@ -46,6 +46,10 @@ class Location(models.Model):
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
     is_qr_scan_enable = models.BooleanField(default=True)
+    is_face_attendance_enabled = models.BooleanField(
+        default=False,
+        help_text="If True, checkin_v4/checkout_v4 require a live face match to the user's enrolled face_photo/encoding.",
+    )
 
     # Managers
     objects = ActiveManager()        # default: only active

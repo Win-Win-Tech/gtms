@@ -13,16 +13,20 @@ class UserSerializer(serializers.ModelSerializer):
     location = SchedulerLocationSerializer(read_only=True)  # use existing serializer
     locationId = serializers.UUIDField(write_only=True, required=False, allow_null=True)
     timezone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    face_photo = serializers.ImageField(required=False, allow_null=True)
+    remove_face_photo = serializers.BooleanField(write_only=True, required=False, default=False)
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'password', 'role', 'is_active', 'created_on', 
-                  'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone', 'employee_code']
+        fields = ['id', 'email', 'password', 'role', 'is_active', 'created_on',
+                  'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone', 'employee_code',
+                  'face_photo', 'remove_face_photo']
 
     def create(self, validated_data):
         location_id = validated_data.pop('locationId', None)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
+        validated_data.pop('remove_face_photo', None)
         
         user = User(**validated_data)
         if password:
@@ -47,15 +51,22 @@ class UserSerializer(serializers.ModelSerializer):
                 user.timezone = location_admin.timezone
         
         user.save()
+        _try_refresh_face_encoding(user)
         return user
 
     def update(self, instance, validated_data):
         location_id = validated_data.pop('locationId', None)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
+        remove_face_photo = validated_data.pop('remove_face_photo', False)
         
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+        if remove_face_photo:
+            if instance.face_photo:
+                instance.face_photo.delete(save=False)
+            instance.face_photo = None
+            instance.face_encoding = None
         if password:
             instance.set_password(password)
         if location_id:
@@ -78,7 +89,28 @@ class UserSerializer(serializers.ModelSerializer):
                 instance.timezone = location_admin.timezone
         
         instance.save()
+        _try_refresh_face_encoding(instance)
         return instance
+
+
+class UserListSerializer(serializers.ModelSerializer):
+    location = SchedulerLocationSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        # Intentionally exclude face_photo/face_encoding for list performance
+        fields = [
+            'id', 'email', 'role', 'is_active', 'created_on', 'modified_on',
+            'name', 'phone_no', 'location', 'aadhar_no', 'timezone', 'employee_code'
+        ]
+
+
+def _try_refresh_face_encoding(user):
+    try:
+        from patrol_backend.utils.face_utils import refresh_user_face_encoding_from_photo
+        refresh_user_face_encoding_from_photo(user)
+    except Exception:
+        pass
 
 
 # from rest_framework import serializers
