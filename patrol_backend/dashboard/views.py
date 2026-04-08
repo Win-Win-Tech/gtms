@@ -1723,10 +1723,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
             ok, msg, dist = verify_user_face(user, raw_bytes)
             if not ok:
-                body = {"error": msg}
-                if dist is not None:
-                    body["face_distance"] = dist
-                return Response(body, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         img_name = "checkin.jpg"
         if image_file:
@@ -1863,10 +1860,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
             ok, msg, dist = verify_user_face(user, raw_bytes)
             if not ok:
-                body = {"error": msg}
-                if dist is not None:
-                    body["face_distance"] = dist
-                return Response(body, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         img_name = "checkout.jpg"
         if image_file:

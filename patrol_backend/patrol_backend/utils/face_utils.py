@@ -13,7 +13,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Default tolerance for face_recognition.compare_faces (lower stricter)
-DEFAULT_FACE_TOLERANCE = 0.55
+DEFAULT_FACE_TOLERANCE = 0.45
 
 _face_recognition = None  # lazy module or None; False = import failed
 _face_recognition_failed = False
