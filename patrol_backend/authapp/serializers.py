@@ -113,6 +113,68 @@ def _try_refresh_face_encoding(user):
         pass
 
 
+def _register_heif_opener_if_available():
+    """iPhone often uses HEIC/HEIF; Pillow needs pillow-heif to decode."""
+    try:
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+    except ImportError:
+        pass
+
+
+_register_heif_opener_if_available()
+
+
+class MobileSelfProfileSerializer(serializers.Serializer):
+    """
+    Mobile app self-service profile updates (authenticated user only).
+    Currently: face photo upload only (replaces existing photo if any).
+    Add fields here later (e.g. phone_no).
+    """
+
+    face_photo = serializers.ImageField(required=True, allow_null=False)
+
+    # Camera-friendly raster formats (no GIF — not used for real camera output).
+    # HEIF = what Pillow reports for iPhone .heic after pillow-heif is registered.
+    _ALLOWED_PIL_FORMATS = frozenset({"JPEG", "PNG", "WEBP", "HEIF"})
+
+    def validate_face_photo(self, value):
+        if not value:
+            raise serializers.ValidationError("Image file is required.")
+
+        ct = (getattr(value, "content_type", None) or "").lower().split(";")[0].strip()
+        if ct and not ct.startswith("image/") and ct != "application/octet-stream":
+            raise serializers.ValidationError(
+                "Only image uploads are allowed (got non-image content type)."
+            )
+
+        try:
+            from PIL import Image
+
+            value.seek(0)
+            with Image.open(value) as img:
+                img.load()
+                fmt = (img.format or "").upper()
+                if fmt not in self._ALLOWED_PIL_FORMATS:
+                    raise serializers.ValidationError(
+                        "Unsupported image type. Use JPEG, PNG, WebP, or HEIC/HEIF."
+                    )
+        except serializers.ValidationError:
+            raise
+        except Exception:
+            raise serializers.ValidationError(
+                "File is not a valid image or is corrupted."
+            )
+        finally:
+            try:
+                value.seek(0)
+            except Exception:
+                pass
+
+        return value
+
+
 # from rest_framework import serializers
 # from .models import User
 

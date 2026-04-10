@@ -1,9 +1,17 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    UserCreateView, LoginView, UserListView, UserUpdateView, UserDeleteView, 
-    ToggleUserActiveView, UserDetailView, UserByRoleView, TimezoneListView,
-    RoleViewSet
+    UserCreateView,
+    LoginView,
+    UserListView,
+    UserUpdateView,
+    UserDeleteView,
+    ToggleUserActiveView,
+    UserDetailView,
+    UserByRoleView,
+    TimezoneListView,
+    RoleViewSet,
+    MobileSelfProfileView,
 )
 
 router = DefaultRouter()
@@ -12,6 +20,7 @@ router.register(r'auth/roles', RoleViewSet, basename='roles')
 
 urlpatterns = [
     path('auth/users/', UserCreateView.as_view(), name='create_user'),
+    path('auth/mobile/profile/', MobileSelfProfileView.as_view(), name='mobile_self_profile'),
     path('auth/login/', LoginView.as_view(), name='login_user'),
     path('auth/users/<uuid:id>/detail/', UserDetailView.as_view(), name='user_detail'),
     path('auth/users/list/', UserListView.as_view(), name='list_users'),

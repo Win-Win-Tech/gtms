@@ -6,9 +6,89 @@ from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User, Role
-from .serializers import UserSerializer, RoleSerializer, UserListSerializer
+from .serializers import (
+    UserSerializer,
+    RoleSerializer,
+    UserListSerializer,
+    MobileSelfProfileSerializer,
+    _try_refresh_face_encoding,
+)
 from patrol_backend.utils.response import api_response
 from django.forms.models import model_to_dict
+
+
+def build_login_user_payload(request, user):
+    """Same `user` object shape as login (includes absolute face_photo URL)."""
+    face_photo_url = None
+    try:
+        if getattr(user, "face_photo", None) and user.face_photo.name:
+            face_photo_url = request.build_absolute_uri(user.face_photo.url)
+    except Exception:
+        face_photo_url = None
+
+    return {
+        "id": str(user.id),
+        "last_login": user.last_login,
+        "is_superuser": user.is_superuser,
+        "aadhar_no": user.aadhar_no,
+        "email": user.email,
+        "name": user.name,
+        "phone_no": user.phone_no,
+        "role": user.role,
+        "location": str(user.location_id) if user.location_id else None,
+        "employee_code": user.employee_code,
+        "timezone": user.timezone,
+        "is_active": user.is_active,
+        "is_staff": user.is_staff,
+        "created_by": str(user.created_by_id) if user.created_by_id else None,
+        "modified_by": str(user.modified_by_id) if user.modified_by_id else None,
+        "is_deleted": user.is_deleted,
+        "deleted_on": user.deleted_on,
+        "deleted_by": str(user.deleted_by_id) if user.deleted_by_id else None,
+        "face_photo": face_photo_url,
+    }
+
+
+def build_flat_profile_data(request, user):
+    """Single `data` object: user fields + permissions/flags (no nested `user` key)."""
+    return {**build_login_user_payload(request, user), **build_login_client_fields(request, user)}
+
+
+def build_login_client_fields(request, user):
+    """Permissions and flags that login repeats at the top level of `data`."""
+    role_permissions = []
+    is_allow_webapp = False
+
+    role_obj = resolve_role_for_user(user)
+    if role_obj:
+        role_permissions = list(role_obj.pages or [])
+        is_allow_webapp = bool(role_obj.is_allow_webapp)
+
+    if user.is_superuser and not role_permissions:
+        role_permissions = [
+            "Dashboard",
+            "Users",
+            "Organization",
+            "Payslip",
+            "Live Tracking",
+            "Incident",
+            "Settings",
+            "Role Management",
+        ]
+        is_allow_webapp = True
+
+    is_qr_scan_enabled = getattr(user.location, "is_qr_scan_enable", False) if user.location else False
+
+    return {
+        "user_id": str(user.id),
+        "role": user.role,
+        "is_allow_webapp": is_allow_webapp,
+        "permissions": role_permissions,
+        "is_superuser": user.is_superuser,
+        "location_id": str(user.location.id) if user.location else None,
+        "timezone": user.timezone,
+        "is_qr_scan_enabled": is_qr_scan_enabled,
+    }
 
 
 def resolve_role_for_user(user):
@@ -24,6 +104,64 @@ def resolve_role_for_user(user):
         if role_obj:
             return role_obj
     return Role.objects.filter(name__iexact=name, location__isnull=True).first()
+
+
+class MobileSelfProfileView(APIView):
+    """
+    Mobile app: authenticated user uploads/replaces their own face photo (JWT user).
+
+    multipart/form-data:
+      - face_photo: image file (required), or alias: image
+
+    If the user already has a face photo, the old file is removed and the new one is stored.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        return self._update(request)
+
+    def patch(self, request):
+        return self._update(request)
+
+    def _update(self, request):
+        user = request.user
+        if getattr(user, "is_deleted", False):
+            return Response(
+                api_response("error", "User not found", None, status.HTTP_404_NOT_FOUND),
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        face_file = request.FILES.get("face_photo") or request.FILES.get("image")
+        serializer = MobileSelfProfileSerializer(data={"face_photo": face_file})
+        if not serializer.is_valid():
+            return Response(
+                api_response("error", "Validation failed", serializer.errors, status.HTTP_400_BAD_REQUEST),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        validated = serializer.validated_data
+        try:
+            if user.face_photo:
+                user.face_photo.delete(save=False)
+                user.face_encoding = None
+
+            user.face_photo = validated["face_photo"]
+            user.save()
+            _try_refresh_face_encoding(user)
+
+            user.refresh_from_db()
+            payload = build_flat_profile_data(request, user)
+            return Response(
+                api_response("success", "Profile updated successfully", payload, status.HTTP_200_OK),
+                status=status.HTTP_200_OK,
+            )
+        except Exception as e:
+            return Response(
+                api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 # 1. Create user
@@ -112,65 +250,18 @@ class LoginView(APIView):
             user = authenticate(request, email=email, password=password)
             if user:
                 refresh = RefreshToken.for_user(user)
-                # From location: False = use other check-in flow (no QR). No location = False so app doesn't assume QR.
-                # Fetch dynamic permissions and web app allowance from Role table
-                role_permissions = []
-                is_allow_webapp = False
-
-                role_obj = resolve_role_for_user(user)
-                if role_obj:
-                    role_permissions = list(role_obj.pages or [])
-                    is_allow_webapp = bool(role_obj.is_allow_webapp)
-
-                # Master superuser (is_superuser=True) gets all permissions if no role found
-                if user.is_superuser and not role_permissions:
-                    # Master fallback for pure superadmins (hardcoded to ensure access)
-                    role_permissions = ['Dashboard', 'Users', 'Organization', 'Payslip', 'Live Tracking', 'Incident', 'Settings', 'Role Management']
-                    is_allow_webapp = True
-
-                is_qr_scan_enabled = getattr(user.location, 'is_qr_scan_enable', False) if user.location else False
-
-                face_photo_url = None
-                try:
-                    if getattr(user, "face_photo", None) and user.face_photo.name:
-                        face_photo_url = request.build_absolute_uri(user.face_photo.url)
-                except Exception:
-                    face_photo_url = None
-
-                user_payload = {
-                    "id": str(user.id),
-                    "last_login": user.last_login,
-                    "is_superuser": user.is_superuser,
-                    "aadhar_no": user.aadhar_no,
-                    "email": user.email,
-                    "name": user.name,
-                    "phone_no": user.phone_no,
-                    "role": user.role,
-                    "location": str(user.location_id) if user.location_id else None,
-                    "employee_code": user.employee_code,
-                    "timezone": user.timezone,
-                    "is_active": user.is_active,
-                    "is_staff": user.is_staff,
-                    "created_by": str(user.created_by_id) if user.created_by_id else None,
-                    "modified_by": str(user.modified_by_id) if user.modified_by_id else None,
-                    "is_deleted": user.is_deleted,
-                    "deleted_on": user.deleted_on,
-                    "deleted_by": str(user.deleted_by_id) if user.deleted_by_id else None,
-                    "face_photo": face_photo_url,
-                }
-                return Response(api_response("success", "Login successful", {
-                    'access': str(refresh.access_token),
-                    'refresh': str(refresh),
-                    'user': user_payload,
-                    'user_id': str(user.id),
-                    'role': user.role,
-                    'is_allow_webapp': is_allow_webapp,
-                    'permissions': role_permissions,
-                    'is_superuser': user.is_superuser,
-                    'location_id': str(user.location.id) if user.location else None,
-                    'timezone': user.timezone,
-                    'is_qr_scan_enabled': is_qr_scan_enabled
-                }, status.HTTP_200_OK))
+                return Response(
+                    api_response(
+                        "success",
+                        "Login successful",
+                        {
+                            "access": str(refresh.access_token),
+                            "refresh": str(refresh),
+                            **build_flat_profile_data(request, user),
+                        },
+                        status.HTTP_200_OK,
+                    )
+                )
             return Response(api_response("error", "Invalid credentials", None, status.HTTP_401_UNAUTHORIZED))
         except Exception as e:
             return Response(api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR))
