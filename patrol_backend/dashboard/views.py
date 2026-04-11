@@ -4018,6 +4018,39 @@ class AttendanceCheckinV3ExportView(APIView):
             return Response({"error": f"Failed to generate v3 report: {str(e)}"}, status=500)
 
 
+# Monthly summary Present/Absent day totals: flip this one flag to change OW/M handling.
+# False (default): only P → present; A, OW, M → absent.
+# True: P, OW, M → present; only A → absent.
+MONTHLY_OWM_COUNT_AS_PRESENT = False
+
+
+def _append_monthly_pa_day_totals(row, date_range):
+    """
+    Count present vs absent days from daily cells (P/A/OW/M).
+    "-" (no assignment / future / N/A) excluded from both totals.
+    Behavior is controlled by MONTHLY_OWM_COUNT_AS_PRESENT (see module constant above).
+    """
+    present = 0
+    absent = 0
+    for d in date_range:
+        key = d.strftime("%d-%b")
+        val = row.get(key, "-")
+        if val == "-":
+            continue
+        if MONTHLY_OWM_COUNT_AS_PRESENT:
+            if val == "A":
+                absent += 1
+            elif val in ("P", "OW", "M"):
+                present += 1
+        else:
+            if val == "P":
+                present += 1
+            elif val in ("A", "OW", "M"):
+                absent += 1
+    row["present_days"] = present
+    row["absent_days"] = absent
+
+
 def _get_monthly_attendance_summary_data(
     month=None,
     start_date_str=None,
@@ -4205,6 +4238,8 @@ def _get_monthly_attendance_summary_data(
                     "OW" if (attendance.checkin_time or attendance.last_checkin_time) else "A"
                 )
 
+        _append_monthly_pa_day_totals(row, date_range)
+
         summary_data.append(row)
 
     return {
@@ -4224,6 +4259,7 @@ def generate_monthly_attendance_summary_excel_internal(
     search=None,
     role=None,
     request=None,
+    include_location_column=None,
 ):
     """
     Internal helper function to generate monthly attendance summary Excel report.
@@ -4236,6 +4272,7 @@ def generate_monthly_attendance_summary_excel_internal(
         location_id: Optional UUID string to filter by location
         user_id: Optional UUID string to filter by guard
         request: Optional request object for timezone detection (to determine "today" for future date check)
+        include_location_column: If True, include Location column. If None, True when request.user.is_superuser else False.
     
     Returns: dict with 'file_path', 'filename', 'start_date', 'end_date', 'row_count'
     """
@@ -4255,6 +4292,11 @@ def generate_monthly_attendance_summary_excel_internal(
     date_range = result['date_range']
     start_date = result['start_date']
     end_date = result['end_date']
+
+    if include_location_column is None:
+        include_location_column = bool(
+            request and getattr(request.user, "is_superuser", False)
+        )
     
     # Create Excel workbook
     wb = Workbook()
@@ -4262,7 +4304,11 @@ def generate_monthly_attendance_summary_excel_internal(
     ws.title = "Monthly Attendance Summary"
     
     # Header row
-    headers = ["Name", "Emp Code", "Designation", "Location"] + [date.strftime("%d-%b") for date in date_range]
+    base_headers = ["Name", "Emp Code", "Designation"]
+    if include_location_column:
+        base_headers.append("Location")
+    base_headers.extend(["Present Days", "Absent Days"])
+    headers = base_headers + [date.strftime("%d-%b") for date in date_range]
     ws.append(headers)
     
     # Data rows
@@ -4272,8 +4318,11 @@ def generate_monthly_attendance_summary_excel_internal(
             row_data["name"],
             row_data.get("employee_code") or "",
             row_data.get("designation") or "",
-            row_data["location"],
         ]
+        if include_location_column:
+            row.append(row_data["location"])
+        row.append(row_data.get("present_days", 0))
+        row.append(row_data.get("absent_days", 0))
         # Add attendance for each date
         for date in date_range:
             row.append(row_data.get(date.strftime("%d-%b"), "-"))
@@ -4499,6 +4548,7 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
                 user_id=user_id,
                 search=search,
                 role=role,
+                include_location_column=request.user.is_superuser,
             )
             
             file_path = result['file_path']
