@@ -1906,6 +1906,360 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
         return Response(data, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=["post"], url_path="face_attendance")
+    @parser_classes([MultiPartParser, FormParser])
+    def face_attendance(self, request):
+        """
+        Kiosk punch API (admin-token driven, face identifies target guard).
+        - Mandatory geofence validation
+        - One endpoint auto-handles checkin / checkout
+        """
+        from patrol_backend.utils.face_utils import is_face_attendance_available
+        from patrol_backend.utils.face_index import identify_user_in_location
+        from patrol_backend.utils.timezone_utils import get_user_timezone
+
+        def _kiosk_error(code, message, http_status=status.HTTP_400_BAD_REQUEST, extra=None):
+            body = {"success": False, "code": code, "message": message}
+            if extra:
+                body.update(extra)
+            return Response(body, status=http_status)
+
+        actor = request.user
+        actor_role = (getattr(actor, "role", "") or "").strip().lower()
+        if not (getattr(actor, "is_superuser", False) or actor_role == "admin"):
+            return _kiosk_error(
+                "forbidden",
+                "Only admin can use kiosk face attendance",
+                status.HTTP_403_FORBIDDEN,
+            )
+
+        if not is_face_attendance_available():
+            return _kiosk_error(
+                "face_library_missing",
+                "Face recognition is not installed on server",
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                extra={"hint": "Install requirements-face-attendance.txt and faiss-cpu"},
+            )
+
+        requested_location_id = request.data.get("location_id")
+        if getattr(actor, "is_superuser", False):
+            scoped_location_id = requested_location_id or getattr(actor, "location_id", None)
+            if not scoped_location_id:
+                return _kiosk_error("location_required", "location_id is required for superuser kiosk punch")
+        else:
+            if not getattr(actor, "location_id", None):
+                return _kiosk_error("location_missing", "Admin must be mapped to a location")
+            scoped_location_id = str(actor.location_id)
+            if requested_location_id and str(requested_location_id) != str(scoped_location_id):
+                return _kiosk_error(
+                    "location_forbidden",
+                    "Admin can only use kiosk for own location",
+                    status.HTTP_403_FORBIDDEN,
+                )
+
+        org_location = Location.objects.filter(id=scoped_location_id, is_deleted=False).first()
+        if not org_location:
+            return _kiosk_error("location_not_found", "Location not found", status.HTTP_404_NOT_FOUND)
+        if not getattr(org_location, "is_face_attendance_enabled", False):
+            return _kiosk_error("face_attendance_disabled", "Face attendance is disabled for this location")
+
+        # Kiosk rule: geofence is mandatory.
+        try:
+            lat = float(request.data.get("latitude"))
+            lon = float(request.data.get("longitude"))
+        except (TypeError, ValueError):
+            return _kiosk_error("geofence_required", "latitude and longitude are required")
+
+        if org_location.latitude is None or org_location.longitude is None:
+            return _kiosk_error(
+                "location_geofence_not_configured",
+                "Location geofence coordinates are not configured",
+            )
+
+        distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
+        allowed_distance = _get_site_setting_int(
+            key="attendance_distance",
+            location_id=getattr(org_location, "id", None),
+            default_value=100,
+        )
+        if distance > allowed_distance:
+            return _kiosk_error(
+                "outside_geofence",
+                f"Not within >{allowed_distance}m of assigned location",
+                extra={"distance_m": round(distance, 2), "allowed_distance_m": allowed_distance},
+            )
+
+        image_file = (
+            request.FILES.get("image")
+            or request.FILES.get("checkin_image")
+            or request.FILES.get("checkout_image")
+        )
+        raw_bytes = image_file.read() if image_file else None
+        if not raw_bytes:
+            return _kiosk_error("face_image_required", "Face image is required")
+
+        matched_user_id, face_code, _face_distance = identify_user_in_location(
+            str(org_location.id),
+            raw_bytes,
+        )
+        if not matched_user_id:
+            if face_code == "face_not_detected":
+                return _kiosk_error("face_not_detected", "No face found in uploaded image")
+            if face_code == "no_enrolled_faces":
+                return _kiosk_error("no_enrolled_faces", "No enrolled face users found for this location")
+            return _kiosk_error("face_not_matched", "Face does not match any enrolled user")
+
+        user = User.objects.filter(id=matched_user_id, is_deleted=False, is_active=True).first()
+        if not user:
+            return _kiosk_error("matched_user_not_found", "Matched user not found", status.HTTP_404_NOT_FOUND)
+        if str(getattr(user, "location_id", "")) != str(org_location.id):
+            return _kiosk_error(
+                "matched_user_location_mismatch",
+                "Matched user does not belong to kiosk location",
+                status.HTTP_403_FORBIDDEN,
+            )
+        greeting_name = (
+            (getattr(user, "name", "") or "").strip()
+            or (getattr(user, "email", "") or "").strip()
+            or "User"
+        )
+        def _fmt_time_user(dt):
+            if not dt:
+                return None
+            return to_user_timezone(dt, user_tz).strftime("%I:%M %p")
+        def _fmt_duration(total_minutes):
+            if total_minutes is None:
+                return None
+            m = int(total_minutes)
+            h = m // 60
+            rem = m % 60
+            if h <= 0:
+                return f"{rem} {'minute' if rem == 1 else 'minutes'}"
+            return f"{h} {'hour' if h == 1 else 'hours'} {rem} {'minute' if rem == 1 else 'minutes'}"
+        def _fmt_offset_minutes(total_minutes):
+            if total_minutes is None:
+                return None
+            m = max(0, int(total_minutes))
+            return _fmt_duration(m)
+
+        user_tz = get_user_timezone(user)
+        assignment, shift_start_date = self.get_today_assignment_v2(user, request=None)
+        if not assignment or getattr(assignment, "location_id", None) != getattr(org_location, "id", None):
+            return Response(
+                {
+                    "success": False,
+                    "code": "no_shift_today",
+                    "message": f"Hi {greeting_name}, no shifts are assigned for today.",
+                    "user_id": str(user.id),
+                    "has_shift": False,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        shift = assignment.shift
+        search_start_utc, search_end_utc, shift_start_dt_user, shift_end_dt_user, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+        )
+        shift_window_text = (
+            f"Your shift time is {shift_start_dt_user.strftime('%I:%M %p')} to {shift_end_dt_user.strftime('%I:%M %p')}."
+        )
+
+        latest_checkin = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkin",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc,
+        ).order_by("-timestamp").first()
+        latest_checkout = CheckInLog.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type="checkout",
+            timestamp__gte=search_start_utc,
+            timestamp__lt=search_end_utc,
+        ).order_by("-timestamp").first()
+        has_open_session = bool(
+            latest_checkin and (not latest_checkout or latest_checkin.timestamp > latest_checkout.timestamp)
+        )
+
+        img_name = "kiosk.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+
+        attendance, _ = AttendanceCheckin.objects.get_or_create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            defaults={"created_on": timezone.now(), "shift_date": shift_start_date},
+        )
+        attendance = AttendanceCheckin.objects.filter(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            shift_date=shift_start_date,
+        ).first() or attendance
+
+        action_mode = "checkin"
+        if has_open_session:
+            action_mode = "checkout"
+            min_checkout_minutes = 5
+            elapsed_seconds = int((timezone.now() - latest_checkin.timestamp).total_seconds())
+            if elapsed_seconds < (min_checkout_minutes * 60):
+                remaining = max(0, (min_checkout_minutes * 60) - elapsed_seconds)
+                return _kiosk_error(
+                    "checkout_too_early",
+                    f"Checkout allowed after {min_checkout_minutes} minutes from checkin",
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "min_checkout_minutes": min_checkout_minutes,
+                        "remaining_seconds": remaining,
+                    },
+                )
+
+        log = CheckInLog.objects.create(
+            guard=user,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            type=action_mode,
+            latitude=lat,
+            longitude=lon,
+        )
+        log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+        if action_mode == "checkin":
+            earliest_checkin = CheckInLog.objects.filter(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkin",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("timestamp").first()
+            if earliest_checkin:
+                attendance.checkin_time = earliest_checkin.timestamp
+                attendance.latitude = earliest_checkin.latitude
+                attendance.longitude = earliest_checkin.longitude
+            attendance.shift_date = shift_start_date
+            attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
+            attendance.save()
+            status_code = status.HTTP_201_CREATED
+        else:
+            latest_checkout = CheckInLog.objects.filter(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkout",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("-timestamp").first()
+            if latest_checkout:
+                attendance.checkout_time = latest_checkout.timestamp
+            attendance.shift_date = shift_start_date
+            attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
+            attendance.save()
+            status_code = status.HTTP_200_OK
+
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
+        payload = AttendanceCheckinSerializer(attendance, context={"request": request}).data
+        voice_text = ""
+        if action_mode == "checkin":
+            first_checkin = CheckInLog.objects.filter(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkin",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("timestamp").first()
+            # Only first check-in of the shift should announce late/on-time details.
+            # Later check-ins in the same shift should be a simple confirmation message.
+            checkin_count_in_shift = int(getattr(attendance, "checkin_count", 0) or 0)
+            if checkin_count_in_shift > 1:
+                voice_text = f"Hi {greeting_name}. Your check-in is marked successfully."
+            elif first_checkin:
+                first_checkin_user = to_user_timezone(first_checkin.timestamp, user_tz)
+                late_min = int((first_checkin_user - shift_start_dt_user).total_seconds() // 60)
+                if late_min > 0:
+                    late_text = _fmt_offset_minutes(late_min)
+                    voice_text = (
+                        f"Hi {greeting_name}. Check-in marked at {first_checkin_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text} You are late by {late_text}."
+                    )
+                else:
+                    voice_text = (
+                        f"Hi {greeting_name}. Check-in marked at {first_checkin_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text}"
+                    )
+        else:
+            last_checkout = CheckInLog.objects.filter(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkout",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).order_by("-timestamp").first()
+            duration_text = _fmt_duration(getattr(attendance, "duration_minutes", None))
+            if last_checkout:
+                checkout_user = to_user_timezone(last_checkout.timestamp, user_tz)
+                early_min = int((shift_end_dt_user - checkout_user).total_seconds() // 60)
+                if early_min > 0:
+                    early_text = _fmt_offset_minutes(early_min)
+                    voice_text = (
+                        f"Hi {greeting_name}. Checkout marked at {checkout_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text} You checked out {early_text} early."
+                    )
+                else:
+                    voice_text = (
+                        f"Hi {greeting_name}. Checkout marked at {checkout_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text}"
+                    )
+                if duration_text:
+                    voice_text += f" Total worked duration is {duration_text}."
+            else:
+                voice_text = f"Hi {greeting_name}. Checkout marked successfully. {shift_window_text}"
+
+        if not voice_text:
+            voice_text = (
+                f"Hi {greeting_name}, your check-in is marked successfully."
+                if action_mode == "checkin"
+                else f"Hi {greeting_name}, your checkout is marked successfully."
+            )
+        if isinstance(payload, dict):
+            payload["kiosk_mode"] = True
+            payload["mode"] = action_mode
+            payload["face_attendance"] = True
+            payload["face_verified"] = True
+            payload["has_shift"] = True
+            payload["user_id"] = str(user.id)
+
+        return Response(
+            {
+                "success": True,
+                "code": f"{action_mode}_success",
+                "message": voice_text,
+                "user_id": str(user.id),
+                "has_shift": True,
+                "data": payload,
+            },
+            status=status_code,
+        )
+
     @action(detail=False, methods=["post"], url_path="force-checkout_v3")
     @parser_classes([MultiPartParser, FormParser])
     def force_checkout_v3(self, request):

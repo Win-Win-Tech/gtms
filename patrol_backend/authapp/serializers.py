@@ -111,6 +111,14 @@ def _try_refresh_face_encoding(user):
         refresh_user_face_encoding_from_photo(user)
     except Exception:
         pass
+    # Keep kiosk FAISS index in sync on every face register/update/remove.
+    try:
+        from patrol_backend.utils.face_index import rebuild_location_index
+
+        if getattr(user, "location_id", None):
+            rebuild_location_index(str(user.location_id))
+    except Exception:
+        pass
 
 
 def _register_heif_opener_if_available():

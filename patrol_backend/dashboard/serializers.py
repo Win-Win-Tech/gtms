@@ -1,12 +1,29 @@
 from rest_framework import serializers
 import pytz
 from datetime import datetime, timedelta
+from django.apps import apps
 from .models import AttendanceCheckin, CheckInLog
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
     to_user_timezone,
     convert_date_range_to_utc,
 )
+
+
+def _get_site_setting_int_local(key, location_id=None, default_value=None):
+    """Read integer SiteSetting value without importing dashboard.views."""
+    try:
+        SiteSetting = apps.get_model("scheduler", "SiteSetting")
+        raw = SiteSetting.get_setting(
+            key=key,
+            location_id=location_id,
+            default_value=default_value,
+        )
+        if raw is None:
+            return default_value
+        return int(raw)
+    except Exception:
+        return default_value
 
 class AttendanceCheckinSerializer(serializers.ModelSerializer):
     status = serializers.ReadOnlyField()
@@ -210,9 +227,17 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             shift_end_local = user_tz.localize(datetime.combine(shift_day + timedelta(days=1), obj.shift.end_time))
         else:
             shift_end_local = user_tz.localize(datetime.combine(shift_day, obj.shift.end_time))
+        
+        # Use dynamic site setting for grace time
+        grace_minutes = _get_site_setting_int_local(
+            key="shift_grace_time",
+            location_id=getattr(obj.org_location, "id", None),
+            default_value=30,
+        )
+
         # Keep small grace so near-boundary events still appear in popup.
-        search_start_utc = (shift_start_local - timedelta(minutes=30)).astimezone(pytz.UTC)
-        search_end_utc = (shift_end_local + timedelta(minutes=30)).astimezone(pytz.UTC)
+        search_start_utc = (shift_start_local - timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
+        search_end_utc = (shift_end_local + timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
 
         logs = CheckInLog.objects.filter(
             guard=obj.guard,

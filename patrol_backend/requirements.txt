@@ -48,6 +48,7 @@ openpyxl==3.1.5
 packaging==25.0
 pillow==11.3.0
 pillow-heif==0.21.0
+faiss-cpu
 prompt_toolkit==3.0.52
 propcache==0.4.1
 py-ubjson==0.16.1
