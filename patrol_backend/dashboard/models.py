@@ -13,9 +13,10 @@ class AttendanceCheckin(models.Model):
     ]
     PA_STATUS_CHOICES = [
         ("P", "Present"),
-        ("A", "Absent"),
         ("OW", "On Work"),
         ("M", "Missed Checkout"),
+        ("LD", "Less Duration"),
+        ("A", "Absent (Legacy)"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

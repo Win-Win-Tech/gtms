@@ -26,7 +26,7 @@ def calculate_attendance_from_master(user, month_str, user_tz):
     """
     Current GTMS rule:
     - working_days = full month days
-    - present/absent from AttendanceCheckin.pa_status (P/A); OW days do not add to either until closed
+    - present/absent from AttendanceCheckin.pa_status (P/LD/M); OW days do not add to either until closed
     - absent for no-entry days in month
     """
     _, _, month_start, month_end = parse_month(month_str)
@@ -84,8 +84,8 @@ def calculate_attendance_from_master(user, month_str, user_tz):
         elif st == "OW":
             # Shift not finished in payroll sense — do not count as full present/absent here.
             pass
-        elif st in ("A", "M"):
-            # Absent or missed checkout should be treated as absent for payroll.
+        elif st in ("LD", "M", "A"):
+            # Less duration / missed checkout / legacy absent should be treated as absent for payroll.
             absent_days += Decimal("1")
         else:
             # no master entry/mark -> absent under current business rule

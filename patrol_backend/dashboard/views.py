@@ -259,7 +259,7 @@ def _attendance_v3_compute_pa_status_from_duration(duration_minutes, shift, _loc
     """
     After checkout: compare total worked minutes to scheduled shift length.
     - P : duration >= shift length
-    - A : duration < shift length
+    - LD: duration < shift length
     """
     if duration_minutes is None:
         return None
@@ -269,14 +269,14 @@ def _attendance_v3_compute_pa_status_from_duration(duration_minutes, shift, _loc
         return None
     required = _shift_required_duration_minutes(shift)
     if required <= 0:
-        return "A"
-    return "P" if worked >= required else "A"
+        return "LD"
+    return "P" if worked >= required else "LD"
 
 
 def _attendance_v3_compute_pa_status_from_summary(summary, shift, _location_id=None, window_end_utc=None):
     """
     - OW: open session (still checked in / no closing checkout in window).
-    - P/A: after checkout — worked duration vs scheduled shift length.
+    - P/LD: after checkout — worked duration vs scheduled shift length.
     """
     if not summary:
         return None
@@ -359,8 +359,11 @@ def _apply_attendance_v3_status_filter(queryset, status_value):
         return queryset.filter(pa_status="OW")
     if v in ("missed", "m", "missed_checkout"):
         return queryset.filter(pa_status="M")
+    if v in ("less_duration", "ld"):
+        return queryset.filter(pa_status="LD")
     if v == "absent":
-        return queryset.filter(pa_status="A")
+        # Backward-compatible alias after removing active "A" usage.
+        return queryset.filter(pa_status__in=["LD", "A"])
     if v == "checked_out":
         return queryset.filter(
             Q(last_checkin_time__isnull=False) &
@@ -546,6 +549,57 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         return assignment, today
         
         return None, None
+
+    def _resolve_scope_location_id(self, request):
+        """
+        Resolve location scope based on actor role.
+        - superuser: can pass location_id, fallback to actor.location_id
+        - admin/so/fo: locked to actor.location_id
+        """
+        actor = request.user
+        requested_location_id = request.query_params.get("location_id") or request.data.get("location_id")
+        actor_role = (getattr(actor, "role", "") or "").strip().lower()
+
+        if getattr(actor, "is_superuser", False):
+            scoped_location_id = requested_location_id or getattr(actor, "location_id", None)
+            if not scoped_location_id:
+                return None, Response(
+                    {"error": "location_id is required for superuser"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return str(scoped_location_id), None
+
+        if actor_role not in {"admin", "so", "fo"}:
+            return None, Response(
+                {"error": "Only admin/SO/FO/superuser can access this API"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        actor_location_id = getattr(actor, "location_id", None)
+        if not actor_location_id:
+            return None, Response(
+                {"error": "User is not mapped to a location"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if requested_location_id and str(requested_location_id) != str(actor_location_id):
+            return None, Response(
+                {"error": "You can access only your own location"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return str(actor_location_id), None
+
+    def _parse_bulk_datetime_to_utc(self, raw_value, user_tz, label):
+        if raw_value in (None, ""):
+            raise ValueError(f"{label} is required")
+        try:
+            parsed = datetime.fromisoformat(str(raw_value).strip().replace("Z", "+00:00"))
+        except Exception:
+            raise ValueError(f"Invalid {label}. Use ISO datetime format.")
+        if parsed.tzinfo is None:
+            parsed = user_tz.localize(parsed)
+        return parsed.astimezone(pytz.UTC)
 
     def find_and_create_default_assignment(self, user, checkin_time_user, user_tz, location_lat, location_lon):
         """
@@ -2803,6 +2857,362 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "checkpoints_count": len(checkpoints)
         }, status=status.HTTP_201_CREATED)
 
+    @action(detail=False, methods=["get"], url_path="bulk-entry-candidates")
+    def bulk_entry_candidates(self, request):
+        """
+        List attendance exception candidates for selected date and scoped location:
+        1) no_shift
+        2) shift_no_checkin
+        """
+        scoped_location_id, error_response = self._resolve_scope_location_id(request)
+        if error_response:
+            return error_response
+
+        date_str = request.query_params.get("date")
+        if not date_str:
+            return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_date = parse_date(date_str)
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        search = (request.query_params.get("search") or "").strip()
+        role_filter = (request.query_params.get("role") or "").strip().lower()
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+
+        users_qs = User.objects.filter(
+            is_deleted=False,
+            is_active=True,
+            location_id=scoped_location_id,
+        ).exclude(
+            Q(role__iexact="admin") | Q(is_superuser=True)
+        )
+        if role_filter and role_filter not in ("all",):
+            users_qs = users_qs.filter(role__iexact=role_filter)
+        if search:
+            users_qs = users_qs.filter(
+                Q(name__icontains=search) |
+                Q(employee_code__icontains=search) |
+                Q(email__icontains=search)
+            )
+        users = list(users_qs.order_by("name", "employee_code"))
+        user_ids = [u.id for u in users]
+
+        assignments = list(
+            Assignment.objects.select_related("shift", "location").filter(
+                guard_id__in=user_ids,
+                start_date__lte=target_date,
+                end_date__gte=target_date,
+                is_deleted=False,
+            ).order_by("-modified_on")
+        )
+        assignment_by_guard = {}
+        for assgn in assignments:
+            assignment_by_guard.setdefault(str(assgn.guard_id), assgn)
+
+        no_shift = []
+        shift_no_checkin = []
+        for guard in users:
+            assgn = assignment_by_guard.get(str(guard.id))
+            base = {
+                "user_id": str(guard.id),
+                "name": guard.name,
+                "employee_code": guard.employee_code or "",
+                "role": (guard.role or "").strip(),
+                "location_id": str(getattr(guard, "location_id", "") or ""),
+            }
+            if not assgn:
+                no_shift.append(base)
+                continue
+
+            if not assgn.shift:
+                no_shift.append(base)
+                continue
+
+            search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                target_date,
+                assgn.shift,
+                user_tz,
+                location_id=getattr(assgn.location, "id", None),
+            )
+            has_checkin = CheckInLog.objects.filter(
+                guard_id=guard.id,
+                assignment_id=assgn.id,
+                shift_id=assgn.shift_id,
+                org_location_id=assgn.location_id,
+                type="checkin",
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).exists()
+            if not has_checkin:
+                shift_no_checkin.append({
+                    **base,
+                    "assignment_id": str(assgn.id),
+                    "shift_id": str(assgn.shift_id),
+                    "shift_name": assgn.shift.name if assgn.shift else "",
+                    "shift_start": assgn.shift.start_time.strftime("%H:%M:%S") if assgn.shift else None,
+                    "shift_end": assgn.shift.end_time.strftime("%H:%M:%S") if assgn.shift else None,
+                })
+
+        location_obj = Location.objects.filter(id=scoped_location_id, is_deleted=False).first()
+        return Response(
+            {
+                "date": str(target_date),
+                "location_id": str(scoped_location_id),
+                "location_name": location_obj.name if location_obj else None,
+                "summary": {
+                    "total_users": len(users),
+                    "no_shift_count": len(no_shift),
+                    "shift_no_checkin_count": len(shift_no_checkin),
+                },
+                "no_shift": no_shift,
+                "shift_no_checkin": shift_no_checkin,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="bulk-entry")
+    def bulk_entry(self, request):
+        """
+        Bulk attendance entry in one flow:
+        - ensure assignment (using selected shift)
+        - create checkin log
+        - create checkout log
+        - refresh master attendance summary
+        """
+        scoped_location_id, error_response = self._resolve_scope_location_id(request)
+        if error_response:
+            return error_response
+
+        date_str = request.data.get("date")
+        user_ids = request.data.get("user_ids")
+        shift_id = request.data.get("shift_id")
+        checkin_time_raw = request.data.get("checkin_time")
+        checkout_time_raw = request.data.get("checkout_time")
+        reason = (request.data.get("reason") or "").strip()
+        latitude = request.data.get("latitude")
+        longitude = request.data.get("longitude")
+
+        if not date_str:
+            return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
+        target_date = parse_date(str(date_str))
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(user_ids, list) or not user_ids:
+            return Response({"error": "user_ids must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
+        if not shift_id:
+            return Response({"error": "shift_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not reason:
+            return Response({"error": "reason is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            shift = Shift.objects.select_related("location", "checkpoint_template").get(
+                id=shift_id,
+                is_deleted=False,
+            )
+        except Shift.DoesNotExist:
+            return Response({"error": "Shift not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if str(getattr(shift, "location_id", "")) != str(scoped_location_id):
+            return Response(
+                {"error": "Selected shift does not belong to the scoped location"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+        try:
+            checkin_utc = self._parse_bulk_datetime_to_utc(checkin_time_raw, user_tz, "checkin_time")
+            checkout_utc = self._parse_bulk_datetime_to_utc(checkout_time_raw, user_tz, "checkout_time")
+        except ValueError as ex:
+            return Response({"error": str(ex)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if checkout_utc <= checkin_utc:
+            return Response(
+                {"error": "checkout_time must be later than checkin_time"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        checkin_local = to_user_timezone(checkin_utc, user_tz)
+        checkout_local = to_user_timezone(checkout_utc, user_tz)
+        is_overnight_shift = bool(shift.end_time <= shift.start_time)
+
+        # Strict date guardrails for bulk entry:
+        # - normal shift: checkin + checkout must be on selected date
+        # - overnight shift: checkin on selected date, checkout on selected/next date
+        if checkin_local.date() != target_date:
+            return Response(
+                {"error": "For bulk entry, checkin_time date must match selected date"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not is_overnight_shift:
+            if checkout_local.date() != target_date:
+                return Response(
+                    {"error": "For normal shift, checkout_time date must match selected date"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            allowed_checkout_dates = {target_date, target_date + timedelta(days=1)}
+            if checkout_local.date() not in allowed_checkout_dates:
+                return Response(
+                    {"error": "For overnight shift, checkout_time must be on selected date or next date"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if latitude is None or longitude is None:
+            if shift.location and shift.location.latitude is not None and shift.location.longitude is not None:
+                latitude = shift.location.latitude
+                longitude = shift.location.longitude
+            else:
+                latitude, longitude = 0, 0
+
+        allowed_users = {
+            str(u.id): u for u in User.objects.filter(
+                id__in=user_ids,
+                is_deleted=False,
+                is_active=True,
+                location_id=scoped_location_id,
+            ).exclude(Q(role__iexact="admin") | Q(is_superuser=True))
+        }
+
+        success = []
+        failed = []
+        actor = request.user
+        for user_id in user_ids:
+            guard = allowed_users.get(str(user_id))
+            if not guard:
+                failed.append({
+                    "user_id": str(user_id),
+                    "error": "User not found in scoped location or not eligible",
+                })
+                continue
+
+            try:
+                with transaction.atomic():
+                    assignment = Assignment.objects.filter(
+                        guard_id=guard.id,
+                        start_date__lte=target_date,
+                        end_date__gte=target_date,
+                        is_deleted=False,
+                    ).order_by("-modified_on").first()
+                    if assignment:
+                        assignment.shift = shift
+                        assignment.location = shift.location
+                        # Bulk attendance entry is shift-only overwrite. Always clear
+                        # existing assignment checkpoints to avoid carrying old shift checkpoints.
+                        assignment.checkpoints = []
+                        assignment.modified_by = actor
+                        assignment.save()
+                    else:
+                        assignment = Assignment.objects.create(
+                            guard=guard,
+                            location=shift.location,
+                            shift=shift,
+                            start_date=target_date,
+                            end_date=target_date,
+                            created_by=actor,
+                            modified_by=actor,
+                        )
+
+                    search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                        target_date, shift, user_tz, location_id=getattr(shift.location, "id", None)
+                    )
+                    existing_checkin = CheckInLog.objects.filter(
+                        guard=guard,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=shift.location,
+                        type="checkin",
+                        timestamp__gte=search_start_utc,
+                        timestamp__lt=search_end_utc,
+                    ).exists()
+                    if existing_checkin:
+                        raise ValueError("Check-in already exists in selected shift window")
+
+                    if checkin_utc < search_start_utc or checkin_utc >= search_end_utc:
+                        raise ValueError("checkin_time is outside selected shift window")
+                    if checkout_utc < search_start_utc or checkout_utc >= search_end_utc:
+                        raise ValueError("checkout_time is outside selected shift window")
+
+                    checkin_log = CheckInLog.objects.create(
+                        guard=guard,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=shift.location,
+                        type="checkin",
+                        latitude=latitude,
+                        longitude=longitude,
+                    )
+                    CheckInLog.objects.filter(id=checkin_log.id).update(timestamp=checkin_utc)
+
+                    checkout_log = CheckInLog.objects.create(
+                        guard=guard,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=shift.location,
+                        type="checkout",
+                        latitude=latitude,
+                        longitude=longitude,
+                    )
+                    CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
+
+                    attendance, _ = AttendanceCheckin.objects.get_or_create(
+                        guard=guard,
+                        assignment=assignment,
+                        shift=shift,
+                        org_location=shift.location,
+                        shift_date=target_date,
+                        defaults={"created_on": timezone.now()},
+                    )
+                    attendance.checkin_time = checkin_utc
+                    attendance.checkout_time = checkout_utc
+                    attendance.shift_date = target_date
+                    attendance.edited_by = actor
+                    attendance.edited_on = timezone.now()
+                    attendance.edit_reason = reason
+                    attendance.save()
+
+                    _attendance_v3_refresh_saved_fields(
+                        attendance,
+                        guard,
+                        assignment,
+                        shift,
+                        shift.location,
+                        search_start_utc,
+                        search_end_utc,
+                    )
+                    success.append({
+                        "user_id": str(guard.id),
+                        "name": guard.name,
+                        "employee_code": guard.employee_code or "",
+                        "assignment_id": str(assignment.id),
+                        "attendance_id": str(attendance.id),
+                        "pa_status": attendance.pa_status,
+                    })
+            except Exception as ex:
+                failed.append({
+                    "user_id": str(user_id),
+                    "error": str(ex),
+                })
+
+        return Response(
+            {
+                "date": str(target_date),
+                "location_id": str(scoped_location_id),
+                "shift_id": str(shift.id),
+                "shift_name": shift.name,
+                "reason": reason,
+                "summary": {
+                    "requested_count": len(user_ids),
+                    "success_count": len(success),
+                    "failed_count": len(failed),
+                },
+                "success": success,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK if not failed else status.HTTP_207_MULTI_STATUS,
+        )
+
     @action(detail=False, methods=["post"], url_path="assign-checkpoint-template")
     def assign_checkpoint_template(self, request):
         """
@@ -4252,7 +4662,13 @@ def generate_attendance_v3_excel_report_internal(
         if obj.duration_minutes is not None:
             minutes_total = int(obj.duration_minutes)
             duration = f"{minutes_total // 60:02}:{minutes_total % 60:02}"
-        pa_map = {"P": "Present", "A": "Absent", "OW": "On Work", "M": "Missed Checkout"}
+        pa_map = {
+            "P": "Present",
+            "OW": "On Work",
+            "M": "Missed Checkout",
+            "LD": "Less Duration",
+            "A": "Absent (Legacy)",
+        }
         pa_text = pa_map.get(obj.pa_status, "")
         live_state = "Checked In" if (
             obj.last_checkin_time and (not obj.last_checkout_time or obj.last_checkin_time > obj.last_checkout_time)
@@ -4372,15 +4788,15 @@ class AttendanceCheckinV3ExportView(APIView):
             return Response({"error": f"Failed to generate v3 report: {str(e)}"}, status=500)
 
 
-# Monthly summary Present/Absent day totals: flip this one flag to change OW/M handling.
-# False (default): only P → present; A, OW, M → absent.
-# True: P, OW, M → present; only A → absent.
+# Monthly summary Present/Absent day totals: flip this flag to change OW/M handling.
+# False (default): only P → present; LD, OW, M → absent.
+# True: P, OW, M → present; LD → absent.
 MONTHLY_OWM_COUNT_AS_PRESENT = False
 
 
 def _append_monthly_pa_day_totals(row, date_range):
     """
-    Count present vs absent days from daily cells (P/A/OW/M).
+    Count present vs absent days from daily cells (P/LD/OW/M).
     "-" (no assignment / future / N/A) excluded from both totals.
     Behavior is controlled by MONTHLY_OWM_COUNT_AS_PRESENT (see module constant above).
     """
@@ -4392,14 +4808,14 @@ def _append_monthly_pa_day_totals(row, date_range):
         if val == "-":
             continue
         if MONTHLY_OWM_COUNT_AS_PRESENT:
-            if val == "A":
+            if val in ("LD", "A"):
                 absent += 1
             elif val in ("P", "OW", "M"):
                 present += 1
         else:
             if val == "P":
                 present += 1
-            elif val in ("A", "OW", "M"):
+            elif val in ("LD", "A", "OW", "M"):
                 absent += 1
     row["present_days"] = present
     row["absent_days"] = absent
@@ -4522,7 +4938,7 @@ def _get_monthly_attendance_summary_data(
 
         # Check attendance for each date
         for date in date_range:
-            # Check if date is in the future - if so, show "-" instead of "A"
+            # Check if date is in the future - if so, show "-"
             if date > user_today:
                 row[date.strftime("%d-%b")] = "-"
                 continue
@@ -4533,7 +4949,7 @@ def _get_monthly_attendance_summary_data(
             ]
 
             if not active_assignments:
-                row[date.strftime("%d-%b")] = "-" if date == user_today else "A"
+                row[date.strftime("%d-%b")] = "-"
                 continue
 
             # Use strict shift-instance windows against AttendanceCheckin master table.
@@ -4572,7 +4988,7 @@ def _get_monthly_attendance_summary_data(
                 attendance = candidate_attendance[0]
 
             if not attendance:
-                row[date.strftime("%d-%b")] = "-" if date == user_today else "A"
+                row[date.strftime("%d-%b")] = "-" if date == user_today else "M"
                 continue
 
             # Prefer persisted pa_status (set after checkout_v2/v3 refresh).
@@ -4584,12 +5000,13 @@ def _get_monthly_attendance_summary_data(
                     _attendance_v3_compute_pa_status_from_duration(
                         attendance.duration_minutes, attendance.shift
                     )
-                    or "A"
+                    or "LD"
                 )
             else:
                 # Still on duty (checked in but no checkout yet).
                 row[date.strftime("%d-%b")] = (
-                    "OW" if (attendance.checkin_time or attendance.last_checkin_time) else "A"
+                    "OW" if (attendance.checkin_time or attendance.last_checkin_time)
+                    else ("-" if date == user_today else "M")
                 )
 
         _append_monthly_pa_day_totals(row, date_range)
