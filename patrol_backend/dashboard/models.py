@@ -168,3 +168,61 @@ class GlobalAuditLog(models.Model):
 
     def __str__(self):
         return f"{self.app_label}.{self.model_name}:{self.object_pk} [{self.event_type}]"
+
+
+class AttendanceWeekOff(models.Model):
+    """
+    Stored week-off marks (W) per user (user_id), location (location_id), and calendar date.
+    Used by monthly week-off Excel upload and listing (separate from check-in derived P/A).
+    """
+
+    SOURCE_CHOICES = [
+        ("excel_upload", "Excel upload"),
+        ("api", "API"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="attendance_weekoffs",
+    )
+    location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        related_name="attendance_weekoffs",
+    )
+    weekoff_date = models.DateField(db_index=True)
+    mark = models.CharField(max_length=3, default="W")
+    source = models.CharField(
+        max_length=20,
+        choices=SOURCE_CHOICES,
+        default="excel_upload",
+        db_index=True,
+    )
+    upload_batch_id = models.UUIDField(null=True, blank=True, db_index=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attendance_weekoffs_created",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "location", "weekoff_date"],
+                name="uniq_attendance_weekoff_user_location_date",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["location", "weekoff_date"]),
+            models.Index(fields=["user", "weekoff_date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} @ {self.location_id} {self.weekoff_date} [{self.mark}]"

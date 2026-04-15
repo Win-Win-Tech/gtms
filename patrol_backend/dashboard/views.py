@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import os
+import uuid
 from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -13,10 +14,11 @@ from django.core.files.base import ContentFile
 # Third-party imports
 import pytz
 from geopy.distance import geodesic
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 # Django imports
 from django.conf import settings
+from django.core.cache import cache
 from django.core.serializers import serialize
 from django.db import transaction
 from django.db.models import Avg, Count, F, Q
@@ -56,7 +58,7 @@ from patrol_backend.utils.timezone_utils import (
     combine_date_time_in_user_tz
 )
 
-from .models import AttendanceCheckin, CheckInLog
+from .models import AttendanceCheckin, AttendanceWeekOff, CheckInLog
 from .serializers import (
     AttendanceBoundaryEditSerializer,
     AttendanceCheckinDashboardSerializer,
@@ -2912,6 +2914,15 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         no_shift = []
         shift_no_checkin = []
+        weekoff = []
+        weekoff_user_ids = set(
+            str(uid)
+            for uid in AttendanceWeekOff.objects.filter(
+                location_id=scoped_location_id,
+                weekoff_date=target_date,
+                user_id__in=user_ids,
+            ).values_list("user_id", flat=True)
+        )
         for guard in users:
             assgn = assignment_by_guard.get(str(guard.id))
             base = {
@@ -2921,6 +2932,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "role": (guard.role or "").strip(),
                 "location_id": str(getattr(guard, "location_id", "") or ""),
             }
+            if str(guard.id) in weekoff_user_ids:
+                weekoff.append(base)
+                continue
             if not assgn:
                 no_shift.append(base)
                 continue
@@ -2962,9 +2976,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "location_name": location_obj.name if location_obj else None,
                 "summary": {
                     "total_users": len(users),
+                    "weekoff_count": len(weekoff),
                     "no_shift_count": len(no_shift),
                     "shift_no_checkin_count": len(shift_no_checkin),
                 },
+                "weekoff": weekoff,
                 "no_shift": no_shift,
                 "shift_no_checkin": shift_no_checkin,
             },
@@ -3114,6 +3130,13 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                             modified_by=actor,
                         )
 
+                    # When bulk-assigning shift/checkin for a weekoff guard, clear that day's weekoff.
+                    AttendanceWeekOff.objects.filter(
+                        user_id=guard.id,
+                        location_id=scoped_location_id,
+                        weekoff_date=target_date,
+                    ).delete()
+
                     search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
                         target_date, shift, user_tz, location_id=getattr(shift.location, "id", None)
                     )
@@ -3201,6 +3224,91 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "location_id": str(scoped_location_id),
                 "shift_id": str(shift.id),
                 "shift_name": shift.name,
+                "reason": reason,
+                "summary": {
+                    "requested_count": len(user_ids),
+                    "success_count": len(success),
+                    "failed_count": len(failed),
+                },
+                "success": success,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK if not failed else status.HTTP_207_MULTI_STATUS,
+        )
+
+    @action(detail=False, methods=["post"], url_path="bulk-weekoff")
+    def bulk_weekoff(self, request):
+        """
+        Mark selected users as weekoff (W) for selected date + scoped location.
+        """
+        scoped_location_id, error_response = self._resolve_scope_location_id(request)
+        if error_response:
+            return error_response
+
+        date_str = request.data.get("date")
+        user_ids = request.data.get("user_ids")
+        reason = (request.data.get("reason") or "").strip()
+
+        if not date_str:
+            return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
+        target_date = parse_date(str(date_str))
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(user_ids, list) or not user_ids:
+            return Response({"error": "user_ids must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
+
+        allowed_users = {
+            str(u.id): u for u in User.objects.filter(
+                id__in=user_ids,
+                is_deleted=False,
+                is_active=True,
+                location_id=scoped_location_id,
+            ).exclude(Q(role__iexact="admin") | Q(is_superuser=True))
+        }
+
+        success = []
+        failed = []
+        actor = request.user
+        batch_id = uuid.uuid4()
+
+        for user_id in user_ids:
+            guard = allowed_users.get(str(user_id))
+            if not guard:
+                failed.append({
+                    "user_id": str(user_id),
+                    "error": "User not found in scoped location or not eligible",
+                })
+                continue
+            try:
+                with transaction.atomic():
+                    obj, _created = AttendanceWeekOff.objects.update_or_create(
+                        user_id=guard.id,
+                        location_id=scoped_location_id,
+                        weekoff_date=target_date,
+                        defaults={
+                            "mark": "W",
+                            "source": "api",
+                            "upload_batch_id": batch_id,
+                            "created_by": actor,
+                        },
+                    )
+                    success.append({
+                        "user_id": str(guard.id),
+                        "name": guard.name,
+                        "employee_code": guard.employee_code or "",
+                        "weekoff_id": str(obj.id),
+                    })
+            except Exception as ex:
+                failed.append({
+                    "user_id": str(user_id),
+                    "error": str(ex),
+                })
+
+        return Response(
+            {
+                "date": str(target_date),
+                "location_id": str(scoped_location_id),
                 "reason": reason,
                 "summary": {
                     "requested_count": len(user_ids),
@@ -4788,37 +4896,23 @@ class AttendanceCheckinV3ExportView(APIView):
             return Response({"error": f"Failed to generate v3 report: {str(e)}"}, status=500)
 
 
-# Monthly summary Present/Absent day totals: flip this flag to change OW/M handling.
-# False (default): only P → present; LD, OW, M → absent.
-# True: P, OW, M → present; LD → absent.
-MONTHLY_OWM_COUNT_AS_PRESENT = False
-
-
-def _append_monthly_pa_day_totals(row, date_range):
+def _append_monthly_day_totals(row, date_range):
     """
-    Count present vs absent days from daily cells (P/LD/OW/M).
-    "-" (no assignment / future / N/A) excluded from both totals.
-    Behavior is controlled by MONTHLY_OWM_COUNT_AS_PRESENT (see module constant above).
+    Count summary days from daily cells:
+    - present_days: count of "P"
+    - weekoff_days: count of "W"
     """
     present = 0
-    absent = 0
+    weekoff = 0
     for d in date_range:
         key = d.strftime("%d-%b")
-        val = row.get(key, "-")
-        if val == "-":
-            continue
-        if MONTHLY_OWM_COUNT_AS_PRESENT:
-            if val in ("LD", "A"):
-                absent += 1
-            elif val in ("P", "OW", "M"):
-                present += 1
-        else:
-            if val == "P":
-                present += 1
-            elif val in ("LD", "A", "OW", "M"):
-                absent += 1
+        val = row.get(key, "")
+        if val == "P":
+            present += 1
+        elif val == "W":
+            weekoff += 1
     row["present_days"] = present
-    row["absent_days"] = absent
+    row["weekoff_days"] = weekoff
 
 
 def _get_monthly_attendance_summary_data(
@@ -4924,6 +5018,21 @@ def _get_monthly_attendance_summary_data(
         grouped[key]["assignments"].append(assignment)
 
     summary_data = []
+    grouped_guard_ids = [gid for (gid, _loc_id) in grouped.keys()]
+    grouped_location_ids = [loc_id for (_gid, loc_id) in grouped.keys() if loc_id]
+    weekoff_lookup = set()
+    if grouped_guard_ids:
+        weekoff_qs = AttendanceWeekOff.objects.filter(
+            user_id__in=grouped_guard_ids,
+            weekoff_date__gte=start_date,
+            weekoff_date__lte=end_date,
+        )
+        if grouped_location_ids:
+            weekoff_qs = weekoff_qs.filter(location_id__in=grouped_location_ids)
+        weekoff_lookup = {
+            (str(uid), str(loc), wd)
+            for uid, loc, wd in weekoff_qs.values_list("user_id", "location_id", "weekoff_date")
+        }
 
     # Build summary for each guard-location combination
     for (guard_id, loc_id), data in grouped.items():
@@ -4938,9 +5047,14 @@ def _get_monthly_attendance_summary_data(
 
         # Check attendance for each date
         for date in date_range:
+            cell_key = date.strftime("%d-%b")
             # Check if date is in the future - if so, show "-"
             if date > user_today:
-                row[date.strftime("%d-%b")] = "-"
+                row[cell_key] = ""
+                continue
+
+            if (str(guard_id), str(loc_id), date) in weekoff_lookup:
+                row[cell_key] = "W"
                 continue
 
             active_assignments = [
@@ -4949,7 +5063,7 @@ def _get_monthly_attendance_summary_data(
             ]
 
             if not active_assignments:
-                row[date.strftime("%d-%b")] = "-"
+                row[cell_key] = ""
                 continue
 
             # Use strict shift-instance windows against AttendanceCheckin master table.
@@ -4988,28 +5102,37 @@ def _get_monthly_attendance_summary_data(
                 attendance = candidate_attendance[0]
 
             if not attendance:
-                row[date.strftime("%d-%b")] = "-" if date == user_today else "M"
+                row[cell_key] = ""
                 continue
 
             # Prefer persisted pa_status (set after checkout_v2/v3 refresh).
             if attendance.pa_status:
-                row[date.strftime("%d-%b")] = attendance.pa_status
+                if attendance.pa_status == "P":
+                    row[cell_key] = "P"
+                elif attendance.pa_status in ("LD", "A"):
+                    # Legacy "A" should be shown as "LD" in monthly summary.
+                    row[cell_key] = "LD"
+                else:
+                    row[cell_key] = ""
             elif attendance.checkout_time or attendance.last_checkout_time:
                 # Fallback for any records created before the new persist logic.
-                row[date.strftime("%d-%b")] = (
+                computed_status = (
                     _attendance_v3_compute_pa_status_from_duration(
                         attendance.duration_minutes, attendance.shift
                     )
                     or "LD"
                 )
+                if computed_status == "P":
+                    row[cell_key] = "P"
+                elif computed_status in ("LD", "A"):
+                    row[cell_key] = "LD"
+                else:
+                    row[cell_key] = ""
             else:
-                # Still on duty (checked in but no checkout yet).
-                row[date.strftime("%d-%b")] = (
-                    "OW" if (attendance.checkin_time or attendance.last_checkin_time)
-                    else ("-" if date == user_today else "M")
-                )
+                # Still on duty / no closed status yet → keep blank.
+                row[cell_key] = ""
 
-        _append_monthly_pa_day_totals(row, date_range)
+        _append_monthly_day_totals(row, date_range)
 
         summary_data.append(row)
 
@@ -5078,7 +5201,7 @@ def generate_monthly_attendance_summary_excel_internal(
     base_headers = ["Name", "Emp Code", "Designation"]
     if include_location_column:
         base_headers.append("Location")
-    base_headers.extend(["Present Days", "Absent Days"])
+    base_headers.extend(["Present Days", "Weekoff Days"])
     headers = base_headers + [date.strftime("%d-%b") for date in date_range]
     ws.append(headers)
     
@@ -5093,7 +5216,7 @@ def generate_monthly_attendance_summary_excel_internal(
         if include_location_column:
             row.append(row_data["location"])
         row.append(row_data.get("present_days", 0))
-        row.append(row_data.get("absent_days", 0))
+        row.append(row_data.get("weekoff_days", 0))
         # Add attendance for each date
         for date in date_range:
             row.append(row_data.get(date.strftime("%d-%b"), "-"))
@@ -5411,4 +5534,446 @@ class MonthlyAttendanceExcelViewSet(ViewSet):
     #     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     #     wb.save(response)
     #     return response
+
+
+# --- Week-off (AttendanceWeekOff) Excel template / upload / grid -----------------
+
+WEEKOFF_COMMIT_CACHE_PREFIX = "weekoff_commit:"
+WEEKOFF_COMMIT_CACHE_TTL = 900  # seconds
+
+
+def _weekoff_location_param(request):
+    if request.method.upper() == "GET":
+        return request.query_params.get("location_id")
+    return request.data.get("location_id")
+
+
+def _weekoff_resolve_location_id(request):
+    """
+    Same scope rules as AttendanceCheckinViewSet._resolve_scope_location_id.
+    """
+    actor = request.user
+    requested_location_id = _weekoff_location_param(request)
+    actor_role = (getattr(actor, "role", "") or "").strip().lower()
+
+    if getattr(actor, "is_superuser", False):
+        scoped_location_id = requested_location_id or getattr(actor, "location_id", None)
+        if not scoped_location_id:
+            return None, Response(
+                {"error": "location_id is required for superuser"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return str(scoped_location_id), None
+
+    if actor_role not in {"admin", "so", "fo"}:
+        return None, Response(
+            {"error": "Only admin/SO/FO/superuser can access this API"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    actor_location_id = getattr(actor, "location_id", None)
+    if not actor_location_id:
+        return None, Response(
+            {"error": "User is not mapped to a location"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if requested_location_id and str(requested_location_id) != str(actor_location_id):
+        return None, Response(
+            {"error": "You can access only your own location"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    return str(actor_location_id), None
+
+
+def _weekoff_parse_month(month_str):
+    if not month_str:
+        raise ValueError("month is required (YYYY-MM)")
+    try:
+        year, month_num = map(int, str(month_str).split("-"))
+        if not (1 <= month_num <= 12):
+            raise ValueError("Invalid month")
+        start_date = date(year, month_num, 1)
+        end_date = date(year, month_num, monthrange(year, month_num)[1])
+    except (ValueError, AttributeError) as e:
+        raise ValueError(f"Invalid month. Use YYYY-MM. ({e})") from e
+    return start_date, end_date, year
+
+
+def _weekoff_eligible_users_qs(location_id, search=None, role=None):
+    qs = User.objects.filter(
+        is_deleted=False,
+        is_active=True,
+        location_id=location_id,
+    ).exclude(Q(role__iexact="admin") | Q(is_superuser=True))
+    if role and str(role).strip().lower() not in ("", "all"):
+        qs = qs.filter(role__iexact=str(role).strip().lower())
+    if search and str(search).strip():
+        s = str(search).strip()
+        qs = qs.filter(
+            Q(name__icontains=s) | Q(employee_code__icontains=s) | Q(email__icontains=s)
+        )
+    return qs.order_by("name", "employee_code")
+
+
+def _weekoff_normalize_cell_mark(value):
+    """Return 'W', '', or None if invalid."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and value == 0:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    if s.upper() == "W":
+        return "W"
+    return None
+
+
+def _weekoff_to_proper_case(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.replace("_", " ")
+    return " ".join(part[:1].upper() + part[1:].lower() for part in normalized.split())
+
+
+def _weekoff_parse_upload_workbook(wb, _location_id, start_date, end_date, year, allowed_user_ids):
+    """
+    Parse first sheet: header row maps columns. Required: user_id.
+    Date columns: headers parseable as %d-%b with request year (e.g. 01-Feb).
+    """
+    ws = wb.active
+    header_row = []
+    max_col = ws.max_column or 0
+    for c in range(1, max_col + 1):
+        cell = ws.cell(row=1, column=c)
+        v = cell.value
+        header_row.append(str(v).strip() if v is not None else "")
+
+    lower_headers = [h.strip().lower() for h in header_row]
+    try:
+        user_id_col = lower_headers.index("user_id") + 1  # 1-based
+    except ValueError as e:
+        raise ValueError("Template must contain a 'user_id' column header in row 1") from e
+
+    reserved = {"user_id", "employee_code", "name", "designation"}
+    date_columns = []
+    for idx, h in enumerate(header_row):
+        hl = h.strip().lower()
+        if hl in reserved or not h.strip():
+            continue
+        try:
+            d = datetime.strptime(f"{h.strip()}-{year}", "%d-%b-%Y").date()
+        except ValueError:
+            continue
+        if start_date <= d <= end_date:
+            date_columns.append((idx + 1, d))
+
+    if not date_columns:
+        raise ValueError(
+            "No date columns found (expected headers like 01-Feb matching the selected month)"
+        )
+
+    errors = []
+    ops_map = {}
+
+    max_row = ws.max_row or 0
+    for r in range(2, max_row + 1):
+        uid_cell = ws.cell(row=r, column=user_id_col).value
+        if uid_cell is None or str(uid_cell).strip() == "":
+            continue
+        uid_str = str(uid_cell).strip()
+        if uid_str not in allowed_user_ids:
+            errors.append({"row": r, "message": "Unknown or ineligible user_id for this location"})
+            continue
+
+        for col_idx, d in date_columns:
+            raw = ws.cell(row=r, column=col_idx).value
+            mark = _weekoff_normalize_cell_mark(raw)
+            if mark is None:
+                errors.append(
+                    {
+                        "row": r,
+                        "message": f"Invalid value in {d.isoformat()} column (only W or empty allowed)",
+                    }
+                )
+                continue
+            ops_map[(uid_str, d.isoformat())] = bool(mark == "W")
+
+    return errors, list(ops_map.items())
+
+
+class AttendanceWeekOffViewSet(ViewSet):
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=False, methods=["get"], url_path="template")
+    def template_excel(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        month = request.query_params.get("month")
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
+        try:
+            start_date, end_date, _year = _weekoff_parse_month(month)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        loc = Location.objects.filter(id=scoped_location_id, is_deleted=False).first()
+        if not loc:
+            return Response({"error": "Location not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        users = list(_weekoff_eligible_users_qs(scoped_location_id, search=search, role=role))
+        user_ids = [u.id for u in users]
+
+        existing = AttendanceWeekOff.objects.filter(
+            location_id=scoped_location_id,
+            weekoff_date__gte=start_date,
+            weekoff_date__lte=end_date,
+            user_id__in=user_ids,
+        ).values_list("user_id", "weekoff_date")
+        wo_set = {(str(uid), d) for uid, d in existing}
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        headers = ["user_id", "employee_code", "name", "designation"] + [
+            d.strftime("%d-%b") for d in date_range
+        ]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Weekoffs"
+        ws.append(headers)
+        for u in users:
+            row = [
+                str(u.id),
+                getattr(u, "employee_code", None) or "",
+                getattr(u, "name", None) or "",
+                _weekoff_to_proper_case(getattr(u, "role", None)),
+            ]
+            for d in date_range:
+                row.append("W" if (str(u.id), d) in wo_set else "")
+            ws.append(row)
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        filename = f"weekoffs_template_{start_date.strftime('%Y%m')}_{scoped_location_id}.xlsx"
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="upload-verify",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def upload_verify(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        month = request.data.get("month")
+        try:
+            start_date, end_date, year = _weekoff_parse_month(month)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        up_file = request.FILES.get("file")
+        if not up_file:
+            return Response({"error": "file is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        users_qs = _weekoff_eligible_users_qs(scoped_location_id)
+        allowed_user_ids = {str(u.id) for u in users_qs.only("id")}
+
+        try:
+            wb = load_workbook(up_file)
+        except Exception as e:
+            return Response(
+                {"error": f"Could not read Excel file: {e}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            errors, ops_items = _weekoff_parse_upload_workbook(
+                wb, scoped_location_id, start_date, end_date, year, allowed_user_ids
+            )
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if errors:
+            return Response({"ok": False, "errors": errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        set_count = sum(1 for _k, set_w in ops_items if set_w)
+        clear_count = sum(1 for _k, set_w in ops_items if not set_w)
+        commit_token = str(uuid.uuid4())
+        cache_payload = {
+            "actor_id": str(request.user.id),
+            "location_id": str(scoped_location_id),
+            "month": str(month),
+            "ops": [
+                {"user_id": uid, "date": d_iso, "set_w": set_w}
+                for (uid, d_iso), set_w in ops_items
+            ],
+        }
+        cache.set(
+            f"{WEEKOFF_COMMIT_CACHE_PREFIX}{commit_token}",
+            cache_payload,
+            WEEKOFF_COMMIT_CACHE_TTL,
+        )
+
+        ws_active = wb.active
+        rows_in_file = max(0, (ws_active.max_row or 0) - 1)
+
+        return Response(
+            {
+                "ok": True,
+                "commit_token": commit_token,
+                "expires_in_seconds": WEEKOFF_COMMIT_CACHE_TTL,
+                "summary": {
+                    "cells_set_to_w": set_count,
+                    "cells_cleared": clear_count,
+                    "rows_in_file": rows_in_file,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="commit")
+    def commit(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        commit_token = (request.data.get("commit_token") or "").strip()
+        if not commit_token:
+            return Response({"error": "commit_token is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        cache_key = f"{WEEKOFF_COMMIT_CACHE_PREFIX}{commit_token}"
+        payload = cache.get(cache_key)
+        if not payload:
+            return Response(
+                {"error": "Invalid or expired commit_token. Run upload-verify again."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if str(payload.get("actor_id")) != str(request.user.id):
+            return Response(
+                {"error": "commit_token was issued for a different user"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if str(payload.get("location_id")) != str(scoped_location_id):
+            return Response(
+                {"error": "location_id does not match the verified upload"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ops = payload.get("ops") or []
+        batch_id = uuid.uuid4()
+        created = 0
+        updated = 0
+        deleted = 0
+
+        with transaction.atomic():
+            for op in ops:
+                uid = op.get("user_id")
+                d_iso = op.get("date")
+                set_w = bool(op.get("set_w"))
+                if not uid or not d_iso:
+                    continue
+                d = parse_date(str(d_iso))
+                if not d:
+                    continue
+                if set_w:
+                    _obj, was_created = AttendanceWeekOff.objects.update_or_create(
+                        user_id=uid,
+                        location_id=scoped_location_id,
+                        weekoff_date=d,
+                        defaults={
+                            "mark": "W",
+                            "source": "excel_upload",
+                            "upload_batch_id": batch_id,
+                            "created_by": request.user,
+                        },
+                    )
+                    if was_created:
+                        created += 1
+                    else:
+                        updated += 1
+                else:
+                    n, _ = AttendanceWeekOff.objects.filter(
+                        user_id=uid,
+                        location_id=scoped_location_id,
+                        weekoff_date=d,
+                    ).delete()
+                    deleted += n
+
+        cache.delete(cache_key)
+
+        return Response(
+            {
+                "ok": True,
+                "upload_batch_id": str(batch_id),
+                "created": created,
+                "updated": updated,
+                "deleted": deleted,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["get"], url_path="grid")
+    def grid(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        month = request.query_params.get("month")
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
+        try:
+            start_date, end_date, _year = _weekoff_parse_month(month)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        users = list(_weekoff_eligible_users_qs(scoped_location_id, search=search, role=role))
+        user_ids = [u.id for u in users]
+
+        wo_qs = AttendanceWeekOff.objects.filter(
+            location_id=scoped_location_id,
+            weekoff_date__gte=start_date,
+            weekoff_date__lte=end_date,
+            user_id__in=user_ids,
+        ).values_list("user_id", "weekoff_date")
+        wo_by_user = defaultdict(set)
+        for uid, wd in wo_qs:
+            wo_by_user[str(uid)].add(wd)
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        loc = Location.objects.filter(id=scoped_location_id, is_deleted=False).first()
+        loc_name = loc.name if loc else ""
+
+        rows = []
+        for u in users:
+            uid = str(u.id)
+            row = {
+                "user_id": uid,
+                "name": getattr(u, "name", None) or "",
+                "employee_code": getattr(u, "employee_code", None) or "",
+                "designation": _weekoff_to_proper_case(getattr(u, "role", None)),
+                "location": loc_name,
+            }
+            dates_set = wo_by_user.get(uid, set())
+            for d in date_range:
+                key = d.strftime("%d-%b")
+                row[key] = "W" if d in dates_set else "-"
+            rows.append(row)
+
+        return Response(rows, status=status.HTTP_200_OK)
 

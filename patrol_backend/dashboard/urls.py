@@ -2,13 +2,20 @@ from .views import *
 from .views import AttendanceCheckinViewSet, AttendanceCheckinListView
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import DashboardCheckInReportView, DashboardCheckInReportExcelView, MonthlyAttendanceSummaryViewSet, MonthlyAttendanceExcelViewSet
+from .views import (
+    AttendanceWeekOffViewSet,
+    DashboardCheckInReportView,
+    DashboardCheckInReportExcelView,
+    MonthlyAttendanceExcelViewSet,
+    MonthlyAttendanceSummaryViewSet,
+)
 
 
 router = DefaultRouter()
 router.register(r'attendance', AttendanceCheckinViewSet, basename="attendance")
 router.register(r'attendance-summary', MonthlyAttendanceSummaryViewSet, basename="attendance-summary")  # ✅ Add this
 router.register(r'attendance-excel', MonthlyAttendanceExcelViewSet, basename="attendance-excel")  # ✅ Add this
+router.register(r"attendance-weekoff", AttendanceWeekOffViewSet, basename="attendance-weekoff")
 
 urlpatterns = [
     path('performance/', GuardPerformanceView.as_view()),
