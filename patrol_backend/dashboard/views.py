@@ -4915,6 +4915,52 @@ def _append_monthly_day_totals(row, date_range):
     row["weekoff_days"] = weekoff
 
 
+def _monthly_normalize_status(raw_status):
+    status_val = str(raw_status or "").strip().upper()
+    if status_val == "A":
+        # Legacy absent value should be represented as LD.
+        return "LD"
+    if status_val in {"P", "OW", "LD", "W", "M"}:
+        return status_val
+    return ""
+
+
+def _monthly_group_rows_for_excel(summary_data, date_range):
+    grouped = defaultdict(list)
+    for row in summary_data:
+        rank = (row.get("designation") or "").strip() or "UNASSIGNED"
+        grouped[rank].append(row)
+
+    ordered_ranks = sorted(grouped.keys(), key=lambda x: x.lower())
+    groups = []
+    for rank in ordered_ranks:
+        members = sorted(grouped[rank], key=lambda r: (r.get("name") or "").lower())
+        date_present_totals = {}
+        date_weekoff_totals = {}
+        for d in date_range:
+            key = d.strftime("%d-%b")
+            present_count = 0
+            weekoff_count = 0
+            for m in members:
+                v = m.get(key, "")
+                if v == "W":
+                    weekoff_count += 1
+                elif v in {"P", "OW", "LD", "M"}:
+                    present_count += 1
+            date_present_totals[key] = present_count
+            date_weekoff_totals[key] = weekoff_count
+
+        groups.append(
+            {
+                "rank": rank.upper(),
+                "members": members,
+                "date_present_totals": date_present_totals,
+                "date_weekoff_totals": date_weekoff_totals,
+            }
+        )
+    return groups
+
+
 def _get_monthly_attendance_summary_data(
     month=None,
     start_date_str=None,
@@ -5107,13 +5153,7 @@ def _get_monthly_attendance_summary_data(
 
             # Prefer persisted pa_status (set after checkout_v2/v3 refresh).
             if attendance.pa_status:
-                if attendance.pa_status == "P":
-                    row[cell_key] = "P"
-                elif attendance.pa_status in ("LD", "A"):
-                    # Legacy "A" should be shown as "LD" in monthly summary.
-                    row[cell_key] = "LD"
-                else:
-                    row[cell_key] = ""
+                row[cell_key] = _monthly_normalize_status(attendance.pa_status)
             elif attendance.checkout_time or attendance.last_checkout_time:
                 # Fallback for any records created before the new persist logic.
                 computed_status = (
@@ -5122,15 +5162,12 @@ def _get_monthly_attendance_summary_data(
                     )
                     or "LD"
                 )
-                if computed_status == "P":
-                    row[cell_key] = "P"
-                elif computed_status in ("LD", "A"):
-                    row[cell_key] = "LD"
-                else:
-                    row[cell_key] = ""
+                row[cell_key] = _monthly_normalize_status(computed_status)
             else:
-                # Still on duty / no closed status yet → keep blank.
-                row[cell_key] = ""
+                # Still on duty (open shift) should be shown as OW.
+                row[cell_key] = (
+                    "OW" if (attendance.checkin_time or attendance.last_checkin_time) else ""
+                )
 
         _append_monthly_day_totals(row, date_range)
 
@@ -5196,32 +5233,223 @@ def generate_monthly_attendance_summary_excel_internal(
     wb = Workbook()
     ws = wb.active
     ws.title = "Monthly Attendance Summary"
-    
-    # Header row
-    base_headers = ["Name", "Emp Code", "Designation"]
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    groups = _monthly_group_rows_for_excel(summary_data, date_range)
+    left_headers = ["SNO", "ID NO", "RANK", "NAME"]
     if include_location_column:
-        base_headers.append("Location")
-    base_headers.extend(["Present Days", "Weekoff Days"])
-    headers = base_headers + [date.strftime("%d-%b") for date in date_range]
-    ws.append(headers)
-    
-    # Data rows
+        left_headers.append("LOCATION")
+    right_headers = ["Total Days", "Week off"]
+    date_headers = [f"{d.day}-{d.strftime('%b-%y')}" for d in date_range]
+    day_headers = [d.strftime("%a").upper() for d in date_range]
+    all_headers = left_headers + date_headers + right_headers
+    total_cols = len(all_headers)
+
+    # Title row (with location context when available)
+    month_label = start_date.strftime("%B-%Y").upper()
+    location_label = "ALL LOCATIONS"
+    if location_id:
+        loc_obj = Location.objects.filter(id=location_id, is_deleted=False).first()
+        if loc_obj and getattr(loc_obj, "name", None):
+            location_label = str(loc_obj.name).strip().upper()
+    title = f"{location_label} MONTHLY ATTENDANCE FOR THE MONTH OF {month_label}"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+    ws.cell(row=1, column=1, value=title)
+
+    # Header rows
+    for c, h in enumerate(left_headers, start=1):
+        ws.cell(row=2, column=c, value=h)
+    for idx, h in enumerate(date_headers, start=len(left_headers) + 1):
+        ws.cell(row=2, column=idx, value=h)
+    ws.cell(row=2, column=total_cols - 1, value=right_headers[0])
+    ws.cell(row=2, column=total_cols, value=right_headers[1])
+    for idx, h in enumerate(day_headers, start=len(left_headers) + 1):
+        ws.cell(row=3, column=idx, value=h)
+    # Merge left and right headers vertically to mimic print layout.
+    for c in range(1, len(left_headers) + 1):
+        ws.merge_cells(start_row=2, start_column=c, end_row=3, end_column=c)
+    ws.merge_cells(start_row=2, start_column=total_cols - 1, end_row=3, end_column=total_cols - 1)
+    ws.merge_cells(start_row=2, start_column=total_cols, end_row=3, end_column=total_cols)
+
+    thin = Side(style="thin", color="8A97A6")
+    medium = Side(style="medium", color="4F5B66")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    strong_border = Border(left=medium, right=medium, top=medium, bottom=medium)
+    header_fill = PatternFill(fill_type="solid", start_color="B7CCE2", end_color="B7CCE2")
+    subtotal_fill = PatternFill(fill_type="solid", start_color="F5E7DB", end_color="F5E7DB")
+    title_fill = PatternFill(fill_type="solid", start_color="B7CCE2", end_color="B7CCE2")
+    weekoff_mark_fill = PatternFill(fill_type="solid", start_color="8CCFF7", end_color="8CCFF7")
+
+    base_font_name = "Arial"
+    for row_no in [1, 2, 3]:
+        for col_no in range(1, total_cols + 1):
+            cell = ws.cell(row=row_no, column=col_no)
+            cell.fill = title_fill if row_no == 1 else header_fill
+            cell.font = Font(
+                name=base_font_name,
+                bold=True,
+                size=11 if row_no == 1 else (9 if row_no == 2 else 8),
+            )
+            if row_no == 2 and (len(left_headers) < col_no < total_cols - 1):
+                cell.alignment = Alignment(horizontal="center", vertical="center", text_rotation=90)
+            elif row_no == 3:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = strong_border if row_no in (1, 2, 3) else border
+
+    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[2].height = 66
+    ws.row_dimensions[3].height = 22
+
+    current_row = 4
+    serial = 1
     row_count = 0
-    for row_data in summary_data:
-        row = [
-            row_data["name"],
-            row_data.get("employee_code") or "",
-            row_data.get("designation") or "",
-        ]
+    designation_day_totals = defaultdict(lambda: defaultdict(int))
+    designation_weekoff_totals = defaultdict(lambda: defaultdict(int))
+    designation_total_days = defaultdict(int)
+    designation_total_weekoff = defaultdict(int)
+
+    for group in groups:
+        rank_name = group["rank"]
+        members = group["members"]
+        for m in members:
+            statuses = []
+            user_total_days = 0
+            user_weekoff_days = 0
+            for d in date_range:
+                key = d.strftime("%d-%b")
+                status_val = _monthly_normalize_status(m.get(key, ""))
+                statuses.append(status_val)
+                if status_val == "W":
+                    user_weekoff_days += 1
+                elif status_val:
+                    user_total_days += 1
+                designation_day_totals[rank_name][key] += 1 if status_val and status_val != "W" else 0
+                designation_weekoff_totals[rank_name][key] += 1 if status_val == "W" else 0
+
+            designation_total_days[rank_name] += user_total_days
+            designation_total_weekoff[rank_name] += user_weekoff_days
+
+            member_name = (m.get("name") or "")
+            member_name = str(member_name).upper() if member_name else ""
+            values = [serial, m.get("employee_code") or "", rank_name, member_name]
+            if include_location_column:
+                values.append(m.get("location") or "")
+            values.extend(statuses)
+            values.extend([user_total_days, user_weekoff_days])
+            for col_no, val in enumerate(values, start=1):
+                cell = ws.cell(row=current_row, column=col_no, value=val)
+                cell.border = border
+                cell.font = Font(name=base_font_name, size=10)
+                if col_no in (1, 2):
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_no == 3:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_no <= len(left_headers):
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                # Highlight weekoff marks like the reference Excel.
+                is_date_col = len(left_headers) < col_no <= (len(left_headers) + len(date_range))
+                if is_date_col and str(val).upper() == "W":
+                    cell.fill = weekoff_mark_fill
+            ws.row_dimensions[current_row].height = 20
+            current_row += 1
+            serial += 1
+            row_count += 1
+
+        # Group subtotal row
+        subtotal_vals = ["", "", "TOTAL PRESENT", ""]
         if include_location_column:
-            row.append(row_data["location"])
-        row.append(row_data.get("present_days", 0))
-        row.append(row_data.get("weekoff_days", 0))
-        # Add attendance for each date
-        for date in date_range:
-            row.append(row_data.get(date.strftime("%d-%b"), "-"))
-        ws.append(row)
-        row_count += 1
+            subtotal_vals.append("")
+        day_totals = [group["date_present_totals"].get(d.strftime("%d-%b"), 0) for d in date_range]
+        subtotal_vals.extend(day_totals)
+        subtotal_vals.extend([sum(day_totals), sum(group["date_weekoff_totals"].values())])
+        for col_no, val in enumerate(subtotal_vals, start=1):
+            cell = ws.cell(row=current_row, column=col_no, value=val)
+            cell.fill = subtotal_fill
+            cell.font = Font(name=base_font_name, bold=True, size=10)
+            cell.border = strong_border if col_no <= len(left_headers) + len(date_range) else border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[current_row].height = 20
+        current_row += 1
+
+    # Footer summary matrix (designation totals by day)
+    for rank_name in sorted(designation_day_totals.keys()):
+        footer_vals = ["", "", rank_name, ""]
+        if include_location_column:
+            footer_vals.append("")
+        day_vals = [designation_day_totals[rank_name].get(d.strftime("%d-%b"), 0) for d in date_range]
+        footer_vals.extend(day_vals)
+        footer_vals.extend([designation_total_days[rank_name], designation_total_weekoff[rank_name]])
+        for col_no, val in enumerate(footer_vals, start=1):
+            cell = ws.cell(row=current_row, column=col_no, value=val)
+            cell.font = Font(name=base_font_name, bold=True, size=10)
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[current_row].height = 20
+        current_row += 1
+
+    # Weekoff totals row
+    weekoff_day_vals = []
+    for d in date_range:
+        key = d.strftime("%d-%b")
+        weekoff_day_vals.append(sum(designation_weekoff_totals[r].get(key, 0) for r in designation_weekoff_totals.keys()))
+    weekoff_total_vals = ["", "", "WEEK OFF", ""]
+    if include_location_column:
+        weekoff_total_vals.append("")
+    weekoff_total_vals.extend(weekoff_day_vals)
+    weekoff_total_vals.extend([sum(weekoff_day_vals), sum(designation_total_weekoff.values())])
+    for col_no, val in enumerate(weekoff_total_vals, start=1):
+        cell = ws.cell(row=current_row, column=col_no, value=val)
+        cell.font = Font(name=base_font_name, bold=True, size=10)
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[current_row].height = 20
+    current_row += 1
+
+    # Total head count row
+    head_count_vals = ["", "", "Total Head count", ""]
+    if include_location_column:
+        head_count_vals.append("")
+    day_head_counts = []
+    for d in date_range:
+        key = d.strftime("%d-%b")
+        count = sum(1 for r in summary_data if _monthly_normalize_status(r.get(key, "")) != "")
+        day_head_counts.append(count)
+    head_count_vals.extend(day_head_counts)
+    head_count_vals.extend([sum(designation_total_days.values()), sum(designation_total_weekoff.values())])
+    for col_no, val in enumerate(head_count_vals, start=1):
+        cell = ws.cell(row=current_row, column=col_no, value=val)
+        cell.font = Font(name=base_font_name, bold=True, size=10)
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[current_row].height = 20
+
+    # Apply borders/alignment for all data rows
+    for r in range(4, current_row + 1):
+        for c in range(1, total_cols + 1):
+            cell = ws.cell(row=r, column=c)
+            if cell.border != border:
+                cell.border = border
+            if not cell.alignment:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Column widths
+    widths = [6, 11, 20, 26]
+    if include_location_column:
+        widths.append(20)
+    widths.extend([4.2] * len(date_range))
+    widths.extend([8, 8])
+    for idx, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = w
+
+    # Freeze title/header + identity columns, so day columns scroll horizontally
+    # while SNO/ID/RANK/NAME stay sticky like the reference.
+    freeze_col = len(left_headers) + 1
+    ws.freeze_panes = ws.cell(row=4, column=freeze_col)
     
     # Save to in-memory buffer
     buffer = BytesIO()
