@@ -3321,6 +3321,400 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             status=status.HTTP_200_OK if not failed else status.HTTP_207_MULTI_STATUS,
         )
 
+    def _monthly_resolve_assignment_for_date(
+        self,
+        guard,
+        target_date,
+        location_id,
+        actor=None,
+        shift_id=None,
+    ):
+        assignment = (
+            Assignment.objects.filter(
+                guard_id=guard.id,
+                location_id=location_id,
+                start_date__lte=target_date,
+                end_date__gte=target_date,
+                is_deleted=False,
+            )
+            .select_related("shift", "location")
+            .order_by("-modified_on")
+            .first()
+        )
+        if not shift_id:
+            return assignment
+
+        try:
+            shift = Shift.objects.select_related("location").get(
+                id=shift_id,
+                is_deleted=False,
+            )
+        except Shift.DoesNotExist:
+            raise ValueError("Shift not found")
+
+        if str(getattr(shift, "location_id", "")) != str(location_id):
+            raise ValueError("Selected shift does not belong to the scoped location")
+
+        if assignment:
+            assignment.shift = shift
+            assignment.location = shift.location
+            assignment.checkpoints = []
+            assignment.modified_by = actor
+            assignment.save()
+            return assignment
+
+        return Assignment.objects.create(
+            guard=guard,
+            location=shift.location,
+            shift=shift,
+            start_date=target_date,
+            end_date=target_date,
+            checkpoints=[],
+            created_by=actor,
+            modified_by=actor,
+        )
+
+    def _monthly_cell_mark_present(
+        self,
+        request,
+        guard,
+        scoped_location_id,
+        target_date,
+        reason,
+        shift_id=None,
+        from_status="",
+    ):
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+        user_today = get_user_today(user_tz)
+        if target_date > user_today:
+            raise ValueError("Cannot mark present for a future date")
+
+        actor = request.user
+        if str(from_status or "").upper() == "W" and not shift_id:
+            raise ValueError("Shift is required when converting week off to present")
+
+        effective_shift_id = shift_id if str(from_status or "").upper() == "W" else None
+        assignment = self._monthly_resolve_assignment_for_date(
+            guard,
+            target_date,
+            scoped_location_id,
+            actor=actor,
+            shift_id=effective_shift_id,
+        )
+        if not assignment or not assignment.shift or not assignment.location:
+            raise ValueError("No active shift assignment for this date")
+
+        shift = assignment.shift
+        org_location = shift.location
+        search_start_utc, search_end_utc, shift_start_dt_user, shift_end_dt_user, _ = (
+            _attendance_v3_shift_window_utc(
+                target_date,
+                shift,
+                user_tz,
+                location_id=getattr(org_location, "id", None),
+            )
+        )
+        checkin_utc = shift_start_dt_user.astimezone(pytz.UTC)
+        checkout_utc = shift_end_dt_user.astimezone(pytz.UTC)
+
+        if str(getattr(shift, "location_id", "")) != str(scoped_location_id):
+            raise ValueError("Shift location does not match selected scope")
+
+        latitude = longitude = 0
+        if org_location and org_location.latitude is not None and org_location.longitude is not None:
+            latitude = org_location.latitude
+            longitude = org_location.longitude
+
+        with transaction.atomic():
+            AttendanceWeekOff.objects.filter(
+                user_id=guard.id,
+                location_id=scoped_location_id,
+                weekoff_date=target_date,
+            ).delete()
+
+            CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).delete()
+
+            AttendanceCheckin.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                shift_date=target_date,
+            ).delete()
+
+            checkin_log = CheckInLog.objects.create(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkin",
+                latitude=latitude,
+                longitude=longitude,
+            )
+            CheckInLog.objects.filter(id=checkin_log.id).update(timestamp=checkin_utc)
+
+            checkout_log = CheckInLog.objects.create(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkout",
+                latitude=latitude,
+                longitude=longitude,
+            )
+            CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
+
+            attendance, _ = AttendanceCheckin.objects.get_or_create(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                shift_date=target_date,
+                defaults={"created_on": timezone.now()},
+            )
+            attendance.checkin_time = checkin_utc
+            attendance.checkout_time = checkout_utc
+            attendance.shift_date = target_date
+            attendance.edited_by = actor
+            attendance.edited_on = timezone.now()
+            attendance.edit_reason = reason
+            attendance.save()
+
+            _attendance_v3_refresh_saved_fields(
+                attendance,
+                guard,
+                assignment,
+                shift,
+                org_location,
+                search_start_utc,
+                search_end_utc,
+            )
+
+        attendance.refresh_from_db()
+        return {
+            "user_id": str(guard.id),
+            "date": str(target_date),
+            "pa_status": attendance.pa_status,
+            "attendance_id": str(attendance.id),
+        }
+
+    def _monthly_cell_mark_weekoff(self, request, guard, scoped_location_id, target_date, reason):
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+        user_today = get_user_today(user_tz)
+        if target_date > user_today:
+            raise ValueError("Cannot mark week off for a future date")
+
+        actor = request.user
+        batch_id = uuid.uuid4()
+        with transaction.atomic():
+            AttendanceWeekOff.objects.update_or_create(
+                user_id=guard.id,
+                location_id=scoped_location_id,
+                weekoff_date=target_date,
+                defaults={
+                    "mark": "W",
+                    "source": "api",
+                    "upload_batch_id": batch_id,
+                    "created_by": actor,
+                },
+            )
+
+            assignment = self._monthly_resolve_assignment_for_date(guard, target_date, scoped_location_id)
+            if assignment and assignment.shift and assignment.shift.location:
+                shift = assignment.shift
+                org_loc = shift.location
+                search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                    target_date,
+                    shift,
+                    user_tz,
+                    location_id=getattr(org_loc, "id", None),
+                )
+                CheckInLog.objects.filter(
+                    guard=guard,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_loc,
+                    timestamp__gte=search_start_utc,
+                    timestamp__lt=search_end_utc,
+                ).delete()
+                AttendanceCheckin.objects.filter(
+                    guard=guard,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_loc,
+                    shift_date=target_date,
+                ).delete()
+
+        return {"user_id": str(guard.id), "date": str(target_date), "reason": reason}
+
+    def _monthly_cell_mark_empty(self, request, guard, scoped_location_id, target_date, reason):
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+        user_today = get_user_today(user_tz)
+        if target_date > user_today:
+            raise ValueError("Cannot clear attendance for a future date")
+
+        with transaction.atomic():
+            AttendanceWeekOff.objects.filter(
+                user_id=guard.id,
+                location_id=scoped_location_id,
+                weekoff_date=target_date,
+            ).delete()
+
+            attendance_qs = AttendanceCheckin.objects.filter(
+                guard=guard,
+                org_location_id=scoped_location_id,
+                shift_date=target_date,
+            ).select_related("assignment", "shift", "org_location")
+
+            log_deleted_count = 0
+            for attendance in attendance_qs:
+                assignment = getattr(attendance, "assignment", None)
+                shift = getattr(attendance, "shift", None)
+                org_location = getattr(attendance, "org_location", None)
+                if not assignment or not shift or not org_location:
+                    continue
+                search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                    target_date,
+                    shift,
+                    user_tz,
+                    location_id=getattr(org_location, "id", None),
+                )
+                n, _ = CheckInLog.objects.filter(
+                    guard=guard,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    timestamp__gte=search_start_utc,
+                    timestamp__lt=search_end_utc,
+                ).delete()
+                log_deleted_count += n
+
+            attendance_deleted_count, _ = attendance_qs.delete()
+            if attendance_deleted_count == 0:
+                # Fallback: clear same-day logs in scoped location for this guard.
+                day_start_user = datetime.combine(target_date, datetime.min.time())
+                day_start_user = user_tz.localize(day_start_user)
+                day_end_user = day_start_user + timedelta(days=1)
+                n, _ = CheckInLog.objects.filter(
+                    guard=guard,
+                    org_location_id=scoped_location_id,
+                    timestamp__gte=day_start_user.astimezone(pytz.UTC),
+                    timestamp__lt=day_end_user.astimezone(pytz.UTC),
+                ).delete()
+                log_deleted_count += n
+
+        return {
+            "user_id": str(guard.id),
+            "date": str(target_date),
+            "reason": reason,
+            "attendance_deleted_count": int(attendance_deleted_count or 0),
+            "log_deleted_count": int(log_deleted_count or 0),
+        }
+
+    @action(detail=False, methods=["post"], url_path="monthly-cell-action")
+    def monthly_cell_action(self, request):
+        """
+        Bulk correct monthly grid cells from the attendance summary UI.
+
+        Body:
+          - action: "mark_present" | "mark_weekoff" | "mark_empty"
+          - reason: required (audit)
+          - shift_id: optional (required for weekoff->present rows)
+          - cells: [ { "user_id": "<uuid>", "date": "YYYY-MM-DD", "from_status": "W|OW|LD|M|P|''" }, ... ]
+        """
+        scoped_location_id, error_response = self._resolve_scope_location_id(request)
+        if error_response:
+            return error_response
+
+        action_type = (request.data.get("action") or "").strip().lower()
+        reason = (request.data.get("reason") or "").strip()
+        shift_id = request.data.get("shift_id")
+        cells = request.data.get("cells")
+
+        if action_type not in ("mark_present", "mark_weekoff", "mark_empty"):
+            return Response(
+                {"error": 'action must be "mark_present", "mark_weekoff", or "mark_empty"'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not reason:
+            return Response({"error": "reason is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(cells, list) or not cells:
+            return Response({"error": "cells must be a non-empty list"}, status=status.HTTP_400_BAD_REQUEST)
+
+        success = []
+        failed = []
+
+        for cell in cells:
+            if not isinstance(cell, dict):
+                failed.append({"cell": cell, "error": "Invalid cell payload"})
+                continue
+            user_id = cell.get("user_id")
+            date_str = cell.get("date")
+            from_status = (cell.get("from_status") or "").strip().upper()
+            if not user_id or not date_str:
+                failed.append({"cell": cell, "error": "user_id and date are required"})
+                continue
+            target_date = parse_date(str(date_str))
+            if not target_date:
+                failed.append({"user_id": user_id, "error": "Invalid date; use YYYY-MM-DD"})
+                continue
+
+            guard = User.objects.filter(
+                id=user_id,
+                is_deleted=False,
+                is_active=True,
+                location_id=scoped_location_id,
+            ).exclude(Q(role__iexact="admin") | Q(is_superuser=True)).first()
+            if not guard:
+                failed.append({"user_id": str(user_id), "error": "User not found or not eligible for this location"})
+                continue
+
+            try:
+                if action_type == "mark_present":
+                    data = self._monthly_cell_mark_present(
+                        request,
+                        guard,
+                        scoped_location_id,
+                        target_date,
+                        reason,
+                        shift_id=shift_id,
+                        from_status=from_status,
+                    )
+                elif action_type == "mark_weekoff":
+                    data = self._monthly_cell_mark_weekoff(
+                        request, guard, scoped_location_id, target_date, reason
+                    )
+                else:
+                    data = self._monthly_cell_mark_empty(
+                        request, guard, scoped_location_id, target_date, reason
+                    )
+                success.append(data)
+            except Exception as ex:
+                failed.append({"user_id": str(user_id), "date": str(target_date), "error": str(ex)})
+
+        return Response(
+            {
+                "action": action_type,
+                "location_id": str(scoped_location_id),
+                "reason": reason,
+                "summary": {
+                    "requested_count": len(cells),
+                    "success_count": len(success),
+                    "failed_count": len(failed),
+                },
+                "success": success,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK if not failed else status.HTTP_207_MULTI_STATUS,
+        )
+
     @action(detail=False, methods=["post"], url_path="assign-checkpoint-template")
     def assign_checkpoint_template(self, request):
         """
@@ -5085,6 +5479,8 @@ def _get_monthly_attendance_summary_data(
         guard = data["guard"]
         location = data["location"]
         row = {
+            "user_id": str(guard_id),
+            "location_id": str(loc_id) if loc_id else None,
             "name": guard.name,
             "location": location,
             "employee_code": getattr(guard, "employee_code", None) or "",
