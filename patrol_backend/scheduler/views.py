@@ -623,13 +623,19 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             headers = ['Name', 'Emp Code', 'Designation', 'Location'] + days
             ws.append(headers)
 
+            grouped_rows = defaultdict(list)
             for row in summary_map.values():
-                ws.append([
-                    row['name'],
-                    row['employee_code'],
-                    row['designation'],
-                    row['location'],
-                ] + [row[day] for day in days])
+                rank = str(row.get('designation') or '').strip().upper() or "UNASSIGNED"
+                grouped_rows[rank].append(row)
+
+            for rank in sorted(grouped_rows.keys()):
+                for row in sorted(grouped_rows[rank], key=lambda x: str(x.get('name') or '').upper()):
+                    ws.append([
+                        row['name'],
+                        row['employee_code'],
+                        row['designation'],
+                        row['location'],
+                    ] + [row[day] for day in days])
 
             # Adjust column widths
             for i, column in enumerate(headers, 1):

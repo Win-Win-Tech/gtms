@@ -5215,6 +5215,7 @@ def generate_attendance_v3_excel_report_internal(
         ))
 
     rows.sort(key=lambda x: (x[0], x[1]), reverse=True)  # shift-date DESC, then time DESC
+    rows.sort(key=lambda x: (str(x[2][3] or "").strip().upper() or "UNASSIGNED"))  # Then group by designation ASC
     row_count = 0
     for _dkey, _tkey, row_data in rows:
         ws.append(row_data)
@@ -6370,16 +6371,23 @@ class AttendanceWeekOffViewSet(ViewSet):
         ws = wb.active
         ws.title = "Weekoffs"
         ws.append(headers)
+        grouped_users = defaultdict(list)
         for u in users:
-            row = [
-                str(u.id),
-                getattr(u, "employee_code", None) or "",
-                getattr(u, "name", None) or "",
-                _weekoff_to_proper_case(getattr(u, "role", None)),
-            ]
-            for d in date_range:
-                row.append("W" if (str(u.id), d) in wo_set else "")
-            ws.append(row)
+            rank = (getattr(u, "role", None) or "").strip().upper() or "UNASSIGNED"
+            grouped_users[rank].append(u)
+
+        for rank in sorted(grouped_users.keys()):
+            rank_users = sorted(grouped_users[rank], key=lambda x: (getattr(x, "name", None) or "").upper())
+            for u in rank_users:
+                row = [
+                    str(u.id),
+                    getattr(u, "employee_code", None) or "",
+                    getattr(u, "name", None) or "",
+                    _weekoff_to_proper_case(getattr(u, "role", None)),
+                ]
+                for d in date_range:
+                    row.append("W" if (str(u.id), d) in wo_set else "")
+                ws.append(row)
 
         buffer = BytesIO()
         wb.save(buffer)
