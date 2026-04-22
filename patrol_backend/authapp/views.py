@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 from .models import User, Role
 from .serializers import (
     UserSerializer,
@@ -263,6 +264,52 @@ class LoginView(APIView):
                     )
                 )
             return Response(api_response("error", "Invalid credentials", None, status.HTTP_401_UNAUTHORIZED))
+        except Exception as e:
+            return Response(api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR))
+
+
+class RefreshTokenView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        try:
+            refresh_token = request.data.get('refresh_token') or request.data.get('refresh')
+            user_id = request.data.get('user_id')
+
+            if not refresh_token:
+                return Response(api_response("error", "Refresh token is required", None, status.HTTP_400_BAD_REQUEST))
+
+            if not user_id:
+                return Response(api_response("error", "User ID is required", None, status.HTTP_400_BAD_REQUEST))
+
+            try:
+                refresh = RefreshToken(refresh_token)
+            except TokenError:
+                return Response(api_response("error", "Invalid or expired refresh token", None, status.HTTP_401_UNAUTHORIZED))
+
+            token_user_id = refresh.payload.get('user_id')
+            if str(token_user_id) != str(user_id):
+                return Response(api_response("error", "Token does not belong to this user", None, status.HTTP_401_UNAUTHORIZED))
+
+            try:
+                user = User.objects.get(id=user_id, is_deleted=False)
+                if not user.is_active:
+                    return Response(api_response("error", "User is inactive", None, status.HTTP_403_FORBIDDEN))
+            except User.DoesNotExist:
+                return Response(api_response("error", "User not found", None, status.HTTP_404_NOT_FOUND))
+
+            return Response(
+                api_response(
+                    "success",
+                    "Token refreshed successfully",
+                    {
+                        "access": str(refresh.access_token),
+                        "refresh": str(refresh),
+                        **build_flat_profile_data(request, user),
+                    },
+                    status.HTTP_200_OK,
+                )
+            )
         except Exception as e:
             return Response(api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR))
 
