@@ -1,0 +1,68 @@
+[INFO] 2026-04-22 08:16:18 Loading faiss with AVX2 support.
+[INFO] 2026-04-22 08:16:18 Successfully loaded faiss with AVX2 support.
+[INFO] 2026-04-22 08:16:18 Face index rebuilt: location=259ea9c6-9e14-44b2-ad8a-52d4385060de users=2
+[INFO] 2026-04-22 08:16:18 Face index rebuilt: location=4adac175-6dfb-4ad2-934c-bbf53ebf7ac0 users=2
+[INFO] 2026-04-22 08:16:18 Face index rebuilt: location=28ef96dc-dab3-4910-8777-d93a864cf017 users=2
+[INFO] 2026-04-22 08:16:18 Face index warmup complete. total_indexed_faces=6
+Starting v2 test...
+Traceback (most recent call last):
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/patrol_backend/test_perf.py", line 14, in <module>
+    report = _get_checkin_report_data_v2(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/patrol_backend/dashboard/views.py", line 6747, in _get_checkin_report_data_v2
+    for cp in (assignment.checkpoints or []):
+                         ^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/manager.py", line 87, in manager_method
+    return getattr(self.get_queryset(), name)(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/query.py", line 629, in get
+    num = len(clone)
+          ^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/query.py", line 366, in __len__
+    self._fetch_all()
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/query.py", line 1949, in _fetch_all
+    self._result_cache = list(self._iterable_class(self))
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/query.py", line 91, in __iter__
+    results = compiler.execute_sql(
+              ^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/models/sql/compiler.py", line 1623, in execute_sql
+    cursor.execute(sql, params)
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/backends/utils.py", line 122, in execute
+    return super().execute(sql, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/backends/utils.py", line 79, in execute
+    return self._execute_with_wrappers(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/backends/utils.py", line 92, in _execute_with_wrappers
+    return executor(sql, params, many, context)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/backends/utils.py", line 105, in _execute
+    return self.cursor.execute(sql, params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/django/db/backends/mysql/base.py", line 76, in execute
+    return self.cursor.execute(query, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/cursors.py", line 153, in execute
+    result = self._query(query)
+             ^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/cursors.py", line 322, in _query
+    conn.query(q)
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/connections.py", line 575, in query
+    self._affected_rows = self._read_query_result(unbuffered=unbuffered)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/connections.py", line 826, in _read_query_result
+    result.read()
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/connections.py", line 1203, in read
+    first_packet = self.connection._read_packet()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/connections.py", line 751, in _read_packet
+    packet_header = self._read_bytes(4)
+                    ^^^^^^^^^^^^^^^^^^^
+  File "/var/www/html/babu/c/czip/GTMS/backendnew/gtms/venv/lib/python3.12/site-packages/pymysql/connections.py", line 789, in _read_bytes
+    data = self._rfile.read(num_bytes)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/socket.py", line 707, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

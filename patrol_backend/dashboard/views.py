@@ -49,6 +49,7 @@ from checkin.models import CheckIn, CheckInChecklistAnswer
 from scheduler.models import ChecklistTemplate
 from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate, SiteSetting
 from tourlog.models import TourLog
+from patrol_backend.utils.proximity_utils import get_site_within_proximity
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
     get_user_today,
@@ -63,6 +64,7 @@ from .serializers import (
     AttendanceBoundaryEditSerializer,
     AttendanceCheckinDashboardSerializer,
     AttendanceCheckinDashboardV3Serializer,
+    AttendanceCheckinDashboardV4Serializer,
     AttendanceCheckinSerializer,
     CheckInReportSerializer,
 )
@@ -1749,15 +1751,13 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
-        if org_location.latitude and org_location.longitude:
-            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-            allowed_distance = _get_site_setting_int(
-                key="attendance_distance",
-                location_id=getattr(org_location, "id", None),
-                default_value=100,
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+        if not matched_site:
+            return Response(
+                {"error": "You are not within the authorized boundary of any site for this location."},
+                status=status.HTTP_400_BAD_REQUEST
             )
-            if distance > allowed_distance:
-                return Response({"error": f"Not within >{allowed_distance}m of assigned location"}, status=status.HTTP_400_BAD_REQUEST)
 
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
@@ -1777,7 +1777,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 )
             if not raw_bytes:
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-            ok, msg, dist = verify_user_face(user, raw_bytes)
+            ok, msg, dist_face = verify_user_face(user, raw_bytes)
             if not ok:
                 return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1793,6 +1793,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             type="checkin",
             latitude=lat,
             longitude=lon,
+            site=matched_site,
         )
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
@@ -1872,18 +1873,13 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
-        if org_location.latitude and org_location.longitude:
-            distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-            allowed_distance = _get_site_setting_int(
-                key="attendance_distance",
-                location_id=getattr(org_location, "id", None),
-                default_value=100,
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+        if not matched_site:
+            return Response(
+                {"error": "You are not within the authorized boundary of any site for this location."},
+                status=status.HTTP_400_BAD_REQUEST
             )
-            if distance > allowed_distance:
-                return Response(
-                    {"error": f"Not within >{allowed_distance}m of assigned location"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
 
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
@@ -1914,7 +1910,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 )
             if not raw_bytes:
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-            ok, msg, dist = verify_user_face(user, raw_bytes)
+            ok, msg, dist_face = verify_user_face(user, raw_bytes)
             if not ok:
                 return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1930,6 +1926,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             type="checkout",
             latitude=lat,
             longitude=lon,
+            site=matched_site,
         )
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
@@ -2026,23 +2023,12 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             return _kiosk_error("geofence_required", "latitude and longitude are required")
 
-        if org_location.latitude is None or org_location.longitude is None:
-            return _kiosk_error(
-                "location_geofence_not_configured",
-                "Location geofence coordinates are not configured",
-            )
-
-        distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
-        allowed_distance = _get_site_setting_int(
-            key="attendance_distance",
-            location_id=getattr(org_location, "id", None),
-            default_value=100,
-        )
-        if distance > allowed_distance:
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+        if not matched_site:
             return _kiosk_error(
                 "outside_geofence",
-                f"Not within >{allowed_distance}m of assigned location",
-                extra={"distance_m": round(distance, 2), "allowed_distance_m": allowed_distance},
+                "You are not within the authorized boundary of any site for this location.",
             )
 
         image_file = (
@@ -3909,7 +3895,7 @@ def _get_checkin_report_data(
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         today = get_user_today(user_tz)
         # Log timezone being used for debugging
-        logger.info(f"[CHECKIN_REPORT] Using timezone: {user_tz.zone} for location_id: {location_id}")
+        # logger.info(f"[CHECKIN_REPORT] Using timezone: {user_tz.zone} for location_id: {location_id}")
     else:
         # For Celery tasks or non-request contexts, use default timezone
         # Note: In Celery tasks, we should ideally get timezone from the user_id if provided
@@ -4094,15 +4080,15 @@ def _get_checkin_report_data(
                         actual_time = checkin.timestamp
                         
                         # Log UTC time before conversion
-                        logger.info(f"[CHECKIN_REPORT] UTC time (before conversion): {actual_time}, timezone: {actual_time.tzinfo if actual_time else None}")
+                        # logger.info(f"[CHECKIN_REPORT] UTC time (before conversion): {actual_time}, timezone: {actual_time.tzinfo if actual_time else None}")
                         
                         # Convert both to user timezone for delay calculation
                         actual_time_user = to_user_timezone(actual_time, user_tz)
                         expected_time_user = expected_datetime_user.astimezone(user_tz)
                         
                         # Log converted time
-                        logger.info(f"[CHECKIN_REPORT] Converted time (after conversion): {actual_time_user}, target timezone: {user_tz.zone}")
-                        logger.info(f"[CHECKIN_REPORT] Expected time: {expected_time_user}, timezone: {expected_time_user.tzinfo if expected_time_user else None}")
+                        # logger.info(f"[CHECKIN_REPORT] Converted time (after conversion): {actual_time_user}, target timezone: {user_tz.zone}")
+                        # logger.info(f"[CHECKIN_REPORT] Expected time: {expected_time_user}, timezone: {expected_time_user.tzinfo if expected_time_user else None}")
                         
                         # Calculate delay in minutes (in user timezone)
                         delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
@@ -4145,9 +4131,9 @@ def _get_checkin_report_data(
                 expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
                 if actual_time:
                     # Log before final conversion for display
-                    logger.info(f"[CHECKIN_REPORT] Display conversion - UTC: {actual_time}, Converting to: {user_tz.zone}")
+                    # logger.info(f"[CHECKIN_REPORT] Display conversion - UTC: {actual_time}, Converting to: {user_tz.zone}")
                     actual_time_display = to_user_timezone(actual_time, user_tz)
-                    logger.info(f"[CHECKIN_REPORT] Display conversion - Result: {actual_time_display}, timezone: {actual_time_display.tzinfo if actual_time_display else None}")
+                    # logger.info(f"[CHECKIN_REPORT] Display conversion - Result: {actual_time_display}, timezone: {actual_time_display.tzinfo if actual_time_display else None}")
                 else:
                     actual_time_display = None
                 
@@ -4360,22 +4346,22 @@ class DashboardCheckInReportView(APIView):
             for idx, item in enumerate(report_data):
                 if item['expected_time']:
                     # Log before formatting
-                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time before format: {item['expected_time']}, timezone: {item['expected_time'].tzinfo if hasattr(item['expected_time'], 'tzinfo') else 'N/A'}")
+                    # logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time before format: {item['expected_time']}, timezone: {item['expected_time'].tzinfo if hasattr(item['expected_time'], 'tzinfo') else 'N/A'}")
                     # Convert to ISO format string (timezone-aware)
                     if hasattr(item['expected_time'], 'isoformat'):
                         item['expected_time'] = item['expected_time'].isoformat()
                     else:
                         item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
-                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time after format: {item['expected_time']}")
+                    # logger.info(f"[CHECKIN_REPORT] Item {idx} - Expected time after format: {item['expected_time']}")
                 if item['actual_checkin_time']:
                     # Log before formatting
-                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time before format: {item['actual_checkin_time']}, timezone: {item['actual_checkin_time'].tzinfo if hasattr(item['actual_checkin_time'], 'tzinfo') else 'N/A'}")
+                    # logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time before format: {item['actual_checkin_time']}, timezone: {item['actual_checkin_time'].tzinfo if hasattr(item['actual_checkin_time'], 'tzinfo') else 'N/A'}")
                     # Convert to ISO format string (timezone-aware)
                     if hasattr(item['actual_checkin_time'], 'isoformat'):
                         item['actual_checkin_time'] = item['actual_checkin_time'].isoformat()
                     else:
                         item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
-                    logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time after format: {item['actual_checkin_time']}")
+                    # logger.info(f"[CHECKIN_REPORT] Item {idx} - Actual time after format: {item['actual_checkin_time']}")
             
             # Serialize and return
             serializer = CheckInReportSerializer(report_data, many=True)
@@ -4549,6 +4535,153 @@ class AttendanceCheckinV3ListView(generics.ListAPIView):
 
         # Enforce stable latest-first ordering for dashboard table.
         return queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
+
+
+class AttendanceCheckinV4ListView(generics.ListAPIView):
+    """
+    V4 Attendance API: Optimized by bulk-fetching CheckInLogs to avoid N+1 queries.
+    """
+    serializer_class = AttendanceCheckinDashboardV4Serializer
+
+    def get_queryset(self):
+        queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
+
+        location_id = self.request.query_params.get("location")
+        user_tz = get_user_timezone_from_request(self.request, location_id=location_id)
+        date_filter = self.request.query_params.get("date_filter", "today")
+        user_today = get_user_today(user_tz)
+
+        if date_filter == "today":
+            queryset = queryset.filter(shift_date=user_today)
+        elif date_filter == "week":
+            start_week = user_today - timedelta(days=user_today.weekday())
+            end_week = min(start_week + timedelta(days=6), user_today)
+            queryset = queryset.filter(shift_date__gte=start_week, shift_date__lte=end_week)
+        elif date_filter == "month":
+            start_of_month = user_today.replace(day=1)
+            end_of_month = min(
+                user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1) if user_today.month != 12
+                else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
+                user_today
+            )
+            queryset = queryset.filter(shift_date__gte=start_of_month, shift_date__lte=end_of_month)
+        elif date_filter == "custom":
+            start_date = self.request.query_params.get("start_date")
+            end_date = self.request.query_params.get("end_date")
+            if start_date and end_date:
+                try:
+                    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+                    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+                    end_date_obj = min(end_date_obj, user_today)
+                    queryset = queryset.filter(shift_date__gte=start_date_obj, shift_date__lte=end_date_obj)
+                except ValueError:
+                    pass
+
+        guard_id = self.request.query_params.get("guard")
+        if guard_id:
+            queryset = queryset.filter(guard_id=guard_id)
+
+        search = (self.request.query_params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(
+                Q(guard__name__icontains=search) | Q(guard__employee_code__icontains=search)
+            )
+
+        role_param = (self.request.query_params.get("role") or "").strip().lower()
+        if role_param and role_param != "all":
+            queryset = queryset.filter(guard__role__iexact=role_param)
+
+        location_id = self.request.query_params.get("location")
+        if location_id:
+            queryset = queryset.filter(org_location_id=location_id)
+
+        shift_id = self.request.query_params.get("shift")
+        if shift_id:
+            queryset = queryset.filter(shift_id=shift_id)
+
+        status = self.request.query_params.get("status")
+        if status:
+            queryset = _apply_attendance_v3_status_filter(queryset, status)
+
+        defaulters = self.request.query_params.get("defaulters")
+        if defaulters == "true":
+            queryset = queryset.filter(
+                Q(checkin_time__isnull=False) & (
+                    (Q(last_checkin_time__isnull=False) & Q(last_checkout_time__isnull=True)) |
+                    Q(last_checkin_time__gt=F("last_checkout_time")) |
+                    (Q(last_checkin_time__isnull=True) & Q(checkout_time__isnull=True))
+                )
+            )
+
+        return queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # Execute queryset once to get the list for serialization and log pre-fetching
+        page_items = list(queryset)
+        if not page_items:
+            return Response([])
+
+        # Determine global time window for log pre-fetching
+        location_id = self.request.query_params.get("location")
+        user_tz = get_user_timezone_from_request(self.request, location_id=location_id)
+        
+        guard_ids = {obj.guard_id for obj in page_items}
+        
+        # Calculate search window for the entire result set
+        min_start_utc = None
+        max_end_utc = None
+        
+        grace_minutes = _get_site_setting_int(
+            key="shift_grace_time",
+            location_id=location_id,
+            default_value=30,
+        )
+
+        for obj in page_items:
+            source_dt = obj.checkin_time or obj.created_on
+            if not source_dt: continue
+            
+            shift_day = obj.shift_date or to_user_timezone(source_dt, user_tz).date()
+            if obj.shift.end_time <= obj.shift.start_time and obj.shift_date is None:
+                local_dt = to_user_timezone(source_dt, user_tz)
+                if local_dt.time() < obj.shift.end_time:
+                    shift_day = shift_day - timedelta(days=1)
+            
+            # Use same logic as _attendance_v3_shift_window_utc to find boundaries
+            shift_start_dt_user = combine_date_time_in_user_tz(shift_day, obj.shift.start_time, user_tz).astimezone(user_tz)
+            if obj.shift.end_time <= obj.shift.start_time:
+                shift_end_dt_user = combine_date_time_in_user_tz(shift_day + timedelta(days=1), obj.shift.end_time, user_tz).astimezone(user_tz)
+            else:
+                shift_end_dt_user = combine_date_time_in_user_tz(shift_day, obj.shift.end_time, user_tz).astimezone(user_tz)
+
+            start_utc = (shift_start_dt_user - timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
+            end_utc = (shift_end_dt_user + timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
+            
+            if min_start_utc is None or start_utc < min_start_utc:
+                min_start_utc = start_utc
+            if max_end_utc is None or end_utc > max_end_utc:
+                max_end_utc = end_utc
+
+        prefetched_logs = {}
+        if min_start_utc and max_end_utc:
+            logs = CheckInLog.objects.filter(
+                guard_id__in=guard_ids,
+                timestamp__gte=min_start_utc,
+                timestamp__lt=max_end_utc,
+            ).order_by("timestamp")
+            
+            for log in logs:
+                if log.guard_id not in prefetched_logs:
+                    prefetched_logs[log.guard_id] = []
+                prefetched_logs[log.guard_id].append(log)
+
+        serializer = self.get_serializer(page_items, many=True, context={
+            'request': request,
+            'prefetched_logs': prefetched_logs
+        })
+        return Response(serializer.data)
 
 
 def generate_checkin_excel_report_internal(
@@ -5289,6 +5422,255 @@ class AttendanceCheckinV3ExportView(APIView):
         except Exception as e:
             logger.error(f"[ATTENDANCE_EXPORT_V3_API] Exception: {str(e)}", exc_info=True)
             return Response({"error": f"Failed to generate v3 report: {str(e)}"}, status=500)
+
+
+def generate_attendance_v4_excel_report_internal(
+    date_filter='today',
+    start_date=None,
+    end_date=None,
+    guard_id=None,
+    location_id=None,
+    shift_id=None,
+    status_filter=None,
+    defaulters=False,
+    request=None,
+    search=None,
+    role=None,
+):
+    """
+    V4 attendance export helper: Optimized by bulk-fetching CheckInLogs.
+    """
+    queryset = AttendanceCheckin.objects.select_related("guard", "shift", "org_location")
+
+    if request:
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
+        user_today = get_user_today(user_tz)
+    else:
+        user_tz = pytz.timezone('Asia/Kolkata')
+        user_today = get_user_today(user_tz)
+
+    if date_filter == "today":
+        queryset = queryset.filter(shift_date=user_today)
+    elif date_filter == "week":
+        start_week = user_today - timedelta(days=user_today.weekday())
+        end_week = min(start_week + timedelta(days=6), user_today)
+        queryset = queryset.filter(shift_date__gte=start_week, shift_date__lte=end_week)
+    elif date_filter == "month":
+        start_of_month = user_today.replace(day=1)
+        end_of_month = min(
+            user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1) if user_today.month != 12
+            else user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1),
+            user_today
+        )
+        queryset = queryset.filter(shift_date__gte=start_of_month, shift_date__lte=end_of_month)
+    elif date_filter == "custom" and start_date and end_date:
+        try:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+            end_date_obj = min(end_date_obj, user_today)
+            queryset = queryset.filter(shift_date__gte=start_date_obj, shift_date__lte=end_date_obj)
+        except ValueError:
+            raise ValueError("Invalid custom date format. Use YYYY-MM-DD.")
+
+    if guard_id:
+        queryset = queryset.filter(guard_id=guard_id)
+    if search and str(search).strip():
+        s = str(search).strip()
+        queryset = queryset.filter(
+            Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+        )
+    if role and str(role).strip().lower() not in ("", "all"):
+        queryset = queryset.filter(guard__role__iexact=str(role).strip().lower())
+    if location_id:
+        queryset = queryset.filter(org_location_id=location_id)
+    if shift_id:
+        queryset = queryset.filter(shift_id=shift_id)
+    if status_filter:
+        queryset = _apply_attendance_v3_status_filter(queryset, status_filter)
+    if defaulters:
+        queryset = queryset.filter(
+            checkin_time__isnull=False,
+        ).filter(
+            (Q(last_checkin_time__isnull=False) & Q(last_checkout_time__isnull=True)) |
+            Q(last_checkin_time__gt=F("last_checkout_time")) |
+            (Q(last_checkin_time__isnull=True) & Q(checkout_time__isnull=True))
+        )
+
+    queryset = queryset.order_by("-shift_date", "-checkin_time", "-last_checkin_time", "-modified_on", "-id")
+    
+    # Execute queryset
+    page_items = list(queryset)
+    
+    # Bulk fetch logs
+    prefetched_logs = {}
+    if page_items:
+        guard_ids = {obj.guard_id for obj in page_items}
+        min_start_utc = None
+        max_end_utc = None
+        
+        grace_minutes = _get_site_setting_int(
+            key="shift_grace_time",
+            location_id=location_id,
+            default_value=30,
+        )
+
+        for obj in page_items:
+            source_dt = obj.checkin_time or obj.created_on
+            if not source_dt: continue
+            shift_day = obj.shift_date or to_user_timezone(source_dt, user_tz).date()
+            if obj.shift.end_time <= obj.shift.start_time and obj.shift_date is None:
+                if to_user_timezone(source_dt, user_tz).time() < obj.shift.end_time:
+                    shift_day = shift_day - timedelta(days=1)
+            
+            # Boundaries
+            s_u = combine_date_time_in_user_tz(shift_day, obj.shift.start_time, user_tz).astimezone(pytz.UTC) - timedelta(minutes=grace_minutes)
+            if obj.shift.end_time <= obj.shift.start_time:
+                e_u = combine_date_time_in_user_tz(shift_day + timedelta(days=1), obj.shift.end_time, user_tz).astimezone(pytz.UTC) + timedelta(minutes=grace_minutes)
+            else:
+                e_u = combine_date_time_in_user_tz(shift_day, obj.shift.end_time, user_tz).astimezone(pytz.UTC) + timedelta(minutes=grace_minutes)
+            
+            if min_start_utc is None or s_u < min_start_utc: min_start_utc = s_u
+            if max_end_utc is None or e_u > max_end_utc: max_end_utc = e_u
+
+        if min_start_utc and max_end_utc:
+            all_logs = CheckInLog.objects.filter(
+                guard_id__in=guard_ids,
+                timestamp__gte=min_start_utc,
+                timestamp__lt=max_end_utc,
+            ).order_by("timestamp")
+            for l in all_logs:
+                if l.guard_id not in prefetched_logs: prefetched_logs[l.guard_id] = []
+                prefetched_logs[l.guard_id].append(l)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance Checkins V4"
+    ws.append([
+        "Shift Date", "Name", "Emp Code", "Designation", "Shift", "Location",
+        "First Checkin", "Last Checkout", "Checkin Count", "Checkout Count",
+        "Live State", "Sessions", "Duration (HH:MM)", "PA Status", "Remarks",
+    ])
+
+    rows = []
+    for obj in page_items:
+        # Optimized session lines logic without per-row DB query
+        guard_logs = prefetched_logs.get(obj.guard_id, [])
+        source_dt = obj.checkin_time or obj.created_on
+        shift_day = obj.shift_date or to_user_timezone(source_dt, user_tz).date()
+        if obj.shift.end_time <= obj.shift.start_time and obj.shift_date is None:
+            if to_user_timezone(source_dt, user_tz).time() < obj.shift.end_time:
+                shift_day = shift_day - timedelta(days=1)
+        
+        s_u = combine_date_time_in_user_tz(shift_day, obj.shift.start_time, user_tz).astimezone(pytz.UTC) - timedelta(minutes=grace_minutes)
+        if obj.shift.end_time <= obj.shift.start_time:
+            e_u = combine_date_time_in_user_tz(shift_day + timedelta(days=1), obj.shift.end_time, user_tz).astimezone(pytz.UTC) + timedelta(minutes=grace_minutes)
+        else:
+            e_u = combine_date_time_in_user_tz(shift_day, obj.shift.end_time, user_tz).astimezone(pytz.UTC) + timedelta(minutes=grace_minutes)
+
+        matched_logs = [l for l in guard_logs if l.assignment_id == obj.assignment_id and l.shift_id == obj.shift_id and s_u <= l.timestamp < e_u]
+        
+        lines = []
+        open_checkin = None
+        idx = 1
+        for log in matched_logs:
+            if log.type == "checkin":
+                open_checkin = log.timestamp
+            elif log.type == "checkout" and open_checkin is not None and log.timestamp > open_checkin:
+                in_local = to_user_timezone(open_checkin, user_tz)
+                out_local = to_user_timezone(log.timestamp, user_tz)
+                mins = int((log.timestamp - open_checkin).total_seconds() // 60)
+                lines.append(f"{idx}) {in_local.strftime('%H:%M')} -> {out_local.strftime('%H:%M')} ({mins//60}h {mins%60}m)")
+                idx += 1
+                open_checkin = None
+        if open_checkin:
+            lines.append(f"{idx}) {to_user_timezone(open_checkin, user_tz).strftime('%H:%M')} -> Open")
+        session_lines = "\n".join(lines)
+
+        first_checkin = to_user_timezone(obj.checkin_time, user_tz) if obj.checkin_time else None
+        last_checkout = to_user_timezone(obj.last_checkout_time, user_tz) if obj.last_checkout_time else (to_user_timezone(obj.checkout_time, user_tz) if obj.checkout_time else None)
+        duration = ""
+        if obj.duration_minutes is not None:
+            m = int(obj.duration_minutes)
+            duration = f"{m // 60:02}:{m % 60:02}"
+        
+        pa_map = {"P": "Present", "OW": "On Work", "M": "Missed Checkout", "LD": "Less Duration", "A": "Absent (Legacy)"}
+        live_state = "Checked In" if (obj.last_checkin_time and (not obj.last_checkout_time or obj.last_checkin_time > obj.last_checkout_time)) else "Checked Out"
+        pa_text = pa_map.get(obj.pa_status, "")
+        if not pa_text and live_state == "Checked In": pa_text = "On Work"
+
+        effective_dt = first_checkin or (to_user_timezone(obj.last_checkin_time, user_tz) if obj.last_checkin_time else to_user_timezone(obj.created_on, user_tz))
+        s_date_key = obj.shift_date or (effective_dt.date() if effective_dt else date.min)
+        
+        rows.append((
+            s_date_key,
+            effective_dt or datetime.min.replace(tzinfo=user_tz),
+            [
+                s_date_key.strftime('%Y-%m-%d') if s_date_key != date.min else "",
+                obj.guard.name,
+                getattr(obj.guard, "employee_code", None) or "",
+                (getattr(obj.guard, "role", None) or "").strip(),
+                obj.shift.name if obj.shift else "",
+                obj.org_location.name if obj.org_location else "",
+                first_checkin.strftime('%Y-%m-%d %H:%M:%S') if first_checkin else "",
+                last_checkout.strftime('%Y-%m-%d %H:%M:%S') if last_checkout else "",
+                int(obj.checkin_count or 0),
+                int(obj.checkout_count or 0),
+                live_state,
+                session_lines,
+                duration,
+                pa_text,
+                ", ".join(["Missed Checked-out"] if first_checkin and not last_checkout else (["Missed Check-in"] if not first_checkin and obj.shift else [])),
+            ],
+        ))
+
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    rows.sort(key=lambda x: (str(x[2][3] or "").strip().upper() or "UNASSIGNED"))
+    for _, _, r_data in rows:
+        ws.append(r_data)
+
+    try:
+        from openpyxl.styles import Alignment
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=12, max_col=12):
+            for cell in row: cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.column_dimensions['L'].width = 42
+    except: pass
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    filename = f"attendance_export_v4_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+    with open(file_path, 'wb') as f: f.write(buffer.getvalue())
+    return {'file_path': file_path, 'filename': filename, 'row_count': len(page_items)}
+
+
+class AttendanceCheckinV4ExportView(APIView):
+    def get(self, request):
+        params = request.query_params
+        try:
+            result = generate_attendance_v4_excel_report_internal(
+                date_filter=params.get("date_filter", "today"),
+                start_date=params.get("start_date"),
+                end_date=params.get("end_date"),
+                guard_id=params.get("guard"),
+                location_id=params.get("location"),
+                shift_id=params.get("shift"),
+                status_filter=params.get("status"),
+                defaulters=params.get("defaulters") == "true",
+                request=request,
+                search=params.get("search"),
+                role=params.get("role"),
+            )
+            with open(result['file_path'], 'rb') as f:
+                content = f.read()
+            response = HttpResponse(content, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            fname = f"attendance_report_v4_{params.get('start_date', '')}_{params.get('end_date', '')}.xlsx" if params.get('date_filter') == 'custom' else f"attendance_report_v4_{timezone.now().strftime('%Y%m%d')}.xlsx"
+            response["Content-Disposition"] = f'attachment; filename="{fname}"'
+            return response
+        except ValueError as e: return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"[ATTENDANCE_EXPORT_V4_API] Exception: {str(e)}", exc_info=True)
+            return Response({"error": f"Failed to generate v4 report: {str(e)}"}, status=500)
 
 
 def _append_monthly_day_totals(row, date_range):
@@ -6609,3 +6991,456 @@ class AttendanceWeekOffViewSet(ViewSet):
 
         return Response(rows, status=status.HTTP_200_OK)
 
+
+# --- Checkin Report API v2 (Performance Optimized) ---
+def _get_checkin_report_data_v2(
+    filter_type='today',
+    start_date_str=None,
+    end_date_str=None,
+    user_id=None,
+    location_id=None,
+    shift_id=None,
+    request=None,
+    search=None,
+    role=None,
+):
+    from django.utils.timezone import now as django_now
+    
+    if request:
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
+        today = get_user_today(user_tz)
+    else:
+        user_tz = pytz.timezone('Asia/Kolkata')
+        today = get_user_today(user_tz)
+    
+    if filter_type == 'today':
+        start_dt_user = datetime.combine(today, datetime.min.time())
+        end_dt_user = datetime.combine(today, datetime.max.time())
+    elif filter_type == 'this_week':
+        start_week = today - timedelta(days=today.weekday())
+        end_week = start_week + timedelta(days=6)
+        start_dt_user = datetime.combine(start_week, datetime.min.time())
+        end_dt_user = datetime.combine(end_week, datetime.max.time())
+    elif filter_type == 'this_month':
+        start_dt_user = datetime(today.year, today.month, 1)
+        next_month = start_dt_user.replace(day=28) + timedelta(days=4)
+        end_dt_user = datetime(next_month.year, next_month.month, 1) - timedelta(seconds=1)
+    elif filter_type == 'custom' and start_date_str and end_date_str:
+        try:
+            start_date_obj = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            end_date_obj = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+            start_dt_user = datetime.combine(start_date_obj, datetime.min.time())
+            end_dt_user = datetime.combine(end_date_obj, datetime.max.time())
+        except ValueError as e:
+            raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
+    else:
+        raise ValueError("Invalid filter or missing dates")
+    
+    query_start_date = start_dt_user.date() - timedelta(days=1)
+    query_end_date = end_dt_user.date()
+    assignments = Assignment.objects.filter(
+        start_date__lte=query_end_date,
+        end_date__gte=query_start_date
+    ).select_related('guard', 'location', 'shift').order_by('guard__name', 'id')
+    
+    if location_id:
+        assignments = assignments.filter(location_id=location_id)
+    if shift_id:
+        assignments = assignments.filter(shift_id=shift_id)
+    if user_id:
+        assignments = assignments.filter(guard_id=user_id)
+    elif search and str(search).strip():
+        s = str(search).strip()
+        assignments = assignments.filter(
+            Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+        )
+    if not user_id and role and str(role).strip().lower() not in ('', 'all'):
+        assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
+    
+    report = []
+    
+    date_range = []
+    current_date = start_dt_user.date()
+    end_date = end_dt_user.date()
+    
+    if filter_type in ['this_week', 'this_month', 'custom']:
+        end_date = min(end_date, today)
+    
+    while current_date <= end_date:
+        date_range.append(current_date)
+        current_date += timedelta(days=1)
+    
+    # --- BULK FETCH OPTIMIZATION FOR v2 ---
+    from collections import defaultdict
+    overall_start_date = start_dt_user.date() - timedelta(days=1)
+    overall_end_date = end_dt_user.date() + timedelta(days=1)
+    global_start_utc = combine_date_time_in_user_tz(overall_start_date, datetime.min.time(), user_tz).astimezone(pytz.UTC)
+    global_end_utc = combine_date_time_in_user_tz(overall_end_date, datetime.max.time(), user_tz).astimezone(pytz.UTC)
+    
+    guard_ids = [a.guard_id for a in assignments]
+    
+    all_checkins_query = CheckIn.objects.filter(
+        guard_id__in=guard_ids,
+        timestamp__gte=global_start_utc,
+        timestamp__lt=global_end_utc
+    )
+    if shift_id:
+        all_checkins_query = all_checkins_query.filter(shift_id=shift_id)
+        
+    all_checkins = list(all_checkins_query.order_by('timestamp'))
+    
+    checkin_map = defaultdict(list)
+    checkin_ids = []
+    for c in all_checkins:
+        key = (str(c.guard_id), str(c.shift_id), str(c.checkpoint_id))
+        checkin_map[key].append(c)
+        if getattr(c, 'has_checklist', False):
+            checkin_ids.append(c.id)
+            
+    answer_map = {}
+    if checkin_ids:
+        all_answers = CheckInChecklistAnswer.objects.filter(
+            checkin_id__in=checkin_ids,
+            is_deleted=False
+        ).select_related('checklist_template')
+        for ans in all_answers:
+            if str(ans.checkin_id) not in answer_map:
+                answer_map[str(ans.checkin_id)] = ans
+                
+    # 4. Fetch all checkpoints in a single query to prevent N+1 lookups
+    all_checkpoint_ids = set()
+    for assignment in assignments:
+        for cp in (assignment.checkpoints or []):
+            if cp.get('checkpoint_id'):
+                all_checkpoint_ids.add(str(cp.get('checkpoint_id')))
+                
+    checkpoints_lookup = {}
+    if all_checkpoint_ids:
+        for cp_obj in Checkpoint.objects.filter(id__in=list(all_checkpoint_ids)):
+            checkpoints_lookup[str(cp_obj.id)] = cp_obj.label
+
+    # --------------------------------------
+
+    for assignment in assignments:
+        guard = assignment.guard
+        shift = assignment.shift
+        location = assignment.location
+        
+        for cp in (assignment.checkpoints or []):
+            checkpoint_id = cp.get('checkpoint_id')
+            expected_time_str = cp.get('time')
+            
+            if not checkpoint_id or not expected_time_str:
+                continue
+            
+            try:
+                expected_time_obj = datetime.strptime(expected_time_str, "%H:%M").time()
+            except ValueError:
+                continue
+            
+            checkpoint_name = checkpoints_lookup.get(str(checkpoint_id))
+            if not checkpoint_name:
+                checkpoint_name = "Unknown Checkpoint"
+                continue
+            
+            is_overnight = shift.end_time <= shift.start_time
+            
+            dates_to_check = list(date_range)
+            if is_overnight:
+                prev_day = start_dt_user.date() - timedelta(days=1)
+                if assignment.start_date <= prev_day <= assignment.end_date:
+                    if prev_day not in dates_to_check:
+                        dates_to_check.insert(0, prev_day)
+            
+            for check_date in dates_to_check:
+                if check_date > today:
+                    continue
+                
+                if not (assignment.start_date <= check_date <= assignment.end_date):
+                    continue
+                
+                if is_overnight:
+                    if expected_time_obj >= shift.start_time:
+                        checkpoint_date = check_date
+                    else:
+                        checkpoint_date = check_date + timedelta(days=1)
+                else:
+                    checkpoint_date = check_date
+                
+                if not (start_dt_user.date() <= checkpoint_date <= end_date):
+                    continue
+                
+                expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
+                
+                search_start_utc = (expected_datetime_user - timedelta(minutes=30)).astimezone(pytz.UTC)
+                search_end_utc = (expected_datetime_user + timedelta(minutes=30)).astimezone(pytz.UTC)
+
+                # Match in O(1) from the memory map instead of DB
+                checkin = None
+                map_key = (str(guard.id), str(shift.id), str(checkpoint_id))
+                for c in checkin_map.get(map_key, []):
+                    if search_start_utc <= c.timestamp < search_end_utc:
+                        checkin = c
+                        break
+                
+                actual_time = None
+                delay = None
+                
+                if expected_datetime_user:
+                    expected_time_user = expected_datetime_user.astimezone(user_tz)
+                    user_now = get_user_now(user_tz)
+                    if user_now > expected_time_user + timedelta(minutes=15):
+                        status = "Missed"
+                    else:
+                        status = "Pending"
+                else:
+                    status = "Missed"
+                
+                if checkin:
+                    if not checkin.synced:
+                        status = "Missed"
+                        actual_time = None
+                        delay = None
+                    else:
+                        actual_time = checkin.timestamp
+                        actual_time_user = to_user_timezone(actual_time, user_tz)
+                        expected_time_user = expected_datetime_user.astimezone(user_tz)
+                        delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
+                        
+                        if delay <= 15:
+                            status = "On Time"
+                        elif 15 < delay <= 30:
+                            status = "Delayed"
+                        else:
+                            status = "Missed"
+                
+                has_checklist = bool(checkin.has_checklist) if checkin else False
+                checklist_template_name = None
+                checklist_remarks = None
+                checklist_checked_count = None
+                checklist_total_count = None
+
+                checklist_answers = None
+                if checkin and has_checklist:
+                    answer = answer_map.get(str(checkin.id))
+
+                    if answer:
+                        checklist_template_name = answer.checklist_template.name if answer.checklist_template else None
+                        checklist_remarks = answer.remarks
+                        checklist_answers = answer.answers or []
+                        try:
+                            checklist_total_count = len(checklist_answers)
+                            checklist_checked_count = sum(1 for a in checklist_answers if a.get("checked") is True)
+                        except Exception:
+                            checklist_total_count = None
+                            checklist_checked_count = None
+
+                expected_time_display = expected_datetime_user.astimezone(user_tz) if expected_datetime_user else None
+                if actual_time:
+                    actual_time_display = to_user_timezone(actual_time, user_tz)
+                else:
+                    actual_time_display = None
+                
+                report_date = checkpoint_date
+                
+                report.append({
+                    'date': report_date.strftime('%Y-%m-%d'),
+                    'guard_id': str(guard.id),
+                    'guard_name': guard.name,
+                    'employee_code': getattr(guard, 'employee_code', None) or '',
+                    'designation': (getattr(guard, 'role', None) or '').strip(),
+                    'location_id': str(location.id) if location else None,
+                    'location_name': location.name if location else "",
+                    'shift_id': str(shift.id) if shift else None,
+                    'shift_name': shift.name if shift else "",
+                    'checkpoint_id': str(checkpoint_id),
+                    'checkpoint_name': checkpoint_name,
+                    'expected_time': expected_time_display,
+                    'actual_checkin_time': actual_time_display,
+                    'status': status,
+                    'delay_minutes': delay,
+                    'checkin_id': str(checkin.id) if checkin else None,
+                    'has_checklist': has_checklist,
+                    'checklist_template_name': checklist_template_name,
+                    'checklist_remarks': checklist_remarks,
+                    'checklist_checked_count': checklist_checked_count,
+                    'checklist_total_count': checklist_total_count,
+                    'checklist_answers': checklist_answers,
+                })
+                
+    # Sort identical to v1: (date, expected_time, guard_name, checkpoint_name)
+    report.sort(key=lambda r: (
+        r['date'],
+        str(r['expected_time']) if r['expected_time'] else '',
+        r['guard_name'],
+        r['checkpoint_name'],
+    ))
+    return report
+
+
+class DashboardCheckInReportViewV2(APIView):
+    """
+    API endpoint that returns check-in report data as JSON.
+    V2: Includes bulk fetch performance improvements for massive user counts.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        filter_type = request.query_params.get('filter', 'today')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
+        search = (request.query_params.get('search') or '').strip()
+        role = (request.query_params.get('role') or '').strip()
+        
+        try:
+            report_data = _get_checkin_report_data_v2(
+                filter_type=filter_type,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                user_id=user_id,
+                location_id=location_id,
+                shift_id=shift_id,
+                request=request,
+                search=search or None,
+                role=role or None,
+            )
+            
+            for idx, item in enumerate(report_data):
+                if item['expected_time']:
+                    if hasattr(item['expected_time'], 'isoformat'):
+                        item['expected_time'] = item['expected_time'].isoformat()
+                    else:
+                        item['expected_time'] = item['expected_time'].strftime('%Y-%m-%d %H:%M:%S')
+                if item['actual_checkin_time']:
+                    if hasattr(item['actual_checkin_time'], 'isoformat'):
+                        item['actual_checkin_time'] = item['actual_checkin_time'].isoformat()
+                    else:
+                        item['actual_checkin_time'] = item['actual_checkin_time'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            serializer = CheckInReportSerializer(report_data, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while generating the v2 report: {str(e)}"}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class DashboardCheckInReportExcelViewV2(APIView):
+    """
+    API endpoint that generates and returns an Excel file download.
+    V2: Uses bulk-fetch optimized _get_checkin_report_data_v2 for fast generation.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        filter_type = request.query_params.get('filter', 'today')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
+        search = (request.query_params.get('search') or '').strip()
+        role = (request.query_params.get('role') or '').strip()
+
+        try:
+            report_data = _get_checkin_report_data_v2(
+                filter_type=filter_type,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                user_id=user_id,
+                location_id=location_id,
+                shift_id=shift_id,
+                request=request,
+                search=search or None,
+                role=role or None,
+            )
+
+            # Create Excel workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Check-In Report"
+
+            def format_checklist_cell(report_item):
+                answers = report_item.get('checklist_answers')
+                if isinstance(answers, list) and len(answers) > 0:
+                    lines = []
+                    for a in answers:
+                        label = (a or {}).get('label') or 'Item'
+                        checked = (a or {}).get('checked') is True
+                        lines.append(f"{label} : {'✓' if checked else '✗'}")
+                    return "\n".join(lines)
+                return report_item.get('checklist_template_name') or ""
+
+            # Header row
+            headers = [
+                'Date', 'Name', 'Emp Code', 'Designation', 'Shift Name', 'Checkpoint Name',
+                'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)',
+                'Has Checklist', 'Checklist', 'Checklist Remarks'
+            ]
+            ws.append(headers)
+
+            # Add data rows
+            for item in report_data:
+                ws.append([
+                    item['date'],
+                    item['guard_name'],
+                    item.get('employee_code') or '',
+                    item.get('designation') or '',
+                    item['shift_name'],
+                    item['checkpoint_name'],
+                    item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
+                    item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
+                    item['status'],
+                    item['delay_minutes'] if item['delay_minutes'] is not None else "",
+                    "Yes" if item.get('has_checklist') else "No",
+                    format_checklist_cell(item),
+                    item.get('checklist_remarks') or "",
+                ])
+
+            # Wrap text for the Checklist column (so items show line-by-line)
+            try:
+                from openpyxl.styles import Alignment
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=12, max_col=12):
+                    for cell in row:
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.column_dimensions['L'].width = 55
+                ws.column_dimensions['M'].width = 35
+            except Exception:
+                pass
+
+            # Save to in-memory buffer
+            buffer = BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+
+            # Return Excel file as HTTP response
+            excel_content = buffer.getvalue()
+
+            response = HttpResponse(
+                excel_content,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            # Generate a meaningful filename based on filter
+            if filter_type == 'custom' and start_date and end_date:
+                filename = f"checkin_report_{start_date}_{end_date}.xlsx"
+            else:
+                filename = f"checkin_report_{timezone.now().strftime('%Y%m%d')}.xlsx"
+
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
+
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while generating the v2 Excel report: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

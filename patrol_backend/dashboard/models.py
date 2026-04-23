@@ -65,6 +65,13 @@ class AttendanceCheckin(models.Model):
         blank=True,
         db_index=True,
     )
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attendance_records"
+    )
 
     latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
@@ -120,6 +127,13 @@ class CheckInLog(models.Model):
     type = models.CharField(max_length=10, choices=[("checkin", "Check-In"), ("checkout", "Check-Out")])
     latitude = models.DecimalField(max_digits=9, decimal_places=6)
     longitude = models.DecimalField(max_digits=9, decimal_places=6)
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="checkin_logs"
+    )
 
     # Optional proof image for each checkin/checkout event
     image = models.ImageField(upload_to="attendance_checkinlog/", null=True, blank=True)

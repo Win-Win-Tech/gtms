@@ -1,12 +1,45 @@
 from rest_framework import serializers
-from .models import Location, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate, ChecklistItem, ChecklistTemplate
+from .models import Location, LocationSite, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate, ChecklistItem, ChecklistTemplate
 from django.utils.timezone import now
 from uuid import UUID
 
+class LocationSiteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LocationSite
+        fields = ['id', 'name', 'latitude', 'longitude']
+
 class LocationSerializer(serializers.ModelSerializer):
+    sites = LocationSiteSerializer(many=True, required=False)
+
     class Meta:
         model = Location
-        fields = '__all__'
+        fields = [
+            'id', 'sites', 'name', 'address', 'latitude', 'longitude', 
+            'is_qr_scan_enable', 'is_face_attendance_enabled', 
+            'created_on', 'modified_on', 'is_deleted'
+        ]
+
+    def create(self, validated_data):
+        sites_data = validated_data.pop('sites', [])
+        location = Location.objects.create(**validated_data)
+        for site_data in sites_data:
+            site_data.pop('id', None)  # Ensure we don't try to reuse IDs on creation
+            LocationSite.objects.create(location=location, **site_data)
+        return location
+
+    def update(self, instance, validated_data):
+        sites_data = validated_data.pop('sites', None)
+        instance = super().update(instance, validated_data)
+
+        if sites_data is not None:
+            # Simple approach: delete existing and recreate. 
+            # We pop 'id' to avoid potential conflicts with the records we just deleted
+            instance.sites.all().delete()
+            for site_data in sites_data:
+                site_data.pop('id', None)
+                LocationSite.objects.create(location=instance, **site_data)
+        
+        return instance
 
 class ShiftSerializer(serializers.ModelSerializer):
     # start_time = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S')

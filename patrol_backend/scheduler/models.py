@@ -72,6 +72,21 @@ class Location(models.Model):
         return self.name
 
 
+class LocationSite(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name="sites")
+    name = models.CharField(max_length=255)
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    is_active = models.BooleanField(default=True)
+
+    # Audit fields
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.location.name} - {self.name}"
+
 
 #class Shift(models.Model):
 #    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
