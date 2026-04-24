@@ -13,9 +13,12 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r'attendance', AttendanceCheckinViewSet, basename="attendance")
-router.register(r'attendance-summary', MonthlyAttendanceSummaryViewSet, basename="attendance-summary")  # ✅ Add this
-router.register(r'attendance-excel', MonthlyAttendanceExcelViewSet, basename="attendance-excel")  # ✅ Add this
+router.register(r'attendance-summary', MonthlyAttendanceSummaryViewSet, basename="attendance-summary")
+router.register(r'attendance-summary-v2', MonthlyAttendanceSummaryViewSetV2, basename="attendance-summary-v2")
+router.register(r'attendance-excel', MonthlyAttendanceExcelViewSet, basename="attendance-excel")
+router.register(r'attendance-excel-v2', MonthlyAttendanceExcelViewSetV2, basename="attendance-excel-v2")
 router.register(r"attendance-weekoff", AttendanceWeekOffViewSet, basename="attendance-weekoff")
+router.register(r"attendance-weekoff-v2", AttendanceWeekOffViewSetV2, basename="attendance-weekoff-v2")
 
 urlpatterns = [
     path('performance/', GuardPerformanceView.as_view()),

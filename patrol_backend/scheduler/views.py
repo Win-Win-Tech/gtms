@@ -34,6 +34,101 @@ from patrol_backend.utils.timezone_utils import (
 )
 
 logger = logging.getLogger(__name__)
+from datetime import date
+
+
+def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None):
+    """
+    Optimized helper to fetch monthly assignment summary for a location.
+    Uses .values() to minimize DB load and object instantiation.
+    """
+    year = int(year)
+    month = int(month)
+    num_days = monthrange(year, month)[1]
+    m_start = date(year, month, 1)
+    m_end = date(year, month, num_days)
+    
+    # Generate full month days array (01-01 through 31-01, etc.)
+    days = [f"{day:02d}-{month:02d}" for day in range(1, num_days + 1)]
+
+    # Query using .values() for performance with large datasets
+    aq = Assignment.objects.filter(
+        shift__location_id=location_id,
+        start_date__lte=m_end,
+        end_date__gte=m_start,
+        is_deleted=False
+    )
+    
+    if search and str(search).strip():
+        s = str(search).strip()
+        aq = aq.filter(Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s))
+    if role and str(role).strip().lower() not in ('', 'all'):
+        aq = aq.filter(guard__role__iexact=str(role).strip().lower())
+
+    # Direct values fetch to avoid model instantiation overhead
+    # Using select_related equivalent in values via double underscores
+    assignments_data = aq.values(
+        'guard_id',
+        'guard__name',
+        'guard__employee_code',
+        'guard__role',
+        'shift__name',
+        'shift__location__name',
+        'start_date',
+        'end_date'
+    ).order_by('guard__name')
+
+    # Build summary map
+    summary_map = defaultdict(lambda: {
+        'name': '',
+        'employee_code': '',
+        'designation': '',
+        'location': '',
+        **{day: '-' for day in days}
+    })
+
+    for row in assignments_data:
+        gid = str(row['guard_id'])
+        s_row = summary_map[gid]
+        
+        # Populate basic info once
+        if not s_row['name']:
+            s_row['name'] = row['guard__name']
+            s_row['employee_code'] = row['guard__employee_code'] or ''
+            s_row['designation'] = (row['guard__role'] or '').strip()
+            s_row['location'] = row['shift__location__name']
+
+        # Determine index range for assignment in this month
+        # Convert start/end to month-local day integers
+        overlap_start = max(row['start_date'], m_start)
+        overlap_end = min(row['end_date'], m_end)
+        
+        shift_name = row['shift__name']
+        for day_num in range(overlap_start.day, overlap_end.day + 1):
+            key = f"{day_num:02d}-{month:02d}"
+            s_row[key] = shift_name
+
+    # Final sort by designation and name for consistency across JSON and Excel
+    rows = list(summary_map.values())
+    grouped_rows = defaultdict(list)
+    for row in rows:
+        rank = str(row.get('designation') or '').strip().upper() or "UNASSIGNED"
+        grouped_rows[rank].append(row)
+
+    sorted_rows = []
+    for rank in sorted(grouped_rows.keys()):
+        for row in sorted(grouped_rows[rank], key=lambda x: str(x.get('name') or '').upper()):
+            sorted_rows.append(row)
+
+    return {
+        'headers': ['Name', 'Emp Code', 'Designation', 'Location'] + days,
+        'rows': sorted_rows,
+        'days': days,
+        'year': year,
+        'month': month,
+        'location_name': Location.objects.filter(id=location_id).values_list('name', flat=True).first() or 'N/A'
+    }
+
 
 class LocationViewSet(viewsets.ModelViewSet):
     queryset = Location.objects.all()
@@ -646,11 +741,73 @@ class AssignmentViewSet(viewsets.ModelViewSet):
             filename = f"monthly_summary_{location_id}_{year}_{month}.xlsx"
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
             wb.save(response)
-            return response
-
         except Exception as e:
             logger.error(f"Error generating Excel summary: {e}", exc_info=True)
-            return Response({'error': 'Failed to generate Excel summary.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to generate Excel summary.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path=r'v2/monthly-location-summary/(?P<location_id>[^/.]+)/(?P<year>\d{4})/(?P<month>\d{1,2})')
+    def monthly_location_summary_v2(self, request, location_id=None, year=None, month=None):
+        try:
+            res = _get_monthly_location_summary_data_v2(
+                location_id=location_id, 
+                year=year, 
+                month=month, 
+                search=request.query_params.get("search"), 
+                role=request.query_params.get("role"),
+                request=request
+            )
+            return Response({
+                'headers': res['headers'],
+                'rows': res['rows']
+            })
+        except Exception as e:
+            logger.error(f"Error in monthly_location_summary_v2: {e}", exc_info=True)
+            return Response({'error': str(e)}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path=r'v2/monthly-location-summary-excel/(?P<location_id>[^/.]+)/(?P<year>\d{4})/(?P<month>\d{1,2})')
+    def monthly_location_summary_excel_v2(self, request, location_id=None, year=None, month=None):
+        try:
+            res = _get_monthly_location_summary_data_v2(
+                location_id=location_id, 
+                year=year, 
+                month=month, 
+                search=request.query_params.get("search"), 
+                role=request.query_params.get("role"),
+                request=request
+            )
+            
+            wb = Workbook()
+            ws = wb.active
+            ws.title = f"{int(month):02d}-{year} Summary v2"
+            ws.append(res['headers'])
+
+            # Grouping and sorting for the report
+            grouped_rows = defaultdict(list)
+            for row in res['rows']:
+                rank = str(row.get('designation') or '').strip().upper() or "UNASSIGNED"
+                grouped_rows[rank].append(row)
+
+            for rank in sorted(grouped_rows.keys()):
+                for row in sorted(grouped_rows[rank], key=lambda x: str(x.get('name') or '').upper()):
+                    ws.append([
+                        row['name'],
+                        row['employee_code'],
+                        row['designation'],
+                        row['location'],
+                    ] + [row[day] for day in res['days']])
+
+            for i, column in enumerate(res['headers'], 1):
+                ws.column_dimensions[get_column_letter(i)].width = max(12, len(column) + 2)
+
+            response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            filename = f"monthly_summary_v2_{location_id}_{year}_{month}.xlsx"
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+            wb.save(response)
+            return response
+        except Exception as e:
+            logger.error(f"Error in monthly_location_summary_excel_v2: {e}", exc_info=True)
+            return Response({'error': str(e)}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 
 class CheckpointViewSet(viewsets.ModelViewSet):

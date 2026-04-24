@@ -2950,7 +2950,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     "assignment_id": str(assgn.id),
                     "shift_id": str(assgn.shift_id),
                     "shift_name": assgn.shift.name if assgn.shift else "",
-                    "shift_start": assgn.shift.start_time.strftime("%H:%M:%S") if assgn.shift else None,
                     "shift_end": assgn.shift.end_time.strftime("%H:%M:%S") if assgn.shift else None,
                 })
 
@@ -2972,6 +2971,148 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=False, methods=["get"], url_path="v2/bulk-entry-candidates")
+    def bulk_entry_candidates_v2(self, request):
+        """
+        MODERN V2: List attendance exception candidates for selected date and scoped location.
+        Uses single-query pre-fetching for CheckInLogs to support 10,000+ users.
+        """
+        scoped_location_id, error_response = self._resolve_scope_location_id(request)
+        if error_response:
+            return error_response
+
+        date_str = request.query_params.get("date")
+        if not date_str:
+            return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_date = parse_date(date_str)
+        if not target_date:
+            return Response({"error": "Invalid date format. Use YYYY-MM-DD"}, status=status.HTTP_400_BAD_REQUEST)
+
+        search = (request.query_params.get("search") or "").strip()
+        role_filter = (request.query_params.get("role") or "").strip().lower()
+        user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
+
+        users_qs = User.objects.filter(
+            is_deleted=False,
+            is_active=True,
+            location_id=scoped_location_id,
+        ).exclude(
+            Q(role__iexact="admin") | Q(is_superuser=True)
+        )
+        if role_filter and role_filter not in ("all",):
+            users_qs = users_qs.filter(role__iexact=role_filter)
+        if search:
+            users_qs = users_qs.filter(
+                Q(name__icontains=search) |
+                Q(employee_code__icontains=search) |
+                Q(email__icontains=search)
+            )
+        users = list(users_qs.order_by("name", "employee_code"))
+        user_ids = [u.id for u in users]
+        if not user_ids:
+            return Response({"no_shift": [], "shift_no_checkin": [], "weekoff": [], "summary": {"total_users": 0, "weekoff_count": 0, "no_shift_count": 0, "shift_no_checkin_count": 0}})
+
+        # Pre-fetch assignments
+        assignments_list = list(
+            Assignment.objects.select_related("shift", "location").filter(
+                guard_id__in=user_ids,
+                start_date__lte=target_date,
+                end_date__gte=target_date,
+                is_deleted=False,
+            ).order_by("-modified_on")
+        )
+        assignment_by_guard = {}
+        for assgn in assignments_list:
+            assignment_by_guard.setdefault(str(assgn.guard_id), assgn)
+
+        # Pre-fetch weekoffs
+        weekoff_user_ids = set(
+            str(uid)
+            for uid in AttendanceWeekOff.objects.filter(
+                location_id=scoped_location_id,
+                weekoff_date=target_date,
+                user_id__in=user_ids,
+            ).values_list("user_id", flat=True)
+        )
+
+        # Performance Optimization: Single broad query for CheckInLogs
+        broad_start_utc = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=user_tz).astimezone(pytz.UTC) - timedelta(hours=6)
+        broad_end_utc = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=user_tz).astimezone(pytz.UTC) + timedelta(hours=6)
+        
+        logs_qs = CheckInLog.objects.filter(
+            guard_id__in=user_ids,
+            type="checkin",
+            timestamp__gte=broad_start_utc,
+            timestamp__lt=broad_end_utc
+        ).values("guard_id", "assignment_id", "shift_id", "timestamp")
+        
+        logs_by_guard = defaultdict(list)
+        for l in logs_qs:
+            logs_by_guard[str(l["guard_id"])].append(l)
+
+        no_shift = []
+        shift_no_checkin = []
+        weekoff = []
+
+        for guard in users:
+            uid_str = str(guard.id)
+            base = {
+                "user_id": uid_str,
+                "name": guard.name,
+                "employee_code": guard.employee_code or "",
+                "role": (guard.role or "").strip().upper(),
+                "location_id": str(getattr(guard, "location_id", "") or ""),
+            }
+
+            if uid_str in weekoff_user_ids:
+                weekoff.append(base)
+                continue
+
+            assgn = assignment_by_guard.get(uid_str)
+            if not assgn or not assgn.shift:
+                no_shift.append(base)
+                continue
+
+            search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                target_date,
+                assgn.shift,
+                user_tz,
+                location_id=getattr(assgn.location, "id", None),
+            )
+
+            guard_logs = logs_by_guard.get(uid_str, [])
+            has_checkin = any(
+                search_start_utc <= l["timestamp"] < search_end_utc and str(l["assignment_id"]) == str(assgn.id)
+                for l in guard_logs
+            )
+
+            if not has_checkin:
+                shift_no_checkin.append({
+                    **base,
+                    "assignment_id": str(assgn.id),
+                    "shift_id": str(assgn.shift_id),
+                    "shift_name": assgn.shift.name,
+                    "shift_start": assgn.shift.start_time.strftime("%H:%M:%S") if assgn.shift else None,
+                    "shift_end": assgn.shift.end_time.strftime("%H:%M:%S") if assgn.shift else None,
+                })
+
+        location_obj = Location.objects.filter(id=scoped_location_id, is_deleted=False).first()
+        return Response({
+            "date": str(target_date),
+            "location_id": str(scoped_location_id),
+            "location_name": location_obj.name if location_obj else None,
+            "summary": {
+                "total_users": len(users),
+                "weekoff_count": len(weekoff),
+                "no_shift_count": len(no_shift),
+                "shift_no_checkin_count": len(shift_no_checkin),
+            },
+            "no_shift": no_shift,
+            "shift_no_checkin": shift_no_checkin,
+            "weekoff": weekoff,
+        }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"], url_path="bulk-entry")
     def bulk_entry(self, request):
@@ -6252,6 +6393,206 @@ def generate_monthly_attendance_summary_excel_internal(
     }
 
 
+def _get_monthly_attendance_summary_data_v2(
+    month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, search=None, role=None, request=None,
+):
+    if month:
+        try:
+            year, month_num = map(int, month.split("-"))
+            start_date, end_date = datetime(year, month_num, 1).date(), datetime(year, month_num, monthrange(year, month_num)[1]).date()
+        except: raise ValueError("Invalid month format. Use YYYY-MM.")
+    elif start_date_str and end_date_str:
+        start_date, end_date = parse_date(start_date_str), parse_date(end_date_str)
+        if not start_date or not end_date: raise ValueError("Invalid date format. Use YYYY-MM-DD")
+    else:
+        today = now().date()
+        start_date, end_date = today.replace(day=1), today
+
+    aq = Assignment.objects.filter(start_date__lte=end_date, end_date__gte=start_date, is_deleted=False)
+    if location_id: aq = aq.filter(location_id=location_id)
+    if user_id: aq = aq.filter(guard_id=user_id)
+    elif search and str(search).strip():
+        s = str(search).strip()
+        aq = aq.filter(Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s))
+    if not user_id and role and str(role).strip().lower() not in ("", "all"):
+        aq = aq.filter(guard__role__iexact=str(role).strip().lower())
+
+    assignments = list(aq.select_related("guard", "location", "shift"))
+    if request: tz, today = get_user_timezone_from_request(request, location_id=location_id), get_user_today(get_user_timezone_from_request(request, location_id=location_id))
+    else: tz, today = pytz.timezone('Asia/Kolkata'), get_user_today(pytz.timezone('Asia/Kolkata'))
+    
+    date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+    if not month and end_date > today: date_range = [d for d in date_range if d <= today]; end_date = today
+
+    grouped = defaultdict(lambda: {"guard": None, "location": None, "assignments": []})
+    for a in assignments:
+        key = (a.guard_id, a.location_id if a.location else None)
+        grouped[key]["guard"], grouped[key]["location"] = a.guard, a.location.name if a.location else "N/A"
+        grouped[key]["assignments"].append(a)
+
+    gids, lids = [gid for (gid, _) in grouped.keys()], list({lid for (_, lid) in grouped.keys() if lid})
+    w_lookup = set()
+    if gids:
+        wq = AttendanceWeekOff.objects.filter(user_id__in=gids, weekoff_date__gte=start_date, weekoff_date__lte=end_date)
+        if location_id or lids: wq = wq.filter(location_id__in=([location_id] if location_id else lids))
+        w_lookup = {(str(u), str(l), wd) for u, l, wd in wq.values_list("user_id", "location_id", "weekoff_date")}
+
+    a_lookup = {}
+    if gids:
+        for att in AttendanceCheckin.objects.filter(guard_id__in=gids, shift_date__range=(start_date, end_date)).values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time'):
+            key = (str(att['guard_id']), str(att['org_location_id']) if att['org_location_id'] else None, att['shift_date'])
+            existing = a_lookup.get(key)
+            if existing:
+                new_l, old_l = att['last_checkout_time'] or att['checkout_time'] or att['modified_on'], existing['last_checkout_time'] or existing['checkout_time'] or existing['modified_on']
+                if new_l and (not old_l or new_l > old_l): a_lookup[key] = att
+            else: a_lookup[key] = att
+
+    summary_data = []
+    for (g_pk, l_pk), data in grouped.items():
+        guard, sgid, slid = data["guard"], str(g_pk), str(l_pk) if l_pk else None
+        row = {"user_id": sgid, "location_id": slid, "name": guard.name, "location": data["location"], "employee_code": getattr(guard, "employee_code", None) or "", "designation": (getattr(guard, "role", None) or "").strip()}
+        for date in date_range:
+            k = date.strftime("%d-%b")
+            if date > today: row[k] = ""; continue
+            if (sgid, slid, date) in w_lookup: row[k] = "W"; continue
+            if not any(a.start_date <= date <= a.end_date for a in data["assignments"]): row[k] = ""; continue
+            att = a_lookup.get((sgid, slid, date))
+            if not att: row[k] = ""; continue
+            if att.get('pa_status'): row[k] = _monthly_normalize_status(att['pa_status'])
+            elif att.get('checkout_time') or att.get('last_checkout_time'):
+                 s_obj = next((a.shift for a in data['assignments'] if a.shift_id == att['shift_id']), None)
+                 row[k] = _monthly_normalize_status(_attendance_v3_compute_pa_status_from_duration(att['duration_minutes'], s_obj) or "LD")
+            else: row[k] = "OW" if (att.get('checkin_time') or att.get('last_checkin_time')) else ""
+        _append_monthly_day_totals(row, date_range); summary_data.append(row)
+    return {'summary_data': summary_data, 'date_range': date_range, 'start_date': start_date, 'end_date': end_date}
+
+def generate_monthly_attendance_summary_excel_internal_v2(
+    month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, search=None, role=None, request=None, include_location_column=None,
+):
+    result = _get_monthly_attendance_summary_data_v2(month=month, start_date_str=start_date_str, end_date_str=end_date_str, location_id=location_id, user_id=user_id, search=search, role=role, request=request)
+    summary_data, date_range, start_date, end_date = result['summary_data'], result['date_range'], result['start_date'], result['end_date']
+    if include_location_column is None: include_location_column = bool(request and getattr(request.user, "is_superuser", False))
+    wb = Workbook(); ws = wb.active; ws.title = "Monthly Attendance Summary"
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side; from openpyxl.utils import get_column_letter
+    groups = _monthly_group_rows_for_excel(summary_data, date_range)
+    l_heads = ["SNO", "ID NO", "RANK", "NAME"]; 
+    if include_location_column: l_heads.append("LOCATION")
+    r_heads, d_heads, dy_heads = ["Total Days", "Week off"], [f"{d.day}-{d.strftime('%b-%y')}" for d in date_range], [d.strftime("%a").upper() for d in date_range]
+    total_cols = len(l_heads + d_heads + r_heads); m_lbl, l_lbl = start_date.strftime("%B-%Y").upper(), "ALL LOCATIONS"
+    if location_id:
+        loc = Location.objects.filter(id=location_id, is_deleted=False).values('name').first()
+        if loc: l_lbl = str(loc['name']).strip().upper()
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols); ws.cell(row=1, column=1, value=f"{l_lbl} MONTHLY ATTENDANCE FOR THE MONTH OF {m_lbl}")
+    for c, h in enumerate(l_heads, start=1): ws.cell(row=2, column=c, value=h)
+    for idx, h in enumerate(d_heads, start=len(l_heads) + 1): ws.cell(row=2, column=idx, value=h)
+    ws.cell(row=2, column=total_cols - 1, value=r_heads[0]); ws.cell(row=2, column=total_cols, value=r_heads[1])
+    for idx, h in enumerate(dy_heads, start=len(l_heads) + 1): ws.cell(row=3, column=idx, value=h)
+    for c in range(1, len(l_heads) + 1): ws.merge_cells(start_row=2, start_column=c, end_row=3, end_column=c)
+    ws.merge_cells(start_row=2, start_column=total_cols - 1, end_row=3, end_column=total_cols - 1); ws.merge_cells(start_row=2, start_column=total_cols, end_row=3, end_column=total_cols)
+    thin, med = Side(style="thin", color="8A97A6"), Side(style="medium", color="4F5B66")
+    brd, sbrd = Border(left=thin, right=thin, top=thin, bottom=thin), Border(left=med, right=med, top=med, bottom=med)
+    h_f, s_f, t_f, w_f = [PatternFill(fill_type="solid", start_color=c, end_color=c) for c in ["B7CCE2", "F5E7DB", "B7CCE2", "8CCFF7"]]
+    for r_n in [1, 2, 3]:
+        for c_n in range(1, total_cols + 1):
+            cell = ws.cell(row=r_n, column=c_n); cell.fill, cell.border = (t_f if r_n == 1 else h_f), sbrd if r_n in (1,2,3) else brd
+            cell.font = Font(name="Arial", bold=True, size=11 if r_n == 1 else (9 if r_n == 2 else 8))
+            if r_n == 2 and (len(l_heads) < c_n < total_cols - 1): cell.alignment = Alignment(horizontal="center", vertical="center", text_rotation=90)
+            elif r_n == 3: cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+            else: cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height, ws.row_dimensions[2].height, ws.row_dimensions[3].height = 24, 66, 22
+    cur_r, ser, r_day_t, r_wk_t, r_t_d, r_t_w = 4, 1, defaultdict(lambda: defaultdict(int)), defaultdict(lambda: defaultdict(int)), defaultdict(int), defaultdict(int)
+    for group in groups:
+        rank, members = group["rank"], group["members"]
+        for m in members:
+            stats, u_t_d, u_w_d = [], 0, 0
+            for d in date_range:
+                k = d.strftime("%d-%b"); v = _monthly_normalize_status(m.get(k, ""))
+                stats.append(v)
+                if v == "W": u_w_d += 1
+                elif v: u_t_d += 1
+                r_day_t[rank][k] += 1 if v and v != "W" else 0; r_wk_t[rank][k] += 1 if v == "W" else 0
+            r_t_d[rank], r_t_w[rank] = r_t_d[rank] + u_t_d, r_t_w[rank] + u_w_d
+            row_v = [ser, m.get("employee_code") or "", rank, str(m.get("name") or "").upper()]
+            if include_location_column: row_v.append(m.get("location") or "")
+            row_v.extend(stats); row_v.extend([u_t_d, u_w_d])
+            for c_n, val in enumerate(row_v, start=1):
+                cell = ws.cell(row=cur_r, column=c_n, value=val); cell.border, cell.font = brd, Font(name="Arial", size=10)
+                if c_n in (1, 2, 3): cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif c_n <= len(l_heads): cell.alignment = Alignment(horizontal="left", vertical="center")
+                else: cell.alignment = Alignment(horizontal="center", vertical="center")
+                if len(l_heads) < c_n <= (len(l_heads) + len(date_range)) and str(val).upper() == "W": cell.fill = w_f
+            ws.row_dimensions[cur_r].height, cur_r, ser = 20, cur_r + 1, ser + 1
+        sub_v = ["", "", "TOTAL PRESENT", ""]; 
+        if include_location_column: sub_v.append("")
+        d_ts = [group["date_present_totals"].get(d.strftime("%d-%b"), 0) for d in date_range]
+        sub_v.extend(d_ts); sub_v.extend([sum(d_ts), sum(group["date_weekoff_totals"].values())])
+        for c_n, val in enumerate(sub_v, start=1):
+            cell = ws.cell(row=cur_r, column=c_n, value=val); cell.fill, cell.font, cell.alignment = s_f, Font(name="Arial", bold=True, size=10), Alignment(horizontal="center", vertical="center")
+            cell.border = sbrd if c_n <= len(l_heads) + len(d_heads) else brd
+        ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
+    for r_n in sorted(r_day_t.keys()):
+        f_v = ["", "", r_n, ""]; 
+        if include_location_column: f_v.append("")
+        d_vs = [r_day_t[r_n].get(d.strftime("%d-%b"), 0) for d in date_range]
+        f_v.extend(d_vs); f_v.extend([r_t_d[r_n], r_t_w[r_n]])
+        for c_n, val in enumerate(f_v, start=1):
+            cell = ws.cell(row=cur_r, column=c_n, value=val); cell.font, cell.border, cell.alignment = Font(name="Arial", bold=True, size=10), brd, Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
+    wk_d_vs = [sum(r_wk_t[r].get(d.strftime("%d-%b"), 0) for r in r_wk_t.keys()) for d in date_range]
+    wk_t_v = ["", "", "WEEK OFF", ""]; 
+    if include_location_column: wk_t_v.append("")
+    wk_t_v.extend(wk_d_vs); wk_t_v.extend([sum(wk_d_vs), sum(r_t_w.values())])
+    for c_n, val in enumerate(wk_t_v, start=1):
+        cell = ws.cell(row=cur_r, column=c_n, value=val); cell.font, cell.border, cell.alignment = Font(name="Arial", bold=True, size=10), brd, Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
+    h_c_v = ["", "", "Total Head count", ""]; 
+    if include_location_column: h_c_v.append("")
+    d_hccs = [sum(1 for r in summary_data if _monthly_normalize_status(r.get(d.strftime("%d-%b"), "")) != "") for d in date_range]
+    h_c_v.extend(d_hccs); h_c_v.extend([sum(r_t_d.values()), sum(r_t_w.values())])
+    for c_n, val in enumerate(h_c_v, start=1):
+        cell = ws.cell(row=cur_r, column=c_n, value=val); cell.font, cell.border, cell.alignment = Font(name="Arial", bold=True, size=10), brd, Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[cur_r].height = 20
+    for r in range(4, cur_r + 1):
+        for c in range(1, total_cols + 1):
+            cell = ws.cell(row=r, column=c); 
+            if cell.border != brd: cell.border = brd
+            if not cell.alignment: cell.alignment = Alignment(horizontal="center", vertical="center")
+    w_ids = [6, 11, 20, 26]; 
+    if include_location_column: w_ids.append(20)
+    w_ids.extend([4.2] * len(date_range)); w_ids.extend([8, 8])
+    for idx, w in enumerate(w_ids, start=1): ws.column_dimensions[get_column_letter(idx)].width = w
+    ws.freeze_panes = ws.cell(row=4, column=len(l_heads) + 1)
+    buffer = BytesIO(); wb.save(buffer); buffer.seek(0)
+    filename = f"attendance_summary_v2_{timezone.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+    with open(file_path, 'wb') as f: f.write(buffer.getvalue())
+    return {'file_path': file_path, 'filename': filename, 'start_date': start_date, 'end_date': end_date, 'row_count': len(summary_data)}
+
+class MonthlyAttendanceSummaryViewSetV2(ViewSet):
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        p = request.query_params
+        try:
+            res = _get_monthly_attendance_summary_data_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), location_id=p.get("location_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), request=request)
+            return Response(res['summary_data'])
+        except ValueError as e: return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"[MONTHLY_ATTENDANCE_SUMMARY_V2_API] {str(e)}", exc_info=True)
+            return Response({"error": str(e)}, status=500)
+
+class MonthlyAttendanceExcelViewSetV2(ViewSet):
+    @action(detail=False, methods=["get"])
+    def export_excel(self, request):
+        p = request.query_params
+        try:
+            res = generate_monthly_attendance_summary_excel_internal_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), request=request, location_id=p.get("location_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), include_location_column=request.user.is_superuser)
+            with open(res['file_path'], 'rb') as f: content = f.read()
+            response = HttpResponse(content, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            response["Content-Disposition"] = f'attachment; filename="attendance_summary_v2_{res["start_date"].strftime("%Y%m%d")}.xlsx"'
+            return response
+        except ValueError as e: return Response({"error": str(e)}, status=400)
+        except Exception as e: return Response({"error": str(e)}, status=500)
+
 class MonthlyAttendanceSummaryViewSet(ViewSet):
 
     @action(detail=False, methods=["get"])
@@ -6710,6 +7051,132 @@ def _weekoff_parse_upload_workbook(wb, _location_id, start_date, end_date, year,
             ops_map[(uid_str, d.isoformat())] = bool(mark == "W")
 
     return errors, list(ops_map.items())
+
+
+class AttendanceWeekOffViewSetV2(ViewSet):
+    """MODERN V2: Enhanced performance for Weekoff Grid and Excel Template."""
+    permission_classes = [IsAuthenticated]
+    queryset = AttendanceWeekOff.objects.none()
+
+    @action(detail=False, methods=["get"], url_path="grid")
+    def grid(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        month = request.query_params.get("month")
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
+        try:
+            start_date, end_date, _year = _weekoff_parse_month(month)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role)
+        users = list(users_qs.only("id", "name", "employee_code", "role"))
+        user_ids = [u.id for u in users]
+
+        wo_qs = AttendanceWeekOff.objects.filter(
+            location_id=scoped_location_id,
+            weekoff_date__gte=start_date,
+            weekoff_date__lte=end_date,
+            user_id__in=user_ids,
+        ).values_list("user_id", "weekoff_date")
+        
+        wo_by_user = defaultdict(set)
+        for uid, wd in wo_qs:
+            wo_by_user[str(uid)].add(wd)
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        loc = Location.objects.filter(id=scoped_location_id, is_deleted=False).only("name").first()
+        loc_name = loc.name if loc else ""
+
+        rows = []
+        for u in users:
+            uid = str(u.id)
+            row = {
+                "user_id": uid,
+                "name": getattr(u, "name", None) or "",
+                "employee_code": getattr(u, "employee_code", None) or "",
+                "designation": (getattr(u, "role", None) or "").strip().upper(),
+                "location": loc_name,
+            }
+            dates_set = wo_by_user.get(uid, set())
+            for d in date_range:
+                key = d.strftime("%d-%b")
+                row[key] = "W" if d in dates_set else "-"
+            rows.append(row)
+
+        return Response(rows, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["get"], url_path="template")
+    def template_excel(self, request):
+        scoped_location_id, error_response = _weekoff_resolve_location_id(request)
+        if error_response:
+            return error_response
+
+        month = request.query_params.get("month")
+        search = request.query_params.get("search")
+        role = request.query_params.get("role")
+        try:
+            start_date, end_date, _year = _weekoff_parse_month(month)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        loc = Location.objects.filter(id=scoped_location_id, is_deleted=False).only("name").first()
+        if not loc:
+            return Response({"error": "Location not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role)
+        users = list(users_qs.only("id", "name", "employee_code", "role"))
+        user_ids = [u.id for u in users]
+
+        existing = AttendanceWeekOff.objects.filter(
+            location_id=scoped_location_id,
+            weekoff_date__gte=start_date,
+            weekoff_date__lte=end_date,
+            user_id__in=user_ids,
+        ).values_list("user_id", "weekoff_date")
+        wo_set = {(str(uid), d) for uid, d in existing}
+
+        date_range = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        headers = ["user_id", "employee_code", "name", "designation"] + [
+            d.strftime("%d-%b") for d in date_range
+        ]
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Weekoffs"
+        ws.append(headers)
+        
+        grouped_users = defaultdict(list)
+        for u in users:
+            rank = (getattr(u, "role", None) or "").strip().upper() or "UNASSIGNED"
+            grouped_users[rank].append(u)
+
+        for rank in sorted(grouped_users.keys()):
+            rank_users = sorted(grouped_users[rank], key=lambda x: (getattr(x, "name", None) or "").upper())
+            for u in rank_users:
+                row = [
+                    str(u.id),
+                    getattr(u, "employee_code", None) or "",
+                    getattr(u, "name", None) or "",
+                    (getattr(u, "role", None) or "").strip().upper(),
+                ]
+                for d in date_range:
+                    row.append("W" if (str(u.id), d) in wo_set else "")
+                ws.append(row)
+
+        buffer = BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        filename = f"weekoffs_template_{start_date.strftime('%Y%m')}_{scoped_location_id}.xlsx"
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 
 
 class AttendanceWeekOffViewSet(ViewSet):
