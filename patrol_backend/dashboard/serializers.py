@@ -143,6 +143,7 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
     user_role = serializers.CharField(source="guard.role", read_only=True)
     shift_name = serializers.CharField(source="shift.name", read_only=True)
     location_name = serializers.CharField(source="org_location.name", read_only=True)
+    site_name = serializers.CharField(source="site.name", read_only=True)
     shift_time = serializers.SerializerMethodField()
     live_state = serializers.SerializerMethodField()
     log_pairs = serializers.SerializerMethodField()
@@ -172,6 +173,8 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             "remarks",
             "od_remarks",
             "location_name",
+            "site",
+            "site_name",
             "shift_name",
             "assignment",
             "shift_time",
@@ -321,6 +324,7 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
     user_role = serializers.CharField(source="guard.role", read_only=True)
     shift_name = serializers.CharField(source="shift.name", read_only=True)
     location_name = serializers.CharField(source="org_location.name", read_only=True)
+    site_name = serializers.CharField(source="site.name", read_only=True)
     shift_time = serializers.SerializerMethodField()
     live_state = serializers.SerializerMethodField()
     log_pairs = serializers.SerializerMethodField()
@@ -350,6 +354,8 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
             "remarks",
             "od_remarks",
             "location_name",
+            "site",
+            "site_name",
             "shift_name",
             "assignment",
             "shift_time",

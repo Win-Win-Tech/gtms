@@ -9,7 +9,8 @@ from .serializers import (
     ShiftSerializer,
     AssignmentSerializer,
     CheckpointSerializer,
-    SiteSettingSerializer
+    SiteSettingSerializer,
+    LocationSiteSerializer
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -58,6 +59,8 @@ def _get_monthly_location_summary_data_v2(location_id, year, month, search=None,
         end_date__gte=m_start,
         is_deleted=False
     )
+    
+
     
     if search and str(search).strip():
         s = str(search).strip()
@@ -172,6 +175,13 @@ class LocationViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Error filtering locations: {e}", exc_info=True)
             return Location.objects.none()
+            
+    @action(detail=True, methods=['get'])
+    def sites(self, request, pk=None):
+        location = self.get_object()
+        sites = location.sites.filter(is_active=True)
+        serializer = LocationSiteSerializer(sites, many=True)
+        return Response(serializer.data)
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
@@ -754,7 +764,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 month=month, 
                 search=request.query_params.get("search"), 
                 role=request.query_params.get("role"),
-                request=request
+                request=request,
             )
             return Response({
                 'headers': res['headers'],
@@ -773,7 +783,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 month=month, 
                 search=request.query_params.get("search"), 
                 role=request.query_params.get("role"),
-                request=request
+                request=request,
             )
             
             wb = Workbook()

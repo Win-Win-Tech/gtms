@@ -47,7 +47,7 @@ from rest_framework.viewsets import ViewSet
 from authapp.models import User
 from checkin.models import CheckIn, CheckInChecklistAnswer
 from scheduler.models import ChecklistTemplate
-from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate, SiteSetting
+from scheduler.models import Assignment, Checkpoint, Location, Shift, CheckpointTemplate, SiteSetting, LocationSite
 from tourlog.models import TourLog
 from patrol_backend.utils.proximity_utils import get_site_within_proximity
 from patrol_backend.utils.timezone_utils import (
@@ -212,6 +212,12 @@ def _attendance_v3_compute_from_logs(user, assignment, shift, org_location, sear
     if last_checkin_time is None:
         duration_minutes = None
 
+    last_site = None
+    for log in reversed(logs):
+        if log.site_id:
+            last_site = log.site
+            break
+
     return {
         "last_checkin_time": last_checkin_time,
         "last_checkout_time": last_checkout_time,
@@ -221,6 +227,7 @@ def _attendance_v3_compute_from_logs(user, assignment, shift, org_location, sear
         "live_state": "checked_in" if (
             last_checkin_time and (not last_checkout_time or last_checkin_time > last_checkout_time)
         ) else "checked_out",
+        "site": last_site,
     }
 
 
@@ -304,6 +311,8 @@ def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org
     attendance.duration_minutes = summary["duration_minutes"]
     attendance.checkin_count = summary.get("checkin_count") or 0
     attendance.checkout_count = summary.get("checkout_count") or 0
+    if summary.get("site"):
+        attendance.site = summary["site"]
     attendance.pa_status = _attendance_v3_compute_pa_status_from_summary(
         summary,
         shift,
@@ -1405,6 +1414,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
         
+        # Multi-site proximity validation (optional for v2)
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+
         # Validate location if location has coordinates
         if org_location.latitude and org_location.longitude:
             distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
@@ -1431,7 +1443,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             org_location=org_location,
             type="checkin",
             latitude=lat,
-            longitude=lon
+            longitude=lon,
+            site=matched_site,
         )
 
         attendance, _ = AttendanceCheckin.objects.get_or_create(
@@ -1439,9 +1452,19 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            defaults={'created_on': timezone.now()}
+            shift_date=shift_start_date,
+            defaults={"created_on": timezone.now()},
         )
         
+        # Update AttendanceCheckin.site if it matched a site
+        if matched_site:
+            attendance.site = matched_site
+            attendance.save()
+
+        _attendance_v3_refresh_saved_fields(
+            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+
         attendance_list = AttendanceCheckin.objects.filter(
             guard=user,
             assignment=assignment,
@@ -1486,6 +1509,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+
         # Strict shift-instance search window (supports consecutive overnight correctly).
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
@@ -1496,8 +1522,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            created_on__gte=search_start_utc,
-            created_on__lt=search_end_utc
+            shift_date=shift_start_date,
         ).first()
 
         if not attendance or not attendance.checkin_time:
@@ -1510,7 +1535,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             org_location=org_location,
             type="checkout",
             latitude=lat,
-            longitude=lon
+            longitude=lon,
+            site=matched_site,
         )
 
         latest_checkout = CheckInLog.objects.filter(
@@ -1551,6 +1577,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+
         if org_location.latitude and org_location.longitude:
             distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
             allowed_distance = _get_site_setting_int(
@@ -1580,6 +1609,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             type="checkin",
             latitude=lat,
             longitude=lon,
+            site=matched_site,
         )
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
@@ -1651,6 +1681,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        # Multi-site proximity validation
+        matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+
         # Enforce same 100m distance rule as checkin_v3.
         if org_location.latitude and org_location.longitude:
             distance = geodesic((lat, lon), (org_location.latitude, org_location.longitude)).meters
@@ -1695,6 +1728,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             type="checkout",
             latitude=lat,
             longitude=lon,
+            site=matched_site,
         )
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
@@ -1715,6 +1749,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if latest_checkout:
             attendance.checkout_time = latest_checkout.timestamp
         attendance.shift_date = shift_start_date
+        attendance.site = matched_site
         attendance.save()
 
         _attendance_v3_refresh_saved_fields(
@@ -1835,6 +1870,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             attendance.longitude = earliest_checkin.longitude
 
         attendance.shift_date = shift_start_date
+        attendance.site = matched_site
 
         if raw_bytes is not None:
             attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
@@ -1947,6 +1983,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if latest_checkout:
             attendance.checkout_time = latest_checkout.timestamp
         attendance.shift_date = shift_start_date
+        attendance.site = matched_site
         attendance.save()
 
         _attendance_v3_refresh_saved_fields(
@@ -2173,6 +2210,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             type=action_mode,
             latitude=lat,
             longitude=lon,
+            site=matched_site,
         )
         log.image.save(img_name, ContentFile(raw_bytes), save=True)
 
@@ -2191,6 +2229,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 attendance.latitude = earliest_checkin.latitude
                 attendance.longitude = earliest_checkin.longitude
             attendance.shift_date = shift_start_date
+            attendance.site = matched_site
             attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
             attendance.save()
             status_code = status.HTTP_201_CREATED
@@ -2207,6 +2246,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             if latest_checkout:
                 attendance.checkout_time = latest_checkout.timestamp
             attendance.shift_date = shift_start_date
+            attendance.site = matched_site
             attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
             attendance.save()
             status_code = status.HTTP_200_OK
@@ -4740,6 +4780,10 @@ class AttendanceCheckinV4ListView(generics.ListAPIView):
         if shift_id:
             queryset = queryset.filter(shift_id=shift_id)
 
+        site_id = self.request.query_params.get("site_id")
+        if site_id:
+            queryset = queryset.filter(site_id=site_id)
+
         status = self.request.query_params.get("status")
         if status:
             queryset = _apply_attendance_v3_status_filter(queryset, status)
@@ -5346,6 +5390,7 @@ def generate_attendance_v3_excel_report_internal(
     request=None,
     search=None,
     role=None,
+    site_id=None,
 ):
     """
     V3 attendance export helper based on AttendanceCheckin master summary fields.
@@ -5395,6 +5440,8 @@ def generate_attendance_v3_excel_report_internal(
         queryset = queryset.filter(org_location_id=location_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
+    if site_id:
+        queryset = queryset.filter(site_id=site_id)
     if status_filter:
         queryset = _apply_attendance_v3_status_filter(queryset, status_filter)
     if defaulters:
@@ -5419,6 +5466,7 @@ def generate_attendance_v3_excel_report_internal(
         "Designation",
         "Shift",
         "Location",
+        "Site",
         "First Checkin",
         "Last Checkout",
         "Checkin Count",
@@ -5476,6 +5524,7 @@ def generate_attendance_v3_excel_report_internal(
                 (getattr(obj.guard, "role", None) or "").strip(),
                 obj.shift.name if obj.shift else "",
                 obj.org_location.name if obj.org_location else "",
+                obj.site.name if obj.site else "",
                 first_checkin.strftime('%Y-%m-%d %H:%M:%S') if first_checkin else "",
                 last_checkout.strftime('%Y-%m-%d %H:%M:%S') if last_checkout else "",
                 int(obj.checkin_count or 0),
@@ -5529,6 +5578,7 @@ class AttendanceCheckinV3ExportView(APIView):
         defaulters = request.query_params.get("defaulters") == "true"
         search = request.query_params.get("search")
         role = request.query_params.get("role")
+        site_id = request.query_params.get("site_id")
 
         try:
             result = generate_attendance_v3_excel_report_internal(
@@ -5543,6 +5593,7 @@ class AttendanceCheckinV3ExportView(APIView):
                 request=request,
                 search=search,
                 role=role,
+                site_id=site_id,
             )
             with open(result['file_path'], 'rb') as f:
                 excel_content = f.read()
@@ -5577,6 +5628,7 @@ def generate_attendance_v4_excel_report_internal(
     request=None,
     search=None,
     role=None,
+    site_id=None,
 ):
     """
     V4 attendance export helper: Optimized by bulk-fetching CheckInLogs.
@@ -5624,6 +5676,8 @@ def generate_attendance_v4_excel_report_internal(
         queryset = queryset.filter(guard__role__iexact=str(role).strip().lower())
     if location_id:
         queryset = queryset.filter(org_location_id=location_id)
+    if site_id:
+        queryset = queryset.filter(site_id=site_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
     if status_filter:
@@ -5801,6 +5855,7 @@ class AttendanceCheckinV4ExportView(APIView):
                 request=request,
                 search=params.get("search"),
                 role=params.get("role"),
+                site_id=params.get("site_id"),
             )
             with open(result['file_path'], 'rb') as f:
                 content = f.read()
@@ -6092,6 +6147,8 @@ def _get_monthly_attendance_summary_data(
         _append_monthly_day_totals(row, date_range)
 
         summary_data.append(row)
+
+    summary_data.sort(key=lambda x: (x.get('designation', '') or '').strip().upper() or 'UNASSIGNED')
 
     return {
         'summary_data': summary_data,
@@ -6394,7 +6451,7 @@ def generate_monthly_attendance_summary_excel_internal(
 
 
 def _get_monthly_attendance_summary_data_v2(
-    month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, search=None, role=None, request=None,
+    month=None, start_date_str=None, end_date_str=None, location_id=None, site_id=None, user_id=None, search=None, role=None, request=None,
 ):
     if month:
         try:
@@ -6436,10 +6493,20 @@ def _get_monthly_attendance_summary_data_v2(
         wq = AttendanceWeekOff.objects.filter(user_id__in=gids, weekoff_date__gte=start_date, weekoff_date__lte=end_date)
         if location_id or lids: wq = wq.filter(location_id__in=([location_id] if location_id else lids))
         w_lookup = {(str(u), str(l), wd) for u, l, wd in wq.values_list("user_id", "location_id", "weekoff_date")}
+    
+    # Pre-fetch site names if site_id is provided or if we want to show it
+    site_names = {}
+    if site_id:
+        site_obj = LocationSite.objects.filter(id=site_id).only('name').first()
+        if site_obj:
+            site_names[str(site_id)] = site_obj.name
 
     a_lookup = {}
     if gids:
-        for att in AttendanceCheckin.objects.filter(guard_id__in=gids, shift_date__range=(start_date, end_date)).values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time'):
+        att_qs = AttendanceCheckin.objects.filter(guard_id__in=gids, shift_date__range=(start_date, end_date))
+        if site_id:
+            att_qs = att_qs.filter(site_id=site_id)
+        for att in att_qs.values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time'):
             key = (str(att['guard_id']), str(att['org_location_id']) if att['org_location_id'] else None, att['shift_date'])
             existing = a_lookup.get(key)
             if existing:
@@ -6450,7 +6517,15 @@ def _get_monthly_attendance_summary_data_v2(
     summary_data = []
     for (g_pk, l_pk), data in grouped.items():
         guard, sgid, slid = data["guard"], str(g_pk), str(l_pk) if l_pk else None
-        row = {"user_id": sgid, "location_id": slid, "name": guard.name, "location": data["location"], "employee_code": getattr(guard, "employee_code", None) or "", "designation": (getattr(guard, "role", None) or "").strip()}
+        row = {
+            "user_id": sgid, 
+            "location_id": slid, 
+            "name": guard.name, 
+            "location": data["location"], 
+            "employee_code": getattr(guard, "employee_code", None) or "", 
+            "designation": (getattr(guard, "role", None) or "").strip(),
+            "site_name": site_names.get(str(site_id)) if site_id else ""
+        }
         for date in date_range:
             k = date.strftime("%d-%b")
             if date > today: row[k] = ""; continue
@@ -6464,12 +6539,15 @@ def _get_monthly_attendance_summary_data_v2(
                  row[k] = _monthly_normalize_status(_attendance_v3_compute_pa_status_from_duration(att['duration_minutes'], s_obj) or "LD")
             else: row[k] = "OW" if (att.get('checkin_time') or att.get('last_checkin_time')) else ""
         _append_monthly_day_totals(row, date_range); summary_data.append(row)
+    
+    summary_data.sort(key=lambda x: (x.get('designation', '') or '').strip().upper() or 'UNASSIGNED')
+    
     return {'summary_data': summary_data, 'date_range': date_range, 'start_date': start_date, 'end_date': end_date}
 
 def generate_monthly_attendance_summary_excel_internal_v2(
-    month=None, start_date_str=None, end_date_str=None, location_id=None, user_id=None, search=None, role=None, request=None, include_location_column=None,
+    month=None, start_date_str=None, end_date_str=None, location_id=None, site_id=None, user_id=None, search=None, role=None, request=None, include_location_column=None,
 ):
-    result = _get_monthly_attendance_summary_data_v2(month=month, start_date_str=start_date_str, end_date_str=end_date_str, location_id=location_id, user_id=user_id, search=search, role=role, request=request)
+    result = _get_monthly_attendance_summary_data_v2(month=month, start_date_str=start_date_str, end_date_str=end_date_str, location_id=location_id, site_id=site_id, user_id=user_id, search=search, role=role, request=request)
     summary_data, date_range, start_date, end_date = result['summary_data'], result['date_range'], result['start_date'], result['end_date']
     if include_location_column is None: include_location_column = bool(request and getattr(request.user, "is_superuser", False))
     wb = Workbook(); ws = wb.active; ws.title = "Monthly Attendance Summary"
@@ -6481,7 +6559,12 @@ def generate_monthly_attendance_summary_excel_internal_v2(
     total_cols = len(l_heads + d_heads + r_heads); m_lbl, l_lbl = start_date.strftime("%B-%Y").upper(), "ALL LOCATIONS"
     if location_id:
         loc = Location.objects.filter(id=location_id, is_deleted=False).values('name').first()
-        if loc: l_lbl = str(loc['name']).strip().upper()
+        if loc:
+            l_lbl = str(loc['name']).strip().upper()
+            if site_id:
+                site = LocationSite.objects.filter(id=site_id, is_active=True).values('name').first()
+                if site:
+                    l_lbl = f"{l_lbl} - {str(site['name']).strip().upper()}"
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols); ws.cell(row=1, column=1, value=f"{l_lbl} MONTHLY ATTENDANCE FOR THE MONTH OF {m_lbl}")
     for c, h in enumerate(l_heads, start=1): ws.cell(row=2, column=c, value=h)
     for idx, h in enumerate(d_heads, start=len(l_heads) + 1): ws.cell(row=2, column=idx, value=h)
@@ -6557,7 +6640,7 @@ def generate_monthly_attendance_summary_excel_internal_v2(
             cell = ws.cell(row=r, column=c); 
             if cell.border != brd: cell.border = brd
             if not cell.alignment: cell.alignment = Alignment(horizontal="center", vertical="center")
-    w_ids = [6, 11, 20, 26]; 
+    w_ids = [6, 11, 20, 26]
     if include_location_column: w_ids.append(20)
     w_ids.extend([4.2] * len(date_range)); w_ids.extend([8, 8])
     for idx, w in enumerate(w_ids, start=1): ws.column_dimensions[get_column_letter(idx)].width = w
@@ -6573,7 +6656,7 @@ class MonthlyAttendanceSummaryViewSetV2(ViewSet):
     def summary(self, request):
         p = request.query_params
         try:
-            res = _get_monthly_attendance_summary_data_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), location_id=p.get("location_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), request=request)
+            res = _get_monthly_attendance_summary_data_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), location_id=p.get("location_id"), site_id=p.get("site_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), request=request)
             return Response(res['summary_data'])
         except ValueError as e: return Response({"error": str(e)}, status=400)
         except Exception as e:
@@ -6585,7 +6668,7 @@ class MonthlyAttendanceExcelViewSetV2(ViewSet):
     def export_excel(self, request):
         p = request.query_params
         try:
-            res = generate_monthly_attendance_summary_excel_internal_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), request=request, location_id=p.get("location_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), include_location_column=request.user.is_superuser)
+            res = generate_monthly_attendance_summary_excel_internal_v2(month=p.get("month"), start_date_str=p.get("start_date"), end_date_str=p.get("end_date"), request=request, location_id=p.get("location_id"), site_id=p.get("site_id"), user_id=p.get("user_id"), search=p.get("search"), role=p.get("role"), include_location_column=request.user.is_superuser)
             with open(res['file_path'], 'rb') as f: content = f.read()
             response = HttpResponse(content, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             response["Content-Disposition"] = f'attachment; filename="attendance_summary_v2_{res["start_date"].strftime("%Y%m%d")}.xlsx"'
@@ -7470,6 +7553,7 @@ def _get_checkin_report_data_v2(
     request=None,
     search=None,
     role=None,
+    site_id=None,
 ):
     from django.utils.timezone import now as django_now
     
@@ -7524,6 +7608,11 @@ def _get_checkin_report_data_v2(
     if not user_id and role and str(role).strip().lower() not in ('', 'all'):
         assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
     
+    if site_id:
+        # Assignments don't have direct 'site' field.
+        # Filter assignments that have at least one attendance record associated with this site.
+        assignments = assignments.filter(attendance_records__site_id=site_id).distinct()
+    
     report = []
     
     date_range = []
@@ -7573,6 +7662,20 @@ def _get_checkin_report_data_v2(
         for ans in all_answers:
             if str(ans.checkin_id) not in answer_map:
                 answer_map[str(ans.checkin_id)] = ans
+                
+    # 3.5. Map AttendanceCheckin to Site Name (for the report rows)
+    attendance_site_map = {}
+    if site_id or True: # Always collect if we want to show it?
+        # Only for the guards and dates we care about
+        from .models import AttendanceCheckin
+        acs = AttendanceCheckin.objects.filter(
+            guard_id__in=guard_ids,
+            shift_date__gte=start_dt_user.date(),
+            shift_date__lte=end_date
+        ).select_related('site')
+        for ac in acs:
+            if ac.site:
+                attendance_site_map[(str(ac.guard_id), str(ac.shift_date), str(ac.shift_id))] = ac.site.name
                 
     # 4. Fetch all checkpoints in a single query to prevent N+1 lookups
     all_checkpoint_ids = set()
@@ -7847,7 +7950,7 @@ class DashboardCheckInReportExcelViewV2(APIView):
 
             # Header row
             headers = [
-                'Date', 'Name', 'Emp Code', 'Designation', 'Shift Name', 'Checkpoint Name',
+                'Date', 'Name', 'Emp Code', 'Designation', 'Shift Name', 'Checkpoint Name', 'Site',
                 'Expected Time', 'Actual Check-In Time', 'Status', 'Delay (minutes)',
                 'Has Checklist', 'Checklist', 'Checklist Remarks'
             ]
@@ -7862,6 +7965,7 @@ class DashboardCheckInReportExcelViewV2(APIView):
                     item.get('designation') or '',
                     item['shift_name'],
                     item['checkpoint_name'],
+                    item.get('site_name') or '',
                     item['expected_time'].strftime("%Y-%m-%d %H:%M") if item['expected_time'] else "",
                     item['actual_checkin_time'].strftime("%Y-%m-%d %H:%M") if item['actual_checkin_time'] else "",
                     item['status'],
