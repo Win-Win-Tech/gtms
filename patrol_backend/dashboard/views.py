@@ -3175,6 +3175,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         reason = (request.data.get("reason") or "").strip()
         latitude = request.data.get("latitude")
         longitude = request.data.get("longitude")
+        site_id = request.data.get("site_id")
 
         if not date_str:
             return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
@@ -3332,6 +3333,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         type="checkin",
                         latitude=latitude,
                         longitude=longitude,
+                        site_id=site_id,
                     )
                     CheckInLog.objects.filter(id=checkin_log.id).update(timestamp=checkin_utc)
 
@@ -3343,6 +3345,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         type="checkout",
                         latitude=latitude,
                         longitude=longitude,
+                        site_id=site_id,
                     )
                     CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
 
@@ -3357,6 +3360,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     attendance.checkin_time = checkin_utc
                     attendance.checkout_time = checkout_utc
                     attendance.shift_date = target_date
+                    if not attendance.site:
+                        attendance.site_id = site_id
                     attendance.edited_by = actor
                     attendance.edited_on = timezone.now()
                     attendance.edit_reason = reason
@@ -3415,6 +3420,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         date_str = request.data.get("date")
         user_ids = request.data.get("user_ids")
         reason = (request.data.get("reason") or "").strip()
+        site_id = request.data.get("site_id")
 
         if not date_str:
             return Response({"error": "date is required (YYYY-MM-DD)"}, status=status.HTTP_400_BAD_REQUEST)
@@ -3550,6 +3556,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         reason,
         shift_id=None,
         from_status="",
+        site_id=None,
     ):
         user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
         user_today = get_user_today(user_tz)
@@ -3608,6 +3615,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 timestamp__lt=search_end_utc,
             ).delete()
 
+            existing_site_id = AttendanceCheckin.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                shift_date=target_date,
+            ).values_list("site_id", flat=True).first()
+
             AttendanceCheckin.objects.filter(
                 guard=guard,
                 assignment=assignment,
@@ -3615,6 +3630,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 org_location=org_location,
                 shift_date=target_date,
             ).delete()
+
+            final_site_id = existing_site_id if existing_site_id else site_id
 
             checkin_log = CheckInLog.objects.create(
                 guard=guard,
@@ -3624,6 +3641,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 type="checkin",
                 latitude=latitude,
                 longitude=longitude,
+                site_id=final_site_id,
             )
             CheckInLog.objects.filter(id=checkin_log.id).update(timestamp=checkin_utc)
 
@@ -3635,6 +3653,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 type="checkout",
                 latitude=latitude,
                 longitude=longitude,
+                site_id=final_site_id,
             )
             CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
 
@@ -3644,8 +3663,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 shift=shift,
                 org_location=org_location,
                 shift_date=target_date,
-                defaults={"created_on": timezone.now()},
+                defaults={"created_on": timezone.now(), "site_id": final_site_id},
             )
+            if not attendance.site:
+                attendance.site_id = final_site_id
             attendance.checkin_time = checkin_utc
             attendance.checkout_time = checkout_utc
             attendance.shift_date = target_date
@@ -3672,7 +3693,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             "attendance_id": str(attendance.id),
         }
 
-    def _monthly_cell_mark_weekoff(self, request, guard, scoped_location_id, target_date, reason):
+    def _monthly_cell_mark_weekoff(self, request, guard, scoped_location_id, target_date, reason, site_id=None):
         user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
         user_today = get_user_today(user_tz)
         if target_date > user_today:
@@ -3804,6 +3825,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         reason = (request.data.get("reason") or "").strip()
         shift_id = request.data.get("shift_id")
         cells = request.data.get("cells")
+        site_id = request.data.get("site_id")
 
         if action_type not in ("mark_present", "mark_weekoff", "mark_empty"):
             return Response(
@@ -3853,10 +3875,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         reason,
                         shift_id=shift_id,
                         from_status=from_status,
+                        site_id=site_id,
                     )
                 elif action_type == "mark_weekoff":
                     data = self._monthly_cell_mark_weekoff(
-                        request, guard, scoped_location_id, target_date, reason
+                        request, guard, scoped_location_id, target_date, reason, site_id=site_id
                     )
                 else:
                     data = self._monthly_cell_mark_empty(
@@ -6506,7 +6529,7 @@ def _get_monthly_attendance_summary_data_v2(
         att_qs = AttendanceCheckin.objects.filter(guard_id__in=gids, shift_date__range=(start_date, end_date))
         if site_id:
             att_qs = att_qs.filter(site_id=site_id)
-        for att in att_qs.values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time'):
+        for att in att_qs.values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time', 'site_id'):
             key = (str(att['guard_id']), str(att['org_location_id']) if att['org_location_id'] else None, att['shift_date'])
             existing = a_lookup.get(key)
             if existing:
@@ -6524,7 +6547,8 @@ def _get_monthly_attendance_summary_data_v2(
             "location": data["location"], 
             "employee_code": getattr(guard, "employee_code", None) or "", 
             "designation": (getattr(guard, "role", None) or "").strip(),
-            "site_name": site_names.get(str(site_id)) if site_id else ""
+            "site_name": site_names.get(str(site_id)) if site_id else "",
+            "site_map": {}
         }
         for date in date_range:
             k = date.strftime("%d-%b")
@@ -6533,6 +6557,7 @@ def _get_monthly_attendance_summary_data_v2(
             if not any(a.start_date <= date <= a.end_date for a in data["assignments"]): row[k] = ""; continue
             att = a_lookup.get((sgid, slid, date))
             if not att: row[k] = ""; continue
+            row["site_map"][k] = str(att['site_id']) if att.get('site_id') else None
             if att.get('pa_status'): row[k] = _monthly_normalize_status(att['pa_status'])
             elif att.get('checkout_time') or att.get('last_checkout_time'):
                  s_obj = next((a.shift for a in data['assignments'] if a.shift_id == att['shift_id']), None)
