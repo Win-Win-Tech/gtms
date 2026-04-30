@@ -7581,6 +7581,8 @@ def _get_checkin_report_data_v2(
     site_id=None,
 ):
     from django.utils.timezone import now as django_now
+    allowed_delay = _get_site_setting_int('time', location_id=location_id, default_value=15)
+
     
     if request:
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
@@ -7767,8 +7769,8 @@ def _get_checkin_report_data_v2(
                 
                 expected_datetime_user = combine_date_time_in_user_tz(checkpoint_date, expected_time_obj, user_tz)
                 
-                search_start_utc = (expected_datetime_user - timedelta(minutes=30)).astimezone(pytz.UTC)
-                search_end_utc = (expected_datetime_user + timedelta(minutes=30)).astimezone(pytz.UTC)
+                search_start_utc = (expected_datetime_user - timedelta(minutes=allowed_delay)).astimezone(pytz.UTC)
+                search_end_utc = (expected_datetime_user + timedelta(minutes=allowed_delay)).astimezone(pytz.UTC)
 
                 # Match in O(1) from the memory map instead of DB
                 checkin = None
@@ -7784,7 +7786,7 @@ def _get_checkin_report_data_v2(
                 if expected_datetime_user:
                     expected_time_user = expected_datetime_user.astimezone(user_tz)
                     user_now = get_user_now(user_tz)
-                    if user_now > expected_time_user + timedelta(minutes=15):
+                    if user_now > expected_time_user + timedelta(minutes=allowed_delay):
                         status = "Missed"
                     else:
                         status = "Pending"
@@ -7802,10 +7804,15 @@ def _get_checkin_report_data_v2(
                         expected_time_user = expected_datetime_user.astimezone(user_tz)
                         delay = int((actual_time_user - expected_time_user).total_seconds() / 60)
                         
-                        if delay <= 15:
+                        # if delay <= 15:
+                        #     status = "On Time"
+                        # elif 15 < delay <= 30:
+                        #     status = "Delayed"
+                        # else:
+                        #     status = "Missed"
+                        
+                        if delay <= allowed_delay:
                             status = "On Time"
-                        elif 15 < delay <= 30:
-                            status = "Delayed"
                         else:
                             status = "Missed"
                 
@@ -7863,13 +7870,13 @@ def _get_checkin_report_data_v2(
                     'checklist_answers': checklist_answers,
                 })
                 
-    # Sort identical to v1: (date, expected_time, guard_name, checkpoint_name)
     report.sort(key=lambda r: (
         r['date'],
         str(r['expected_time']) if r['expected_time'] else '',
         r['guard_name'],
         r['checkpoint_name'],
     ))
+
     return report
 
 
@@ -7891,6 +7898,7 @@ class DashboardCheckInReportViewV2(APIView):
         role = (request.query_params.get('role') or '').strip()
         
         try:
+            status_filter = (request.query_params.get('status') or 'all').strip()
             report_data = _get_checkin_report_data_v2(
                 filter_type=filter_type,
                 start_date_str=start_date,
@@ -7902,6 +7910,10 @@ class DashboardCheckInReportViewV2(APIView):
                 search=search or None,
                 role=role or None,
             )
+
+            # Filter by status if provided
+            if status_filter and status_filter != 'all':
+                report_data = [r for r in report_data if r.get('status') == status_filter]
             
             for idx, item in enumerate(report_data):
                 if item['expected_time']:
@@ -7943,6 +7955,7 @@ class DashboardCheckInReportExcelViewV2(APIView):
         shift_id = request.query_params.get('shift_id')
         search = (request.query_params.get('search') or '').strip()
         role = (request.query_params.get('role') or '').strip()
+        status_filter = (request.query_params.get('status') or '').strip()
 
         try:
             report_data = _get_checkin_report_data_v2(
@@ -7956,6 +7969,10 @@ class DashboardCheckInReportExcelViewV2(APIView):
                 search=search or None,
                 role=role or None,
             )
+
+            # Filter by status if provided
+            if status_filter and status_filter != 'all':
+                report_data = [r for r in report_data if r.get('status') == status_filter]
 
             # Create Excel workbook
             wb = Workbook()

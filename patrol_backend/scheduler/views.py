@@ -352,7 +352,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     #                         if (scan.checkpoint_id == checkpoint_id and
     #                             getattr(scan, 'synced', True) == True and
     #                             scan.id not in used_checkin_ids and
-    #                             abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=30)):
+    #                             abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=allowed_delay)):
 
     #                             is_checked_in = True
     #                             used_checkin_ids.add(scan.id)
@@ -431,11 +431,21 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     def upcoming_checkpoints(self, request, user_id=None):
         try:
             # 1. SETUP: Timezone and expanded Date Range (Yesterday + Today)
-            user_tz = get_user_timezone_from_request(request)
+            from authapp.models import User
+            user_obj = User.objects.filter(id=user_id).first()
+            user_location_id = user_obj.location_id if user_obj else None
+            user_tz = get_user_timezone_from_request(request, location_id=user_location_id)
             today_user = get_user_today(user_tz)
             yesterday_user = today_user - timedelta(days=1)
             user_now = get_user_now(user_tz)
             user_now_utc = user_now.astimezone(pytz.UTC)
+
+            # Fetch allowed_delay from SiteSetting
+            allowed_delay_raw = SiteSetting.get_setting('time', location_id=user_location_id, default_value='15')
+            try:
+                allowed_delay = int(allowed_delay_raw)
+            except (ValueError, TypeError):
+                allowed_delay = 15
 
             # Query window for scans: from start of yesterday to end of today
             from patrol_backend.utils.timezone_utils import convert_date_range_to_utc
@@ -524,7 +534,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                             if (scan.checkpoint_id == checkpoint_id and
                                 getattr(scan, 'synced', True) == True and 
                                 scan.id not in used_checkin_ids and 
-                                abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=30)):
+                                abs(scan.timestamp - expected_dt_utc) <= timedelta(minutes=allowed_delay)):
                                 
                                 is_checked_in = True
                                 used_checkin_ids.add(scan.id)
@@ -532,7 +542,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
                         # 7. OVERDUE & SYNC LOGIC
                         # Check if 15 minutes have passed since the expected time
-                        is_overdue = user_now_utc > (expected_dt_utc + timedelta(minutes=15))
+                        is_overdue = user_now_utc > (expected_dt_utc + timedelta(minutes=allowed_delay))
 
                         if is_checked_in:
                             status, synced = 'completed', True
