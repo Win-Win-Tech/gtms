@@ -21,6 +21,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = ['id', 'email', 'password', 'role', 'is_active', 'created_on',
                   'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone', 'employee_code',
                   'face_photo', 'remove_face_photo']
+        read_only_fields = ['id', 'is_active', 'created_on', 'modified_on']
 
     def create(self, validated_data):
         location_id = validated_data.pop('locationId', None)

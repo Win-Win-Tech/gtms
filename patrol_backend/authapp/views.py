@@ -217,7 +217,7 @@ class UserDeleteView(APIView):
         try:
             user = User.objects.get(id=id)
             user.delete(user=request.user)
-            return Response(api_response("success", "User deleted successfully", None, status.HTTP_204_NO_CONTENT))
+            return Response(api_response("success", "User deleted successfully", None), status=status.HTTP_204_NO_CONTENT)
         except User.DoesNotExist:
             return Response(api_response("error", "User not found", None, status.HTTP_404_NOT_FOUND))
         except Exception as e:
