@@ -69,11 +69,25 @@ def _fmt_day_1(val) -> str:
     return f"{d:.1f}"
 
 
+def _fmt_hours_2(val) -> str:
+    if val is None or val == "":
+        return "-"
+    try:
+        d = val if isinstance(val, Decimal) else Decimal(str(val))
+    except Exception:
+        return str(val)
+    return f"{d:.2f}"
+
+
 def _fmt_display(field, raw) -> str:
     if raw is None or raw == "":
         return "-"
     if field.field_type in ("EARNING", "DEDUCTION"):
         return _fmt_rs_cell(raw)
+    if getattr(field, "field_code", "") == "HOURLY_RATE":
+        return _fmt_rs_cell(raw)
+    if getattr(field, "field_code", "") == "PAID_HOURS":
+        return _fmt_hours_2(raw)
     if getattr(field, "field_code", "") in {"MONTH_DAYS", "WORKING_DAYS", "PRESENT_DAYS", "HALF_DAYS", "ABSENT_DAYS", "PAID_DAYS"}:
         return _fmt_day_1(raw)
     return str(raw)
@@ -110,13 +124,20 @@ def _meta_line(record, template, field_values: dict) -> dict:
         return ""
 
     profile = record.payroll_profile
+    is_hourly = getattr(record, "salary_type", "monthly") == "hourly"
+    working_label = "Paid Hours" if is_hourly else "Working Days"
+    working_value = _fmt_hours_2(record.paid_hours) if is_hourly else _fmt_day_1(record.working_days)
+    payable_label = "Hourly Rate" if is_hourly else "Net Payable Days"
+    payable_value = _fmt_rs_cell(record.hourly_rate) if is_hourly else _fmt_day_1(record.paid_days)
     return {
         "name": getattr(record.user, "name", None) or "-",
-        "code": profile.employee_code or "-",
+        "code": getattr(profile, "employee_code", None) or getattr(record.user, "employee_code", None) or "-",
         "team": pick("TEAM", "team", em_keys=("team", "Team")),
         "designation": pick("DESIGNATION", "designation", em_keys=("designation", "Designation")) or (getattr(record.user, "role", None) or "-").title(),
-        "working_days": _fmt_day_1(record.working_days),
-        "net_payable_days": _fmt_day_1(record.paid_days),
+        "working_label": working_label,
+        "working_value": working_value,
+        "payable_label": payable_label,
+        "payable_value": payable_value,
         "doj": pick("DOJ", "doj", "DATE_OF_JOINING", em_keys=("doj", "date_of_joining")),
         "uan": profile.uan or pick("UAN", "PF_UAN", em_keys=("uan",)),
         "pay_mode": pick("PAY_MODE", "pay_mode", em_keys=("pay_mode",)),
@@ -416,7 +437,7 @@ def _build_reportlab_pdf(record) -> bytes:
     emp_rows = [
         ["Employee Name", meta["name"], "Employee Code", meta["code"]],
         ["Team", meta["team"] or "-", "Designation", meta["designation"] or "-"],
-        ["Working Days", meta["working_days"], "Net Payable Days", meta["net_payable_days"]],
+        [meta["working_label"], meta["working_value"], meta["payable_label"], meta["payable_value"]],
         ["Date of Joining", meta["doj"] or "-", "PF UAN", meta["uan"] or "-"],
         ["Pay Mode", meta["pay_mode"] or "-", "Bank", meta["bank"] or "-"],
         ["Branch", meta["branch"] or "-", "Account No.", meta["account"] or "-"],
@@ -610,6 +631,7 @@ def _build_fallback_raw_pdf(record) -> bytes:
         "",
         f"Month Days: {_fmt_day_1(record.month_days)}  Working: {_fmt_day_1(record.working_days)}",
         f"Present: {_fmt_day_1(record.present_days)}  Half: {_fmt_day_1(record.half_days)}  Absent: {_fmt_day_1(record.absent_days)}  Paid: {_fmt_day_1(record.paid_days)}",
+        f"Salary Type: {getattr(record, 'salary_type', 'monthly')}  Paid Hours: {_fmt_hours_2(getattr(record, 'paid_hours', 0))}  Hourly Rate: {_fmt_rs_cell(getattr(record, 'hourly_rate', None))}",
         "",
         f"Gross: {record.gross_salary}  Earnings: {record.total_earnings}",
         f"Deductions: {record.total_deductions}  Net: {record.net_pay}",

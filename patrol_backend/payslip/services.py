@@ -106,6 +106,43 @@ def calculate_attendance_from_master(user, month_str, user_tz):
     }
 
 
+def calculate_hourly_attendance_from_master(user, month_str, user_tz, location_id=None):
+    """
+    Hourly payroll uses the master attendance duration already computed from
+    check-in/check-out sessions. Salary is calculated from exact minutes so
+    partial hours (for example 20 minutes) are paid correctly.
+    """
+    base = calculate_attendance_from_master(user, month_str, user_tz)
+    _, _, month_start, month_end = parse_month(month_str)
+
+    records = AttendanceCheckin.objects.filter(
+        guard=user,
+        shift_date__gte=month_start,
+        shift_date__lte=month_end,
+        duration_minutes__gt=0,
+    )
+    if location_id:
+        records = records.filter(org_location_id=location_id)
+
+    worked_minutes = 0
+    worked_days = set()
+    for row in records.only("shift_date", "duration_minutes"):
+        worked_minutes += int(row.duration_minutes or 0)
+        if row.shift_date:
+            worked_days.add(row.shift_date)
+
+    paid_hours = (Decimal(worked_minutes) / Decimal("60")).quantize(Decimal("0.01"))
+    base.update(
+        {
+            "worked_minutes": worked_minutes,
+            "paid_hours": paid_hours,
+            # Hourly employees may still need a day count in existing displays.
+            "paid_days": Decimal(str(len(worked_days))),
+        }
+    )
+    return base
+
+
 def _to_decimal(value, default="0"):
     if value is None:
         return Decimal(default)
@@ -174,7 +211,13 @@ def _eval_formula_safely(expr: str, context: dict) -> Decimal:
     return _to_decimal(_node(tree), "0")
 
 
-def calculate_salary_fields(gross_salary, field_rows, attendance_snapshot):
+def calculate_salary_fields(
+    gross_salary,
+    field_rows,
+    attendance_snapshot,
+    salary_type="monthly",
+    hourly_rate=None,
+):
     """
     Simple field engine:
     - FIXED: numeric value
@@ -182,10 +225,20 @@ def calculate_salary_fields(gross_salary, field_rows, attendance_snapshot):
     - FORMULA: python expression referencing computed fields + attendance vars
     """
     gross = _to_decimal(gross_salary, "0")
+    hourly = _to_decimal(hourly_rate, "0")
+    worked_minutes = _to_decimal(attendance_snapshot.get("worked_minutes"), "0")
+    base_pay = gross
+    if salary_type == "hourly":
+        base_pay = ((hourly * worked_minutes) / Decimal("60")).quantize(Decimal("0.01"))
     half_days_count = _to_decimal(attendance_snapshot.get("half_days"), "0")
     half_days_paid = half_days_count * Decimal("0.5")
     context = {
         "gross_salary": gross,
+        "salary_type": Decimal("1") if salary_type == "hourly" else Decimal("0"),
+        "hourly_rate": hourly,
+        "worked_minutes": worked_minutes,
+        "paid_hours": _to_decimal(attendance_snapshot.get("paid_hours"), "0"),
+        "base_pay": base_pay,
         "month_days": _to_decimal(attendance_snapshot.get("month_days"), "0"),
         "working_days": _to_decimal(attendance_snapshot.get("working_days"), "0"),
         "present_days": _to_decimal(attendance_snapshot.get("present_days"), "0"),
@@ -197,7 +250,10 @@ def calculate_salary_fields(gross_salary, field_rows, attendance_snapshot):
         "absent_days": _to_decimal(attendance_snapshot.get("absent_days"), "0"),
         "paid_days": _to_decimal(attendance_snapshot.get("paid_days"), "0"),
     }
-    zero_attendance = context["working_days"] <= Decimal("0") or context["paid_days"] <= Decimal("0")
+    if salary_type == "hourly":
+        zero_attendance = context["worked_minutes"] <= Decimal("0")
+    else:
+        zero_attendance = context["working_days"] <= Decimal("0") or context["paid_days"] <= Decimal("0")
 
     field_values = {}
     total_earnings = Decimal("0")

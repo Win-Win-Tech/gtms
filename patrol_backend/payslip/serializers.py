@@ -25,6 +25,18 @@ class EmployeePayrollProfileSerializer(serializers.ModelSerializer):
         location = attrs.get("location") or getattr(self.instance, "location", None)
         default_field_config = attrs.get("default_field_config", getattr(self.instance, "default_field_config", None))
         default_template = attrs.get("default_template", getattr(self.instance, "default_template", None))
+        salary_type = attrs.get("salary_type", getattr(self.instance, "salary_type", "monthly"))
+        gross_salary = attrs.get("gross_salary", getattr(self.instance, "gross_salary", None))
+        hourly_rate = attrs.get("hourly_rate", getattr(self.instance, "hourly_rate", None))
+
+        if salary_type not in ("monthly", "hourly"):
+            raise serializers.ValidationError({"salary_type": "salary_type must be monthly or hourly"})
+
+        if salary_type == "monthly":
+            if gross_salary is None or Decimal(gross_salary) <= Decimal("0"):
+                raise serializers.ValidationError({"gross_salary": "Gross salary is required for monthly salary profiles"})
+        elif hourly_rate is None or Decimal(hourly_rate) <= Decimal("0"):
+            raise serializers.ValidationError({"hourly_rate": "Hourly rate is required for hourly salary profiles"})
 
         if default_field_config and location and default_field_config.location_id != location.id:
             raise serializers.ValidationError({"default_field_config": "Selected field config must belong to profile location"})
@@ -56,6 +68,11 @@ class PayslipFieldConfigSerializer(serializers.ModelSerializer):
 class PayslipFieldSerializer(serializers.ModelSerializer):
     SYSTEM_VARS = {
         "gross_salary",
+        "salary_type",
+        "hourly_rate",
+        "worked_minutes",
+        "paid_hours",
+        "base_pay",
         "month_days",
         "working_days",
         "present_days",
@@ -219,7 +236,11 @@ class PayslipRecordSerializer(serializers.ModelSerializer):
             "half_days",
             "absent_days",
             "paid_days",
+            "salary_type",
             "gross_salary",
+            "hourly_rate",
+            "worked_minutes",
+            "paid_hours",
             "total_earnings",
             "total_deductions",
             "net_pay",

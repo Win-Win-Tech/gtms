@@ -30,7 +30,7 @@ from .serializers import (
     PayslipReopenSerializer,
     PayslipRecordAttendanceEditSerializer,
 )
-from .services import calculate_attendance_from_master, calculate_salary_fields
+from .services import calculate_attendance_from_master, calculate_hourly_attendance_from_master, calculate_salary_fields
 from .pdf_utils import build_simple_payslip_pdf_bytes
 from decimal import Decimal
 
@@ -451,6 +451,117 @@ class PayslipFieldConfigViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             status=status.HTTP_200_OK,
         )
 
+    @action(detail=False, methods=["post"], url_path="bootstrap-hourly")
+    def bootstrap_hourly(self, request):
+        """
+        Ensure a simple hourly payslip setup for a location.
+        Hourly wages are calculated from exact worked minutes:
+        hourly_rate * worked_minutes / 60.
+        """
+        location_id = request.data.get("location_id")
+        if not location_id:
+            return Response({"error": "location_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        template, template_created = PayslipTemplate.objects.get_or_create(
+            location_id=location_id,
+            defaults={
+                "company_name": "GTMS",
+                "header_text": "Payslip",
+                "created_by": request.user,
+                "modified_by": request.user,
+                "is_deleted": False,
+            },
+        )
+        if template.is_deleted:
+            template.is_deleted = False
+            template.modified_by = request.user
+            template.save(update_fields=["is_deleted", "modified_by", "modified_on"])
+            template_created = True
+
+        config = PayslipFieldConfig.objects.filter(
+            location_id=location_id,
+            is_deleted=False,
+            config_name="Hourly Salary Config",
+        ).first()
+        config_created = False
+        if not config:
+            config = PayslipFieldConfig.objects.create(
+                location_id=location_id,
+                config_name="Hourly Salary Config",
+                description="Hourly salary setup using attendance worked minutes",
+                is_active=True,
+                created_by=request.user,
+                modified_by=request.user,
+            )
+            config_created = True
+
+        hourly_fields = [
+            ("Hourly Wages", "HOURLY_WAGES", "EARNING", "FORMULA", "(hourly_rate * worked_minutes) / Decimal('60')", 1),
+            ("Hourly Rate", "HOURLY_RATE", "INFO", "FORMULA", "hourly_rate", 2),
+            ("Worked Minutes", "WORKED_MINUTES", "INFO", "FORMULA", "worked_minutes", 3),
+            ("Paid Hours", "PAID_HOURS", "INFO", "FORMULA", "paid_hours", 4),
+            ("Present Days", "PRESENT_DAYS", "INFO", "FORMULA", "present_days", 5),
+            ("Paid Days", "PAID_DAYS", "INFO", "FORMULA", "paid_days", 6),
+        ]
+        created_field_codes = []
+        for field_name, field_code, field_type, value_type, value, display_order in hourly_fields:
+            field_obj, was_created = PayslipField.objects.get_or_create(
+                field_config=config,
+                field_code=field_code,
+                defaults={
+                    "field_name": field_name,
+                    "field_type": field_type,
+                    "value_type": value_type,
+                    "value": value,
+                    "display_order": display_order,
+                    "is_visible": True,
+                    "is_deleted": False,
+                },
+            )
+            if not was_created and field_obj.is_deleted:
+                field_obj.is_deleted = False
+                field_obj.field_name = field_name
+                field_obj.field_type = field_type
+                field_obj.value_type = value_type
+                field_obj.value = value
+                field_obj.display_order = display_order
+                field_obj.is_visible = True
+                field_obj.save(
+                    update_fields=[
+                        "is_deleted",
+                        "field_name",
+                        "field_type",
+                        "value_type",
+                        "value",
+                        "display_order",
+                        "is_visible",
+                        "modified_on",
+                    ]
+                )
+                created_field_codes.append(field_code)
+            if was_created:
+                created_field_codes.append(field_code)
+
+        visible_fields_count = PayslipField.objects.filter(
+            field_config=config,
+            is_deleted=False,
+            is_visible=True,
+        ).count()
+
+        return Response(
+            {
+                "message": "Hourly bootstrap completed",
+                "location_id": location_id,
+                "template_created": template_created,
+                "field_config_created": config_created,
+                "created_fields": created_field_codes,
+                "template_id": str(template.id),
+                "field_config_id": str(config.id),
+                "visible_fields_count": visible_fields_count,
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 class PayslipFieldViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
     queryset = PayslipField.objects.select_related("field_config").filter(is_deleted=False)
@@ -626,11 +737,26 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
         if not field_config:
             return None, {"error": "Payslip field config not found for location"}, status.HTTP_400_BAD_REQUEST
 
+        salary_type = profile.salary_type or "monthly"
         user_tz = get_user_timezone_from_request(request, location_id=profile.location_id)
-        attendance_snapshot = calculate_attendance_from_master(employee, month, user_tz)
+        if salary_type == "hourly":
+            attendance_snapshot = calculate_hourly_attendance_from_master(
+                employee,
+                month,
+                user_tz,
+                location_id=profile.location_id,
+            )
+        else:
+            attendance_snapshot = calculate_attendance_from_master(employee, month, user_tz)
 
         fields = PayslipField.objects.filter(field_config=field_config, is_deleted=False, is_visible=True).order_by("display_order")
-        calc = calculate_salary_fields(profile.gross_salary, fields, attendance_snapshot)
+        calc = calculate_salary_fields(
+            profile.gross_salary,
+            fields,
+            attendance_snapshot,
+            salary_type=salary_type,
+            hourly_rate=profile.hourly_rate,
+        )
 
         with transaction.atomic():
             existing = PayslipRecord.objects.filter(user=employee, month=month).first()
@@ -648,7 +774,11 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                 "half_days": attendance_snapshot["half_days"],
                 "absent_days": attendance_snapshot["absent_days"],
                 "paid_days": attendance_snapshot["paid_days"],
+                "salary_type": salary_type,
                 "gross_salary": profile.gross_salary,
+                "hourly_rate": profile.hourly_rate,
+                "worked_minutes": attendance_snapshot.get("worked_minutes", 0),
+                "paid_hours": attendance_snapshot.get("paid_hours", Decimal("0")),
                 "total_earnings": calc["total_earnings"],
                 "total_deductions": calc["total_deductions"],
                 "net_pay": calc["net_pay"],
@@ -866,6 +996,11 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
 
         if not self._can_edit_record(record):
             return Response({"error": "This payslip cannot be edited in current state."}, status=status.HTTP_400_BAD_REQUEST)
+        if record.salary_type == "hourly":
+            return Response(
+                {"error": "Hourly payslips are calculated from worked minutes and cannot be edited with day-based attendance."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         serializer = PayslipRecordAttendanceEditSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -903,7 +1038,13 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             is_deleted=False,
             is_visible=True,
         ).order_by("display_order")
-        calc = calculate_salary_fields(record.gross_salary, fields, attendance_snapshot)
+        calc = calculate_salary_fields(
+            record.gross_salary,
+            fields,
+            attendance_snapshot,
+            salary_type=record.salary_type,
+            hourly_rate=record.hourly_rate,
+        )
 
         with transaction.atomic():
             record.working_days = working_days

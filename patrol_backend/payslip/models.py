@@ -6,6 +6,7 @@ from django.db import models
 class EmployeePayrollProfile(models.Model):
     SALARY_TYPE_CHOICES = [
         ("monthly", "Monthly"),
+        ("hourly", "Hourly"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -20,7 +21,8 @@ class EmployeePayrollProfile(models.Model):
         related_name="payroll_profiles",
     )
     salary_type = models.CharField(max_length=20, choices=SALARY_TYPE_CHOICES, default="monthly")
-    gross_salary = models.DecimalField(max_digits=12, decimal_places=2)
+    gross_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    hourly_rate = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     default_field_config = models.ForeignKey(
         "payslip.PayslipFieldConfig",
         on_delete=models.SET_NULL,
@@ -229,7 +231,11 @@ class PayslipRecord(models.Model):
     absent_days = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     paid_days = models.DecimalField(max_digits=6, decimal_places=2, default=0)
 
+    salary_type = models.CharField(max_length=20, choices=EmployeePayrollProfile.SALARY_TYPE_CHOICES, default="monthly")
     gross_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    hourly_rate = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    worked_minutes = models.IntegerField(default=0)
+    paid_hours = models.DecimalField(max_digits=8, decimal_places=2, default=0)
     total_earnings = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     total_deductions = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     net_pay = models.DecimalField(max_digits=12, decimal_places=2, default=0)
