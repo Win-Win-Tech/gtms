@@ -14,10 +14,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from authapp.models import User
+from patrol_backend.utils.face_identify_log import save_face_identify_error_image
 from patrol_backend.utils.face_utils import (
     DEFAULT_FACE_TOLERANCE,
     bytes_to_encoding,
-    get_face_encoding,
+    get_face_encoding_kiosk,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,16 @@ def get_or_rebuild_location_index(location_id: str) -> FaceLocationIndex:
         )
 
 
+def _identify_fail(
+    location_id: str,
+    code: str,
+    live_image_bytes: bytes,
+    distance: Optional[float] = None,
+) -> Tuple[Optional[str], str, Optional[float]]:
+    save_face_identify_error_image(str(location_id), code, live_image_bytes)
+    return None, code, distance
+
+
 def identify_user_in_location(
     location_id: str,
     live_image_bytes: bytes,
@@ -137,21 +148,24 @@ def identify_user_in_location(
     """
     Returns (matched_user_id, code, distance):
     - code: success | face_not_detected | no_enrolled_faces | face_not_matched
-    """
-    live = get_face_encoding(live_image_bytes)
-    if live is None:
-        return None, "face_not_detected", None
 
-    entry = get_or_rebuild_location_index(str(location_id))
+    Failed identification images are stored under media/logphoto/{date}/{location_id}/.
+    """
+    loc = str(location_id)
+    live = get_face_encoding_kiosk(live_image_bytes)
+    if live is None:
+        return _identify_fail(loc, "face_not_detected", live_image_bytes)
+
+    entry = get_or_rebuild_location_index(loc)
     if entry.vectors32.shape[0] == 0:
-        return None, "no_enrolled_faces", None
+        return _identify_fail(loc, "no_enrolled_faces", live_image_bytes)
 
     query = np.asarray(live, dtype=np.float32).reshape(1, -1)
     if entry.faiss_index is not None:
         dists2, idxs = entry.faiss_index.search(query, 1)
         best_idx = int(idxs[0][0])
         if best_idx < 0 or best_idx >= len(entry.user_ids):
-            return None, "face_not_matched", None
+            return _identify_fail(loc, "face_not_matched", live_image_bytes)
         dist = float(sqrt(float(dists2[0][0])))
     else:
         # Fallback: linear L2 distance (same metric as face_recognition distance).
@@ -161,6 +175,6 @@ def identify_user_in_location(
         dist = float(sqrt(float(d2[best_idx])))
 
     if dist > float(tolerance):
-        return None, "face_not_matched", dist
+        return _identify_fail(loc, "face_not_matched", live_image_bytes, dist)
 
     return entry.user_ids[best_idx], "success", dist

@@ -40,14 +40,47 @@ def is_face_attendance_available() -> bool:
     return _load_face_recognition() is not None
 
 
-def get_face_encoding(image_bytes: bytes) -> Optional[np.ndarray]:
+def _prepare_face_image_array(image_bytes: bytes, max_width: int = 640):
+    """Downscale large uploads before detection (major speed win for kiosk)."""
+    fr = _load_face_recognition()
+    if not fr or not image_bytes:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            if w > max_width and w > 0:
+                new_h = max(1, int(h * (max_width / float(w))))
+                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+            return np.asarray(img)
+    except Exception:
+        return fr.load_image_file(io.BytesIO(image_bytes))
+
+
+def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.ndarray]:
     """Return 128-d encoding or None if no face / error."""
     fr = _load_face_recognition()
     if not fr or not image_bytes:
         return None
     try:
-        image = fr.load_image_file(io.BytesIO(image_bytes))
-        encodings = fr.face_encodings(image)
+        if fast:
+            from django.conf import settings
+
+            max_w = int(getattr(settings, "FACE_KIOSK_MAX_IMAGE_WIDTH", 640))
+            num_jitters = int(getattr(settings, "FACE_KIOSK_NUM_JITTERS", 0))
+            upsample = int(getattr(settings, "FACE_KIOSK_UPSAMPLE", 0))
+            image = _prepare_face_image_array(image_bytes, max_width=max_w)
+            if image is None:
+                return None
+            locations = fr.face_locations(image, number_of_times_to_upsample=upsample)
+            if not locations:
+                return None
+            encodings = fr.face_encodings(image, locations, num_jitters=num_jitters)
+        else:
+            image = fr.load_image_file(io.BytesIO(image_bytes))
+            encodings = fr.face_encodings(image)
         if not encodings:
             logger.info("No face found in image.")
             return None
@@ -55,6 +88,10 @@ def get_face_encoding(image_bytes: bytes) -> Optional[np.ndarray]:
     except Exception as e:
         logger.exception("get_face_encoding failed: %s", e)
         return None
+
+
+def get_face_encoding_kiosk(image_bytes: bytes) -> Optional[np.ndarray]:
+    return get_face_encoding(image_bytes, fast=True)
 
 
 def encoding_to_bytes(enc: np.ndarray) -> bytes:

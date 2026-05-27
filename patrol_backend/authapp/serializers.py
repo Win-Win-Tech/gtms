@@ -1,6 +1,10 @@
+import logging
+
 from rest_framework import serializers
 from .models import User, Role
 from scheduler.serializers import LocationSerializer as SchedulerLocationSerializer
+
+logger = logging.getLogger(__name__)
 
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:
@@ -90,7 +94,14 @@ class UserSerializer(serializers.ModelSerializer):
                 instance.timezone = location_admin.timezone
         
         instance.save()
-        _try_refresh_face_encoding(instance)
+        new_location_id = (
+            str(instance.location_id) if getattr(instance, "location_id", None) else None
+        )
+        sync_user_face_and_index(
+            instance,
+            old_location_id=old_location_id,
+            new_location_id=new_location_id,
+        )
         return instance
 
 
@@ -106,20 +117,39 @@ class UserListSerializer(serializers.ModelSerializer):
         ]
 
 
-def _try_refresh_face_encoding(user):
+def sync_user_face_and_index(user, old_location_id=None, new_location_id=None):
+    """
+    Recompute face_encoding from face_photo and rebuild FAISS indexes for affected locations.
+    Clears encoding when photo is missing or no face is detected in the photo.
+    """
     try:
         from patrol_backend.utils.face_utils import refresh_user_face_encoding_from_photo
-        refresh_user_face_encoding_from_photo(user)
-    except Exception:
-        pass
-    # Keep kiosk FAISS index in sync on every face register/update/remove.
+
+        if user.face_photo:
+            if not refresh_user_face_encoding_from_photo(user):
+                User.objects.filter(pk=user.pk).update(face_encoding=None)
+                user.face_encoding = None
+        elif not user.face_encoding:
+            pass
+        else:
+            User.objects.filter(pk=user.pk).update(face_encoding=None)
+            user.face_encoding = None
+    except Exception as exc:
+        logger.warning("refresh_user_face_encoding failed user=%s: %s", user.pk, exc)
+
     try:
         from patrol_backend.utils.face_index import rebuild_location_index
 
-        if getattr(user, "location_id", None):
-            rebuild_location_index(str(user.location_id))
-    except Exception:
-        pass
+        for loc_id in {lid for lid in (old_location_id, new_location_id) if lid}:
+            rebuild_location_index(str(loc_id))
+    except Exception as exc:
+        logger.warning("rebuild_location_index failed user=%s: %s", user.pk, exc)
+
+
+def _try_refresh_face_encoding(user):
+    """Backward-compatible alias used by mobile profile view."""
+    loc = str(user.location_id) if getattr(user, "location_id", None) else None
+    sync_user_face_and_index(user, old_location_id=loc, new_location_id=loc)
 
 
 def _register_heif_opener_if_available():

@@ -13,6 +13,12 @@ class DashboardConfig(AppConfig):
         # First-phase kiosk requirement: rebuild face index on every app restart.
         def _warmup():
             try:
+                from patrol_backend.utils.face_utils import is_face_attendance_available
+
+                is_face_attendance_available()
+            except Exception as exc:
+                logger.warning("Face library warmup skipped: %s", exc)
+            try:
                 from patrol_backend.utils.face_index import rebuild_all_indexes
 
                 rebuild_all_indexes()

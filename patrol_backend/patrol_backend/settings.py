@@ -221,6 +221,17 @@ SIMPLE_JWT = {
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
+FACE_IDENTIFY_LOG_PHOTOS_ENABLED = True
+FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API response)
+
+# Kiosk face_attendance performance
+FACE_KIOSK_FAST_PATH = True
+FACE_KIOSK_MAX_IMAGE_WIDTH = 640
+FACE_KIOSK_NUM_JITTERS = 0
+FACE_KIOSK_UPSAMPLE = 0
+FACE_KIOSK_LIGHT_RESPONSE = True
+FACE_KIOSK_DEFER_METRICS_REFRESH = True
+
 # Twilio credentials
 # TWILIO_SID = 'AC2f6c622ec954be8536e4b4ae1a913e90'
 TWILIO_SID = 'ACf6536d328a204ec62b62648f58e17263'

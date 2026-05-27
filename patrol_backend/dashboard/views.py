@@ -2124,6 +2124,86 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         user_tz = get_user_timezone(user)
         assignment, shift_start_date = self.get_today_assignment_v2(user, request=None)
         if not assignment or getattr(assignment, "location_id", None) != getattr(org_location, "id", None):
+            # If there is an assignment today but it is not currently within the active/grace window,
+            # return an actionable message instead of generic no_shift_today.
+            try:
+                today = get_user_today(user_tz)
+                yesterday = today - timedelta(days=1)
+                any_assignment = (
+                    Assignment.objects.filter(
+                        guard_id=user.id,
+                        location_id=getattr(org_location, "id", None),
+                        start_date__lte=today,
+                        end_date__gte=yesterday,
+                    )
+                    .select_related("shift", "location")
+                    .order_by("start_date")
+                    .first()
+                )
+                if any_assignment and any_assignment.shift:
+                    shift = any_assignment.shift
+                    is_overnight = shift.end_time <= shift.start_time
+                    grace_minutes = _get_site_setting_int(
+                        key="shift_grace_time",
+                        location_id=getattr(any_assignment, "location_id", None)
+                        or getattr(user, "location_id", None),
+                        default_value=30,
+                    )
+                    user_now = get_user_now(user_tz)
+
+                    if is_overnight:
+                        # Next shift window (starting today)
+                        start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+                        end_dt = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
+                    else:
+                        start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+                        end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
+
+                    window_start = start_dt - timedelta(minutes=grace_minutes)
+                    window_end = end_dt + timedelta(minutes=grace_minutes)
+                    # combine_date_time_in_user_tz returns UTC; convert back for display.
+                    start_dt_user = to_user_timezone(start_dt, user_tz)
+                    end_dt_user = to_user_timezone(end_dt, user_tz)
+                    window_start_user = to_user_timezone(window_start, user_tz)
+                    window_end_user = to_user_timezone(window_end, user_tz)
+
+                    if user_now < window_start:
+                        return Response(
+                            {
+                                "success": False,
+                                "code": "shift_not_started_yet",
+                                "message": (
+                                    f"Hi {greeting_name}, your shift starts at {start_dt_user.strftime('%I:%M %p')}. "
+                                    f"You can check-in from {window_start_user.strftime('%I:%M %p')} (grace {grace_minutes} minutes)."
+                                ),
+                                "user_id": str(user.id),
+                                "has_shift": True,
+                                "shift_start_time": start_dt_user.strftime("%I:%M %p"),
+                                "allowed_from": window_start_user.strftime("%I:%M %p"),
+                                "grace_minutes": grace_minutes,
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+
+                    if user_now > window_end:
+                        return Response(
+                            {
+                                "success": False,
+                                "code": "shift_window_closed",
+                                "message": (
+                                    f"Hi {greeting_name}, your shift time is {start_dt_user.strftime('%I:%M %p')} to {end_dt_user.strftime('%I:%M %p')}. "
+                                    f"You cannot punch now. Please contact admin."
+                                ),
+                                "user_id": str(user.id),
+                                "has_shift": True,
+                                "shift_start_time": start_dt_user.strftime("%I:%M %p"),
+                                "shift_end_time": end_dt_user.strftime("%I:%M %p"),
+                                "grace_minutes": grace_minutes,
+                            },
+                            status=status.HTTP_200_OK,
+                        )
+            except Exception:
+                pass
             return Response(
                 {
                     "success": False,
@@ -2143,6 +2223,130 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             f"Your shift time is {shift_start_dt_user.strftime('%I:%M %p')} to {shift_end_dt_user.strftime('%I:%M %p')}."
         )
 
+        img_name = "kiosk.jpg"
+        if image_file:
+            img_name = getattr(image_file, "name", img_name) or img_name
+
+        if getattr(settings, "FACE_KIOSK_FAST_PATH", True):
+            from patrol_backend.utils.kiosk_attendance_fast import (
+                CheckoutTooEarly,
+                build_kiosk_light_payload,
+                defer_attendance_v3_refresh,
+                get_kiosk_session_state,
+                kiosk_apply_punch,
+            )
+
+            latest_checkin, latest_checkout, has_open_session = get_kiosk_session_state(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+            try:
+                action_mode, attendance, log, status_code = kiosk_apply_punch(
+                    user=user,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    shift_start_date=shift_start_date,
+                    matched_site=matched_site,
+                    lat=lat,
+                    lon=lon,
+                    raw_bytes=raw_bytes,
+                    img_name=img_name,
+                    search_start_utc=search_start_utc,
+                    search_end_utc=search_end_utc,
+                    latest_checkin=latest_checkin,
+                    latest_checkout=latest_checkout,
+                    has_open_session=has_open_session,
+                )
+            except CheckoutTooEarly as exc:
+                return _kiosk_error(
+                    "checkout_too_early",
+                    f"Checkout allowed after {exc.min_checkout_minutes} minutes from checkin",
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "min_checkout_minutes": exc.min_checkout_minutes,
+                        "remaining_seconds": exc.remaining,
+                    },
+                )
+
+            if getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", True):
+                defer_attendance_v3_refresh(
+                    _attendance_v3_refresh_saved_fields,
+                    attendance,
+                    user,
+                    assignment,
+                    shift,
+                    org_location,
+                    search_start_utc,
+                    search_end_utc,
+                )
+            else:
+                _attendance_v3_refresh_saved_fields(
+                    attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+                )
+
+            event_user = to_user_timezone(log.timestamp, user_tz)
+            if action_mode == "checkin":
+                checkin_count_in_shift = int(attendance.checkin_count or 0)
+                if checkin_count_in_shift > 1:
+                    voice_text = f"Hi {greeting_name}. Your check-in is marked successfully."
+                else:
+                    late_min = int((event_user - shift_start_dt_user).total_seconds() // 60)
+                    if late_min > 0:
+                        late_text = _fmt_offset_minutes(late_min)
+                        voice_text = (
+                            f"Hi {greeting_name}. Check-in marked at {event_user.strftime('%I:%M %p')}. "
+                            f"{shift_window_text} You are late by {late_text}."
+                        )
+                    else:
+                        voice_text = (
+                            f"Hi {greeting_name}. Check-in marked at {event_user.strftime('%I:%M %p')}. "
+                            f"{shift_window_text}"
+                        )
+            else:
+                early_min = int((shift_end_dt_user - event_user).total_seconds() // 60)
+                if early_min > 0:
+                    early_text = _fmt_offset_minutes(early_min)
+                    voice_text = (
+                        f"Hi {greeting_name}. Checkout marked at {event_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text} You checked out {early_text} early."
+                    )
+                else:
+                    voice_text = (
+                        f"Hi {greeting_name}. Checkout marked at {event_user.strftime('%I:%M %p')}. "
+                        f"{shift_window_text}"
+                    )
+
+            if getattr(settings, "FACE_KIOSK_LIGHT_RESPONSE", True):
+                payload = build_kiosk_light_payload(
+                    attendance,
+                    action_mode=action_mode,
+                    user_id=str(user.id),
+                    request=request,
+                )
+            else:
+                payload = AttendanceCheckinSerializer(attendance, context={"request": request}).data
+                if isinstance(payload, dict):
+                    payload["kiosk_mode"] = True
+                    payload["mode"] = action_mode
+                    payload["face_attendance"] = True
+                    payload["face_verified"] = True
+                    payload["has_shift"] = True
+                    payload["user_id"] = str(user.id)
+
+            return Response(
+                {
+                    "success": True,
+                    "code": f"{action_mode}_success",
+                    "message": voice_text,
+                    "user_id": str(user.id),
+                    "has_shift": True,
+                    "data": payload,
+                },
+                status=status_code,
+            )
+
+        # Legacy slow path (kept for rollback via FACE_KIOSK_FAST_PATH=False)
         latest_checkin = CheckInLog.objects.filter(
             guard=user,
             assignment=assignment,
@@ -2164,10 +2368,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         has_open_session = bool(
             latest_checkin and (not latest_checkout or latest_checkin.timestamp > latest_checkout.timestamp)
         )
-
-        img_name = "kiosk.jpg"
-        if image_file:
-            img_name = getattr(image_file, "name", img_name) or img_name
 
         attendance, _ = AttendanceCheckin.objects.get_or_create(
             guard=user,
@@ -2267,8 +2467,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 timestamp__gte=search_start_utc,
                 timestamp__lt=search_end_utc,
             ).order_by("timestamp").first()
-            # Only first check-in of the shift should announce late/on-time details.
-            # Later check-ins in the same shift should be a simple confirmation message.
             checkin_count_in_shift = int(getattr(attendance, "checkin_count", 0) or 0)
             if checkin_count_in_shift > 1:
                 voice_text = f"Hi {greeting_name}. Your check-in is marked successfully."
