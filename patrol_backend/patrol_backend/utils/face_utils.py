@@ -6,7 +6,7 @@ checkin_v4/checkout_v4 return 503 when a location has face attendance enabled.
 """
 import io
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -40,8 +40,21 @@ def is_face_attendance_available() -> bool:
     return _load_face_recognition() is not None
 
 
-def _prepare_face_image_array(image_bytes: bytes, max_width: int = 640):
-    """Downscale large uploads before detection (major speed win for kiosk)."""
+def _apply_exif_orientation(img):
+    """Phones often store portrait JPEGs with EXIF rotation; browsers show upright, raw pixels may not."""
+    try:
+        from PIL import ImageOps
+
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return img
+
+
+def load_image_rgb_array(image_bytes: bytes, max_dimension: Optional[int] = None) -> Optional[np.ndarray]:
+    """
+    Decode upload to RGB numpy array with EXIF orientation applied.
+    Optionally downscale so longest side <= max_dimension (keeps kiosk fast).
+    """
     fr = _load_face_recognition()
     if not fr or not image_bytes:
         return None
@@ -49,14 +62,77 @@ def _prepare_face_image_array(image_bytes: bytes, max_width: int = 640):
         from PIL import Image
 
         with Image.open(io.BytesIO(image_bytes)) as img:
+            img = _apply_exif_orientation(img)
             img = img.convert("RGB")
             w, h = img.size
-            if w > max_width and w > 0:
-                new_h = max(1, int(h * (max_width / float(w))))
-                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+            if max_dimension and max(w, h) > max_dimension and max(w, h) > 0:
+                scale = max_dimension / float(max(w, h))
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             return np.asarray(img)
-    except Exception:
-        return fr.load_image_file(io.BytesIO(image_bytes))
+    except Exception as exc:
+        logger.warning("load_image_rgb_array failed, fallback to face_recognition loader: %s", exc)
+        try:
+            return fr.load_image_file(io.BytesIO(image_bytes))
+        except Exception:
+            return None
+
+
+def _encoding_from_image(
+    image: np.ndarray,
+    *,
+    upsample: int,
+    num_jitters: int,
+) -> Optional[np.ndarray]:
+    fr = _load_face_recognition()
+    if fr is None or image is None:
+        return None
+    locations = fr.face_locations(image, number_of_times_to_upsample=max(0, int(upsample)))
+    if not locations:
+        return None
+    encodings = fr.face_encodings(image, locations, num_jitters=max(0, int(num_jitters)))
+    if not encodings:
+        return None
+    return encodings[0]
+
+
+def _kiosk_detect_attempts() -> List[Tuple[Optional[int], int, int]]:
+    """
+    Ordered (max_dimension, upsample, num_jitters) attempts.
+    Fast first; retry with stronger detect if settings allow.
+    """
+    from django.conf import settings
+
+    max_w = int(getattr(settings, "FACE_KIOSK_MAX_IMAGE_WIDTH", 640))
+    upsample = int(getattr(settings, "FACE_KIOSK_UPSAMPLE", 0))
+    num_jitters = int(getattr(settings, "FACE_KIOSK_NUM_JITTERS", 0))
+    attempts = [(max_w, upsample, num_jitters)]
+
+    if not getattr(settings, "FACE_KIOSK_DETECT_RETRY", True):
+        return attempts
+
+    retry_upsample = int(getattr(settings, "FACE_KIOSK_RETRY_UPSAMPLE", 1))
+    retry_max = int(getattr(settings, "FACE_KIOSK_RETRY_MAX_IMAGE_WIDTH", 1280))
+    retry_jitters = int(getattr(settings, "FACE_KIOSK_RETRY_NUM_JITTERS", 1))
+
+    if (retry_upsample, retry_max, retry_jitters) != (upsample, max_w, num_jitters):
+        attempts.append((retry_max, retry_upsample, retry_jitters))
+
+    # Last resort: full resolution + stronger upsample (some devices only work here).
+    full_max = int(getattr(settings, "FACE_KIOSK_FULL_MAX_IMAGE_WIDTH", 0)) or None
+    full_upsample = int(getattr(settings, "FACE_KIOSK_FULL_UPSAMPLE", 1))
+    if full_max is not None or full_upsample > retry_upsample:
+        attempts.append((full_max, full_upsample, retry_jitters))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for item in attempts:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
 
 
 def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.ndarray]:
@@ -66,25 +142,23 @@ def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.
         return None
     try:
         if fast:
-            from django.conf import settings
-
-            max_w = int(getattr(settings, "FACE_KIOSK_MAX_IMAGE_WIDTH", 640))
-            num_jitters = int(getattr(settings, "FACE_KIOSK_NUM_JITTERS", 0))
-            upsample = int(getattr(settings, "FACE_KIOSK_UPSAMPLE", 0))
-            image = _prepare_face_image_array(image_bytes, max_width=max_w)
-            if image is None:
-                return None
-            locations = fr.face_locations(image, number_of_times_to_upsample=upsample)
-            if not locations:
-                return None
-            encodings = fr.face_encodings(image, locations, num_jitters=num_jitters)
-        else:
-            image = fr.load_image_file(io.BytesIO(image_bytes))
-            encodings = fr.face_encodings(image)
-        if not encodings:
-            logger.info("No face found in image.")
+            for max_dim, upsample, num_jitters in _kiosk_detect_attempts():
+                image = load_image_rgb_array(image_bytes, max_dimension=max_dim)
+                if image is None:
+                    continue
+                enc = _encoding_from_image(image, upsample=upsample, num_jitters=num_jitters)
+                if enc is not None:
+                    return enc
+            logger.info("No face found in kiosk image after all detect attempts.")
             return None
-        return encodings[0]
+
+        image = load_image_rgb_array(image_bytes, max_dimension=None)
+        if image is None:
+            return None
+        enc = _encoding_from_image(image, upsample=1, num_jitters=1)
+        if enc is None:
+            logger.info("No face found in image.")
+        return enc
     except Exception as e:
         logger.exception("get_face_encoding failed: %s", e)
         return None

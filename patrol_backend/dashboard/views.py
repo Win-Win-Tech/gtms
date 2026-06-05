@@ -253,6 +253,104 @@ def _attendance_v3_shift_window_utc(shift_start_date, shift, user_tz, location_i
     search_end_utc = (shift_end_dt_user + timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
     return search_start_utc, search_end_utc, shift_start_dt_user, shift_end_dt_user, grace_minutes
 
+
+def _pick_closest_assignment_for_calendar_day(assignments, today, user_tz, user_now):
+    """
+    Same selection as shift_today_v3 when shift is scheduled today but not in active window.
+    Picks assignment whose shift start today is closest to now (handles day + overnight).
+    """
+    best = None
+    best_distance = None
+    for assgn in assignments:
+        shift = assgn.shift
+        if not shift:
+            continue
+        shift_start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
+        shift_start_local = to_user_timezone(shift_start_dt, user_tz)
+        distance_seconds = abs((shift_start_local - user_now).total_seconds())
+        if best_distance is None or distance_seconds < best_distance:
+            best_distance = distance_seconds
+            best = assgn
+    return best
+
+
+def _kiosk_shift_gate_response(user, org_location, greeting_name, user_tz):
+    """
+    Kiosk face_attendance: explain why punch is blocked when get_today_assignment_v2
+    returned nothing for this location. Aligned with shift_today_v3 (end_date >= today).
+    Overnight shifts use _attendance_v3_shift_window_utc for window boundaries.
+    Returns a DRF Response or None (caller should treat None as no_shift_today).
+    """
+    today = get_user_today(user_tz)
+    user_now = get_user_now(user_tz)
+    loc_id = getattr(org_location, "id", None)
+
+    candidates = list(
+        Assignment.objects.filter(
+            guard_id=user.id,
+            location_id=loc_id,
+            start_date__lte=today,
+            end_date__gte=today,
+        ).select_related("shift", "location")
+    )
+    if not candidates:
+        return None
+
+    scheduled = _pick_closest_assignment_for_calendar_day(candidates, today, user_tz, user_now)
+    if not scheduled or not scheduled.shift:
+        return None
+
+    shift = scheduled.shift
+    shift_start_date = today
+    _, _, shift_start_dt_user, shift_end_dt_user, grace_minutes = _attendance_v3_shift_window_utc(
+        shift_start_date,
+        shift,
+        user_tz,
+        location_id=loc_id,
+    )
+    window_start = shift_start_dt_user - timedelta(minutes=grace_minutes)
+    window_end = shift_end_dt_user + timedelta(minutes=grace_minutes)
+
+    if user_now < window_start:
+        return Response(
+            {
+                "success": False,
+                "code": "shift_not_started_yet",
+                "message": (
+                    f"Hi {greeting_name}, your shift starts at {shift_start_dt_user.strftime('%I:%M %p')}. "
+                    f"You can check-in from {window_start.strftime('%I:%M %p')} (grace {grace_minutes} minutes)."
+                ),
+                "user_id": str(user.id),
+                "has_shift": True,
+                "shift_start_time": shift_start_dt_user.strftime("%I:%M %p"),
+                "allowed_from": window_start.strftime("%I:%M %p"),
+                "grace_minutes": grace_minutes,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    if user_now > window_end:
+        return Response(
+            {
+                "success": False,
+                "code": "shift_window_closed",
+                "message": (
+                    f"Hi {greeting_name}, your shift time is {shift_start_dt_user.strftime('%I:%M %p')} "
+                    f"to {shift_end_dt_user.strftime('%I:%M %p')}. "
+                    f"You cannot punch now. Please contact admin."
+                ),
+                "user_id": str(user.id),
+                "has_shift": True,
+                "shift_start_time": shift_start_dt_user.strftime("%I:%M %p"),
+                "shift_end_time": shift_end_dt_user.strftime("%I:%M %p"),
+                "grace_minutes": grace_minutes,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    return None
+
+
 def _shift_required_duration_minutes(shift):
     """Scheduled shift length in minutes (supports overnight shifts)."""
     if not shift:
@@ -482,9 +580,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
     # ===== V2 APIs (enhanced with overnight shift + auto-assignment support) =====
 
-    def get_today_assignment_v2(self, user, request=None):
+    def get_today_assignment_v2(self, user, request=None, location_id=None):
         """V2: Enhanced assignment lookup with overnight shift support.
            Returns a tuple: (assignment, logical_start_date)
+
+           Optional location_id scopes to one org (kiosk / site-specific punch).
         """
         if request:
             user_tz = get_user_timezone_from_request(request)
@@ -502,6 +602,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             start_date__lte=today,
             end_date__gte=yesterday
         ).select_related('shift', 'location')
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
         
         # Find the active shift instance
         for assignment in assignments:
@@ -2122,88 +2224,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             return _fmt_duration(m)
 
         user_tz = get_user_timezone(user)
-        assignment, shift_start_date = self.get_today_assignment_v2(user, request=None)
-        if not assignment or getattr(assignment, "location_id", None) != getattr(org_location, "id", None):
-            # If there is an assignment today but it is not currently within the active/grace window,
-            # return an actionable message instead of generic no_shift_today.
-            try:
-                today = get_user_today(user_tz)
-                yesterday = today - timedelta(days=1)
-                any_assignment = (
-                    Assignment.objects.filter(
-                        guard_id=user.id,
-                        location_id=getattr(org_location, "id", None),
-                        start_date__lte=today,
-                        end_date__gte=yesterday,
-                    )
-                    .select_related("shift", "location")
-                    .order_by("start_date")
-                    .first()
-                )
-                if any_assignment and any_assignment.shift:
-                    shift = any_assignment.shift
-                    is_overnight = shift.end_time <= shift.start_time
-                    grace_minutes = _get_site_setting_int(
-                        key="shift_grace_time",
-                        location_id=getattr(any_assignment, "location_id", None)
-                        or getattr(user, "location_id", None),
-                        default_value=30,
-                    )
-                    user_now = get_user_now(user_tz)
-
-                    if is_overnight:
-                        # Next shift window (starting today)
-                        start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                        end_dt = combine_date_time_in_user_tz(today + timedelta(days=1), shift.end_time, user_tz)
-                    else:
-                        start_dt = combine_date_time_in_user_tz(today, shift.start_time, user_tz)
-                        end_dt = combine_date_time_in_user_tz(today, shift.end_time, user_tz)
-
-                    window_start = start_dt - timedelta(minutes=grace_minutes)
-                    window_end = end_dt + timedelta(minutes=grace_minutes)
-                    # combine_date_time_in_user_tz returns UTC; convert back for display.
-                    start_dt_user = to_user_timezone(start_dt, user_tz)
-                    end_dt_user = to_user_timezone(end_dt, user_tz)
-                    window_start_user = to_user_timezone(window_start, user_tz)
-                    window_end_user = to_user_timezone(window_end, user_tz)
-
-                    if user_now < window_start:
-                        return Response(
-                            {
-                                "success": False,
-                                "code": "shift_not_started_yet",
-                                "message": (
-                                    f"Hi {greeting_name}, your shift starts at {start_dt_user.strftime('%I:%M %p')}. "
-                                    f"You can check-in from {window_start_user.strftime('%I:%M %p')} (grace {grace_minutes} minutes)."
-                                ),
-                                "user_id": str(user.id),
-                                "has_shift": True,
-                                "shift_start_time": start_dt_user.strftime("%I:%M %p"),
-                                "allowed_from": window_start_user.strftime("%I:%M %p"),
-                                "grace_minutes": grace_minutes,
-                            },
-                            status=status.HTTP_200_OK,
-                        )
-
-                    if user_now > window_end:
-                        return Response(
-                            {
-                                "success": False,
-                                "code": "shift_window_closed",
-                                "message": (
-                                    f"Hi {greeting_name}, your shift time is {start_dt_user.strftime('%I:%M %p')} to {end_dt_user.strftime('%I:%M %p')}. "
-                                    f"You cannot punch now. Please contact admin."
-                                ),
-                                "user_id": str(user.id),
-                                "has_shift": True,
-                                "shift_start_time": start_dt_user.strftime("%I:%M %p"),
-                                "shift_end_time": end_dt_user.strftime("%I:%M %p"),
-                                "grace_minutes": grace_minutes,
-                            },
-                            status=status.HTTP_200_OK,
-                        )
-            except Exception:
-                pass
+        kiosk_loc_id = getattr(org_location, "id", None)
+        assignment, shift_start_date = self.get_today_assignment_v2(
+            user, request=None, location_id=kiosk_loc_id
+        )
+        if not assignment:
+            gate_response = _kiosk_shift_gate_response(
+                user, org_location, greeting_name, user_tz
+            )
+            if gate_response is not None:
+                return gate_response
             return Response(
                 {
                     "success": False,
