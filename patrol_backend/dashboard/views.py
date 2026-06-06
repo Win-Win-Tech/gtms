@@ -2269,6 +2269,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             latest_checkin, latest_checkout, has_open_session = get_kiosk_session_state(
                 user, assignment, shift, org_location, search_start_utc, search_end_utc
             )
+            defer_refresh = getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", False)
             try:
                 action_mode, attendance, log, status_code = kiosk_apply_punch(
                     user=user,
@@ -2283,9 +2284,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     img_name=img_name,
                     search_start_utc=search_start_utc,
                     search_end_utc=search_end_utc,
+                    user_tz=user_tz,
                     latest_checkin=latest_checkin,
                     latest_checkout=latest_checkout,
                     has_open_session=has_open_session,
+                    refresh_fn=None if defer_refresh else _attendance_v3_refresh_saved_fields,
                 )
             except CheckoutTooEarly as exc:
                 return _kiosk_error(
@@ -2299,7 +2302,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-            if getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", True):
+            if defer_refresh:
                 defer_attendance_v3_refresh(
                     _attendance_v3_refresh_saved_fields,
                     attendance,
@@ -2309,10 +2312,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     org_location,
                     search_start_utc,
                     search_end_utc,
-                )
-            else:
-                _attendance_v3_refresh_saved_fields(
-                    attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
                 )
 
             event_user = to_user_timezone(log.timestamp, user_tz)
