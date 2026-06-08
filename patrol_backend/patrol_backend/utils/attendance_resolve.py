@@ -16,9 +16,20 @@ import logging
 from typing import Any, Callable, Dict, Optional
 
 from django.core.files.base import ContentFile
+from django.db import IntegrityError
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _attendance_shift_day_filter(user, assignment, shift, org_location, shift_start_date):
+    return {
+        "guard": user,
+        "assignment": assignment,
+        "shift": shift,
+        "org_location": org_location,
+        "shift_date": shift_start_date,
+    }
 
 
 def get_or_create_attendance_for_shift_day(
@@ -31,15 +42,43 @@ def get_or_create_attendance_for_shift_day(
     """One row per logical shift day — keyed by shift_date (matches checkin_v3/v4)."""
     from dashboard.models import AttendanceCheckin
 
+    filt = _attendance_shift_day_filter(
+        user, assignment, shift, org_location, shift_start_date
+    )
     attendance, _ = AttendanceCheckin.objects.get_or_create(
-        guard=user,
-        assignment=assignment,
-        shift=shift,
-        org_location=org_location,
-        shift_date=shift_start_date,
+        **filt,
         defaults={"created_on": timezone.now()},
     )
     return attendance
+
+
+def lock_or_create_attendance_for_shift_day(
+    user,
+    assignment,
+    shift,
+    org_location,
+    shift_start_date,
+):
+    """
+    Lock the attendance row for this guard/shift day (serializes concurrent kiosk punches).
+    Scoped per guard — different users never block each other.
+    Must be called inside transaction.atomic().
+    """
+    from dashboard.models import AttendanceCheckin
+
+    filt = _attendance_shift_day_filter(
+        user, assignment, shift, org_location, shift_start_date
+    )
+    attendance = AttendanceCheckin.objects.select_for_update().filter(**filt).first()
+    if attendance:
+        return attendance
+    try:
+        return AttendanceCheckin.objects.create(
+            **filt,
+            created_on=timezone.now(),
+        )
+    except IntegrityError:
+        return AttendanceCheckin.objects.select_for_update().get(**filt)
 
 
 def build_log_window_filter(

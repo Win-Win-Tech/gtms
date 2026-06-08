@@ -2262,13 +2262,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 CheckoutTooEarly,
                 build_kiosk_light_payload,
                 defer_attendance_v3_refresh,
-                get_kiosk_session_state,
                 kiosk_apply_punch,
             )
 
-            latest_checkin, latest_checkout, has_open_session = get_kiosk_session_state(
-                user, assignment, shift, org_location, search_start_utc, search_end_utc
-            )
             defer_refresh = getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", False)
             try:
                 action_mode, attendance, log, status_code = kiosk_apply_punch(
@@ -2285,9 +2281,6 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     search_start_utc=search_start_utc,
                     search_end_utc=search_end_utc,
                     user_tz=user_tz,
-                    latest_checkin=latest_checkin,
-                    latest_checkout=latest_checkout,
-                    has_open_session=has_open_session,
                     refresh_fn=None if defer_refresh else _attendance_v3_refresh_saved_fields,
                 )
             except CheckoutTooEarly as exc:

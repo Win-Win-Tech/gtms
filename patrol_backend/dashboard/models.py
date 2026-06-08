@@ -117,7 +117,17 @@ class AttendanceCheckin(models.Model):
 
     def _str_(self):
         return f"{self.guard} - {self.shift} [{self.status}]"
-    
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["guard", "assignment", "shift", "org_location", "shift_date"],
+                condition=models.Q(shift_date__isnull=False),
+                name="uniq_attendance_guard_shift_day",
+            ),
+        ]
+
+
 class CheckInLog(models.Model):
     guard = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     assignment = models.ForeignKey("scheduler.Assignment", on_delete=models.CASCADE)

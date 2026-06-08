@@ -231,6 +231,8 @@ FACE_KIOSK_NUM_JITTERS = 0
 FACE_KIOSK_UPSAMPLE = 0
 FACE_KIOSK_LIGHT_RESPONSE = True
 FACE_KIOSK_DEFER_METRICS_REFRESH = False
+# Ignore duplicate kiosk scans for the same guard within N seconds (one row / one log).
+FACE_KIOSK_DUPLICATE_PUNCH_SECONDS = 15
 # If fast detect fails (common on some phones: EXIF/glare/tilt), retry stronger detect
 FACE_KIOSK_DETECT_RETRY = True
 FACE_KIOSK_RETRY_UPSAMPLE = 1
