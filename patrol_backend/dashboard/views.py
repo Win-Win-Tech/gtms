@@ -6112,6 +6112,46 @@ class AttendanceCheckinV4ExportView(APIView):
             return Response({"error": f"Failed to generate v4 report: {str(e)}"}, status=500)
 
 
+class AttendanceCheckinV4PdfExportView(APIView):
+    """Daily attendance detail summary PDF (landscape). Same filters as export_v4."""
+
+    def get(self, request):
+        from dashboard.attendance_detail_pdf import generate_attendance_v4_pdf_report_internal
+
+        params = request.query_params
+        try:
+            result = generate_attendance_v4_pdf_report_internal(
+                date_filter=params.get("date_filter", "today"),
+                start_date=params.get("start_date"),
+                end_date=params.get("end_date"),
+                guard_id=params.get("guard"),
+                location_id=params.get("location"),
+                shift_id=params.get("shift"),
+                status_filter=params.get("status"),
+                defaulters=params.get("defaulters") == "true",
+                request=request,
+                search=params.get("search"),
+                role=params.get("role"),
+                site_id=params.get("site_id"),
+            )
+            content = result.get("pdf_bytes")
+            if not content:
+                with open(result["file_path"], "rb") as f:
+                    content = f.read()
+            response = HttpResponse(content, content_type="application/pdf")
+            if params.get("date_filter") == "custom" and params.get("start_date"):
+                fname = f"attendance_detail_{params.get('start_date')}_{params.get('end_date', '')}.pdf"
+            else:
+                fname = f"attendance_detail_{timezone.now().strftime('%Y%m%d')}.pdf"
+            response["Content-Disposition"] = f'attachment; filename="{fname}"'
+            return response
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        except Exception as e:
+            logger.error(f"[ATTENDANCE_EXPORT_V4_PDF] Exception: {str(e)}", exc_info=True)
+            return Response({"error": f"Failed to generate PDF report: {str(e)}"}, status=500)
+
+
 def _append_monthly_day_totals(row, date_range):
     """
     Count summary days from daily cells:

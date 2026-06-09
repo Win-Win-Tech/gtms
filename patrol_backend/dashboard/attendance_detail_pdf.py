@@ -1,0 +1,345 @@
+"""
+Daily Attendance Detail Summary Report — landscape PDF (reportlab).
+Multiple employees per page; bold emp header + summary (reference layout).
+"""
+from __future__ import annotations
+
+import os
+from io import BytesIO
+
+from django.conf import settings
+from django.utils import timezone
+
+from dashboard.attendance_export_data import gather_attendance_v4_export_context, group_detail_rows_by_employee
+
+
+def _fmt_report_date(d):
+    if not d:
+        return ""
+    return d.strftime("%b %d %Y")
+
+
+def _duration_hrs_min(hhmm: str) -> str:
+    """01:08 -> 1 Hrs 8 Min"""
+    if not hhmm or hhmm == "00:00":
+        return "0 Hrs 0 Min"
+    try:
+        parts = str(hhmm).split(":")
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        return f"{h} Hrs {m} Min"
+    except (ValueError, IndexError):
+        return "0 Hrs 0 Min"
+
+
+def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        KeepTogether,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    def _para_style(name, **kwargs):
+        base = dict(
+            leftIndent=0,
+            rightIndent=0,
+            firstLineIndent=0,
+            spaceBefore=0,
+            spaceAfter=0,
+        )
+        base.update(kwargs)
+        return ParagraphStyle(name, **base)
+
+    def _full_width(flowable):
+        """Force flowable to start at the left content edge (full frame width)."""
+        t = Table([[flowable]], colWidths=[content_width])
+        t.setStyle(
+            TableStyle(
+                [
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 0),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        t.hAlign = "LEFT"
+        return t
+
+    buffer = BytesIO()
+    page_w, _page_h = landscape(A4)
+    left_margin = 0.2 * inch
+    right_margin = 0.2 * inch
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=left_margin,
+        rightMargin=right_margin,
+        topMargin=0.35 * inch,
+        bottomMargin=0.35 * inch,
+    )
+    content_width = doc.width
+    styles = getSampleStyleSheet()
+    title_style = _para_style(
+        "ReportTitle",
+        parent=styles["Normal"],
+        fontSize=11,
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+        spaceAfter=2,
+    )
+    date_style = _para_style(
+        "ReportDate",
+        parent=styles["Normal"],
+        fontSize=9,
+        alignment=TA_CENTER,
+        spaceAfter=6,
+    )
+    meta_style = _para_style(
+        "ReportMeta",
+        parent=styles["Normal"],
+        fontSize=9,
+        fontName="Helvetica-Bold",
+        alignment=TA_LEFT,
+        leading=11,
+    )
+    meta_right_style = _para_style(
+        "ReportMetaRight",
+        parent=meta_style,
+        alignment=TA_RIGHT,
+    )
+    emp_line_style = _para_style(
+        "EmpLine",
+        parent=styles["Normal"],
+        fontSize=10,
+        fontName="Helvetica-Bold",
+        alignment=TA_LEFT,
+        leading=12,
+        spaceAfter=2,
+    )
+    summary_style = _para_style(
+        "SummaryBold",
+        parent=styles["Normal"],
+        fontSize=9,
+        fontName="Helvetica-Bold",
+        alignment=TA_LEFT,
+        leading=11,
+        spaceBefore=2,
+    )
+    cell_style = _para_style(
+        "TableCellBold",
+        parent=styles["Normal"],
+        fontSize=9,
+        fontName="Helvetica-Bold",
+        alignment=TA_LEFT,
+        leading=11,
+    )
+    punch_style = _para_style(
+        "PunchCellBold",
+        parent=styles["Normal"],
+        fontSize=8,
+        fontName="Helvetica-Bold",
+        alignment=TA_LEFT,
+        leading=10,
+    )
+
+    range_start = context.get("range_start")
+    range_end = context.get("range_end")
+    printed_at = context.get("printed_at")
+    org_name = context.get("org_name") or "—"
+    dept_label = context.get("dept_name") or org_name or "—"
+
+    story = []
+    story.append(Paragraph("Daily Attendance Report(Detailed Summary Report)", title_style))
+    story.append(
+        Paragraph(
+            f"{_fmt_report_date(range_start)} To {_fmt_report_date(range_end)}",
+            date_style,
+        )
+    )
+
+    printed_text = ""
+    if printed_at:
+        printed_text = f"Printed On : {printed_at.strftime('%b %d %Y %H:%M')}"
+    header_meta = Table(
+        [
+            [
+                Paragraph(f"Company &nbsp; {org_name}", meta_style),
+                Paragraph(printed_text, meta_right_style),
+            ],
+            [Paragraph(f"Department &nbsp; {dept_label}", meta_style), ""],
+        ],
+        colWidths=[content_width * 0.55, content_width * 0.45],
+    )
+    header_meta.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
+    header_meta.hAlign = "LEFT"
+    story.append(header_meta)
+    story.append(Spacer(1, 8))
+
+    col_headers = [
+        "Att. Date",
+        "InTime",
+        "OutTime",
+        "Shift",
+        "S. InTime",
+        "S. OutTime",
+        "Work Dur.",
+        "Tot. Dur.",
+        "Status",
+        "Punch Records",
+    ]
+    col_ratios = [0.09, 0.06, 0.06, 0.08, 0.06, 0.06, 0.07, 0.07, 0.11, 0.34]
+    ratio_sum = sum(col_ratios)
+    col_widths = [content_width * (r / ratio_sum) for r in col_ratios]
+
+    data_table_style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9E1F2")),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 10),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("ALIGN", (0, 1), (-1, -1), "LEFT"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ]
+    )
+
+    for group in employee_groups:
+        block = []
+        emp_code = group.get("emp_code") or "—"
+        emp_name = group.get("emp_name") or "—"
+        block.append(
+            _full_width(
+                Paragraph(
+                    f"Emp Code: {emp_code} &nbsp;&nbsp;&nbsp;&nbsp; "
+                    f"Employee Name: {emp_name}",
+                    emp_line_style,
+                )
+            )
+        )
+
+        def _cell(text):
+            if not text:
+                return ""
+            return Paragraph(str(text).replace("&", "&amp;"), cell_style)
+
+        table_data = [col_headers]
+        for row in group.get("rows") or []:
+            punch = row.get("punch_records") or ""
+            punch_para = (
+                Paragraph(punch.replace("&", "&amp;"), punch_style) if punch else ""
+            )
+            table_data.append(
+                [
+                    _cell(row.get("att_date_display") or ""),
+                    _cell(row.get("in_time") or ""),
+                    _cell(row.get("out_time") or ""),
+                    _cell(row.get("shift_name") or ""),
+                    _cell(row.get("sched_in") or ""),
+                    _cell(row.get("sched_out") or ""),
+                    _cell(row.get("work_dur") or "00:00"),
+                    _cell(row.get("tot_dur") or "00:00"),
+                    _cell(row.get("status") or ""),
+                    punch_para,
+                ]
+            )
+
+        tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+        tbl.setStyle(data_table_style)
+        tbl.hAlign = "LEFT"
+        block.append(_full_width(tbl))
+
+        present_days = group.get("present_days", 0)
+        present_display = (
+            str(int(present_days))
+            if present_days == int(present_days)
+            else f"{present_days:.1f}"
+        )
+        total_dur = _duration_hrs_min(group.get("total_duration") or "00:00")
+        block.append(
+            _full_width(
+                Paragraph(
+                    f"Total Duration={total_dur} , "
+                    f"PresentDays={present_display} , "
+                    "Leaves=0 , Holiday=0 , "
+                    f"AbsentDays={int(group.get('absent_days') or 0)} , "
+                    "Weekly Off =0",
+                    summary_style,
+                )
+            )
+        )
+        block.append(Spacer(1, 10))
+        story.append(KeepTogether(block))
+
+    if not employee_groups:
+        story.append(Paragraph("No attendance records for the selected filters.", meta_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def generate_attendance_v4_pdf_report_internal(
+    date_filter="today",
+    start_date=None,
+    end_date=None,
+    guard_id=None,
+    location_id=None,
+    shift_id=None,
+    status_filter=None,
+    defaulters=False,
+    request=None,
+    search=None,
+    role=None,
+    site_id=None,
+):
+    context = gather_attendance_v4_export_context(
+        date_filter=date_filter,
+        start_date=start_date,
+        end_date=end_date,
+        guard_id=guard_id,
+        location_id=location_id,
+        shift_id=shift_id,
+        status_filter=status_filter,
+        defaulters=defaulters,
+        request=request,
+        search=search,
+        role=role,
+        site_id=site_id,
+    )
+    employee_groups = group_detail_rows_by_employee(context["detail_rows"])
+    pdf_bytes = build_daily_attendance_detail_pdf_bytes(context, employee_groups)
+    filename = f"attendance_detail_{timezone.now().strftime('%Y%m%d%H%M%S')}.pdf"
+    file_path = os.path.join(settings.MEDIA_ROOT, filename)
+    os.makedirs(settings.MEDIA_ROOT, exist_ok=True)
+    with open(file_path, "wb") as fh:
+        fh.write(pdf_bytes)
+    return {
+        "file_path": file_path,
+        "filename": filename,
+        "row_count": context["row_count"],
+        "pdf_bytes": pdf_bytes,
+    }

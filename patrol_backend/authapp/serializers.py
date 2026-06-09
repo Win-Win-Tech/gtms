@@ -60,6 +60,9 @@ class UserSerializer(serializers.ModelSerializer):
         return user
 
     def update(self, instance, validated_data):
+        old_location_id = (
+            str(instance.location_id) if getattr(instance, "location_id", None) else None
+        )
         location_id = validated_data.pop('locationId', None)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
