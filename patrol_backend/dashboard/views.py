@@ -2186,9 +2186,23 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if not matched_user_id:
             if face_code == "face_not_detected":
                 return _kiosk_error("face_not_detected", "No face found in uploaded image")
+            if face_code == "multiple_faces_detected":
+                return _kiosk_error(
+                    "multiple_faces_detected",
+                    "Multiple faces detected. Only one person should stand in front of the camera.",
+                )
+            if face_code == "ambiguous_match":
+                return _kiosk_error(
+                    "ambiguous_match",
+                    "Face match is unclear. Please stand still, look at the camera directly, and try again.",
+                )
             if face_code == "no_enrolled_faces":
                 return _kiosk_error("no_enrolled_faces", "No enrolled face users found for this location")
-            return _kiosk_error("face_not_matched", "Face does not match any enrolled user")
+            return _kiosk_error(
+                "face_not_matched",
+                "Face does not match any enrolled user. If your appearance changed (e.g. haircut), "
+                "ask admin to update your profile face photo.",
+            )
 
         user = User.objects.filter(id=matched_user_id, is_deleted=False, is_active=True).first()
         if not user:

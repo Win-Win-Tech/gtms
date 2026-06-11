@@ -12,13 +12,18 @@ from math import sqrt
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from django.conf import settings
 
 from authapp.models import User
 from patrol_backend.utils.face_identify_log import save_face_identify_error_image
 from patrol_backend.utils.face_utils import (
-    DEFAULT_FACE_TOLERANCE,
+    IdentifyFrameResult,
     bytes_to_encoding,
-    get_face_encoding_kiosk,
+    extract_identify_frame,
+    get_identify_min_margin,
+    get_identify_tolerance,
+    get_identify_tolerance_strict,
+    get_identify_top_k,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,41 +145,159 @@ def _identify_fail(
     return None, code, distance
 
 
+def _search_top_k(
+    entry: FaceLocationIndex,
+    query: np.ndarray,
+    k: int,
+) -> List[Tuple[str, float]]:
+    """Return [(user_id, distance), ...] sorted best-first."""
+    n = int(entry.vectors32.shape[0])
+    if n <= 0:
+        return []
+    k = min(max(1, int(k)), n)
+    if entry.faiss_index is not None:
+        dists2, idxs = entry.faiss_index.search(query, k)
+        results: List[Tuple[str, float]] = []
+        for i in range(k):
+            idx = int(idxs[0][i])
+            if idx < 0 or idx >= len(entry.user_ids):
+                continue
+            dist = float(sqrt(float(dists2[0][i])))
+            results.append((entry.user_ids[idx], dist))
+        return results
+
+    deltas = entry.vectors32 - query
+    d2 = np.sum(deltas * deltas, axis=1)
+    order = np.argsort(d2)[:k]
+    return [
+        (entry.user_ids[int(i)], float(sqrt(float(d2[int(i)]))))
+        for i in order
+    ]
+
+
+def _evaluate_ranked(
+    ranked: List[Tuple[str, float]],
+    tolerance: float,
+    min_margin: float,
+) -> Tuple[str, Optional[str], Optional[float]]:
+    """
+    Returns (verdict, user_id, distance).
+    verdict: ok | over_tolerance | ambiguous | no_match
+    """
+    if not ranked:
+        return "no_match", None, None
+
+    best_user_id, best_dist = ranked[0]
+    if best_dist > tolerance:
+        return "over_tolerance", best_user_id, best_dist
+
+    if len(ranked) >= 2:
+        second_user_id, second_dist = ranked[1]
+        margin = second_dist - best_dist
+        if second_user_id != best_user_id and margin < min_margin:
+            return "ambiguous", best_user_id, best_dist
+
+    return "ok", best_user_id, best_dist
+
+
+def _match_from_frame(
+    entry: FaceLocationIndex,
+    frame: IdentifyFrameResult,
+    top_k: int,
+    tolerance: float,
+    min_margin: float,
+) -> Tuple[str, Optional[str], Optional[float]]:
+    if frame.encoding is None:
+        return "no_face", None, None
+
+    query = np.asarray(frame.encoding, dtype=np.float32).reshape(1, -1)
+    ranked = _search_top_k(entry, query, top_k)
+    return _evaluate_ranked(ranked, tolerance, min_margin)
+
+
+def _should_quality_retry(verdict: str, distance: Optional[float], relaxed_tol: float) -> bool:
+    if not getattr(settings, "FACE_IDENTIFY_QUALITY_RETRY", True):
+        return False
+    if verdict == "no_face":
+        return True
+    if verdict == "ambiguous":
+        return True
+    if verdict == "over_tolerance" and distance is not None and distance <= relaxed_tol + 0.08:
+        return True
+    return False
+
+
 def identify_user_in_location(
     location_id: str,
     live_image_bytes: bytes,
-    tolerance: float = DEFAULT_FACE_TOLERANCE,
+    tolerance: Optional[float] = None,
 ) -> Tuple[Optional[str], str, Optional[float]]:
     """
     Returns (matched_user_id, code, distance):
-    - code: success | face_not_detected | no_enrolled_faces | face_not_matched
+    - code: success | face_not_detected | multiple_faces_detected |
+            no_enrolled_faces | ambiguous_match | face_not_matched
 
-    Failed identification images are stored under media/logphoto/{date}/{location_id}/.
+    Fast path first (~1s); quality retry only for borderline / no-face cases.
     """
     loc = str(location_id)
-    live = get_face_encoding_kiosk(live_image_bytes)
-    if live is None:
-        return _identify_fail(loc, "face_not_detected", live_image_bytes)
+    relaxed_tol = float(tolerance if tolerance is not None else get_identify_tolerance())
+    strict_tol = get_identify_tolerance_strict()
+    min_margin = get_identify_min_margin()
+    top_k = get_identify_top_k()
+    reject_multi = getattr(settings, "FACE_IDENTIFY_REJECT_MULTIPLE_FACES", True)
 
     entry = get_or_rebuild_location_index(loc)
     if entry.vectors32.shape[0] == 0:
         return _identify_fail(loc, "no_enrolled_faces", live_image_bytes)
 
-    query = np.asarray(live, dtype=np.float32).reshape(1, -1)
-    if entry.faiss_index is not None:
-        dists2, idxs = entry.faiss_index.search(query, 1)
-        best_idx = int(idxs[0][0])
-        if best_idx < 0 or best_idx >= len(entry.user_ids):
-            return _identify_fail(loc, "face_not_matched", live_image_bytes)
-        dist = float(sqrt(float(dists2[0][0])))
-    else:
-        # Fallback: linear L2 distance (same metric as face_recognition distance).
-        deltas = entry.vectors32 - query
-        d2 = np.sum(deltas * deltas, axis=1)
-        best_idx = int(np.argmin(d2))
-        dist = float(sqrt(float(d2[best_idx])))
+    # --- Tier 1: fast detect (640px, same as kiosk) ---
+    fast_frame = extract_identify_frame(live_image_bytes, use_quality=False)
+    if reject_multi and fast_frame.face_count > 1:
+        logger.info(
+            "Face identify rejected: multiple_faces_detected location=%s count=%s",
+            loc,
+            fast_frame.face_count,
+        )
+        return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
 
-    if dist > float(tolerance):
-        return _identify_fail(loc, "face_not_matched", live_image_bytes, dist)
+    verdict, user_id, dist = _match_from_frame(
+        entry, fast_frame, top_k, strict_tol, min_margin
+    )
+    if verdict == "ok" and user_id:
+        logger.info(
+            "Face identify success (fast) location=%s user=%s dist=%.4f",
+            loc,
+            user_id,
+            dist,
+        )
+        return user_id, "success", dist
 
-    return entry.user_ids[best_idx], "success", dist
+    # --- Tier 2: quality retry for haircut / blur / borderline only ---
+    need_retry = _should_quality_retry(verdict, dist, relaxed_tol)
+    if need_retry:
+        quality_frame = extract_identify_frame(live_image_bytes, use_quality=True)
+        if reject_multi and quality_frame.face_count > 1:
+            return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
+
+        q_verdict, q_user_id, q_dist = _match_from_frame(
+            entry, quality_frame, top_k, relaxed_tol, min_margin
+        )
+        if q_verdict == "ok" and q_user_id:
+            logger.info(
+                "Face identify success (quality) location=%s user=%s dist=%.4f",
+                loc,
+                q_user_id,
+                q_dist,
+            )
+            return q_user_id, "success", q_dist
+        if q_verdict == "ambiguous":
+            return _identify_fail(loc, "ambiguous_match", live_image_bytes, q_dist)
+        if quality_frame.encoding is None and fast_frame.encoding is None:
+            return _identify_fail(loc, "face_not_detected", live_image_bytes)
+        return _identify_fail(loc, "face_not_matched", live_image_bytes, q_dist or dist)
+
+    if fast_frame.encoding is None:
+        return _identify_fail(loc, "face_not_detected", live_image_bytes)
+    if verdict == "ambiguous":
+        return _identify_fail(loc, "ambiguous_match", live_image_bytes, dist)
+    return _identify_fail(loc, "face_not_matched", live_image_bytes, dist)

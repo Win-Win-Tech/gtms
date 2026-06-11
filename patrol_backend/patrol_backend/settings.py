@@ -223,6 +223,17 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 FACE_IDENTIFY_LOG_PHOTOS_ENABLED = True
 FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API response)
+# 1:N kiosk identification — margin check stops wrong-user; tolerance allows haircut/appearance drift
+FACE_IDENTIFY_TOLERANCE = 0.45  # relaxed pass (quality retry / appearance change e.g. haircut)
+FACE_IDENTIFY_TOLERANCE_STRICT = 0.38  # fast-path instant accept when clearly best match
+FACE_IDENTIFY_MIN_MARGIN = 0.055  # best must beat 2nd place (main wrong-user guard)
+FACE_IDENTIFY_TOP_K = 5
+FACE_IDENTIFY_REJECT_MULTIPLE_FACES = True
+# Quality retry only when fast path is borderline — keeps most punches under ~1s
+FACE_IDENTIFY_QUALITY_RETRY = True
+FACE_IDENTIFY_MAX_IMAGE_WIDTH = 960
+FACE_IDENTIFY_UPSAMPLE = 1
+FACE_IDENTIFY_NUM_JITTERS = 1
 
 # Kiosk face_attendance performance
 FACE_KIOSK_FAST_PATH = True

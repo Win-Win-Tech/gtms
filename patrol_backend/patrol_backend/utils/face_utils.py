@@ -6,14 +6,39 @@ checkin_v4/checkout_v4 return 503 when a location has face attendance enabled.
 """
 import io
 import logging
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Default tolerance for face_recognition.compare_faces (lower stricter)
+# Default tolerance for 1:1 verify (lower = stricter)
 DEFAULT_FACE_TOLERANCE = 0.45
+
+
+def get_identify_tolerance() -> float:
+    from django.conf import settings
+
+    return float(getattr(settings, "FACE_IDENTIFY_TOLERANCE", 0.45))
+
+
+def get_identify_tolerance_strict() -> float:
+    from django.conf import settings
+
+    return float(getattr(settings, "FACE_IDENTIFY_TOLERANCE_STRICT", 0.38))
+
+
+def get_identify_min_margin() -> float:
+    from django.conf import settings
+
+    return float(getattr(settings, "FACE_IDENTIFY_MIN_MARGIN", 0.055))
+
+
+def get_identify_top_k() -> int:
+    from django.conf import settings
+
+    return max(2, int(getattr(settings, "FACE_IDENTIFY_TOP_K", 5)))
 
 _face_recognition = None  # lazy module or None; False = import failed
 _face_recognition_failed = False
@@ -155,7 +180,7 @@ def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.
         image = load_image_rgb_array(image_bytes, max_dimension=None)
         if image is None:
             return None
-        enc = _encoding_from_image(image, upsample=1, num_jitters=1)
+        enc = _encoding_from_image(image, upsample=1, num_jitters=2)
         if enc is None:
             logger.info("No face found in image.")
         return enc
@@ -166,6 +191,53 @@ def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.
 
 def get_face_encoding_kiosk(image_bytes: bytes) -> Optional[np.ndarray]:
     return get_face_encoding(image_bytes, fast=True)
+
+
+@dataclass
+class IdentifyFrameResult:
+    encoding: Optional[np.ndarray]
+    face_count: int = 0
+    tier: str = "fast"
+
+
+def _identify_quality_attempt() -> Tuple[Optional[int], int, int]:
+    from django.conf import settings
+
+    max_w = int(getattr(settings, "FACE_IDENTIFY_MAX_IMAGE_WIDTH", 960))
+    upsample = int(getattr(settings, "FACE_IDENTIFY_UPSAMPLE", 1))
+    num_jitters = int(getattr(settings, "FACE_IDENTIFY_NUM_JITTERS", 1))
+    return max_w, upsample, num_jitters
+
+
+def extract_identify_frame(image_bytes: bytes, *, use_quality: bool = False) -> IdentifyFrameResult:
+    """
+    Single decode + detect pass. Fast tier (~640px) for speed; quality tier for borderline cases.
+    """
+    fr = _load_face_recognition()
+    if not fr or not image_bytes:
+        return IdentifyFrameResult(None, 0, "quality" if use_quality else "fast")
+
+    tier = "quality" if use_quality else "fast"
+    if use_quality:
+        attempts = [_identify_quality_attempt()]
+    else:
+        # Single 640px pass for speed (~1s). Quality tier retries harder cases.
+        kiosk_attempts = _kiosk_detect_attempts()
+        attempts = [kiosk_attempts[0]] if kiosk_attempts else [(640, 0, 0)]
+
+    for max_dim, upsample, num_jitters in attempts:
+        image = load_image_rgb_array(image_bytes, max_dimension=max_dim)
+        if image is None:
+            continue
+        locations = fr.face_locations(image, number_of_times_to_upsample=max(0, int(upsample)))
+        if not locations:
+            continue
+        encodings = fr.face_encodings(image, locations, num_jitters=max(0, int(num_jitters)))
+        if not encodings:
+            continue
+        return IdentifyFrameResult(encodings[0], len(locations), tier)
+
+    return IdentifyFrameResult(None, 0, tier)
 
 
 def encoding_to_bytes(enc: np.ndarray) -> bytes:
