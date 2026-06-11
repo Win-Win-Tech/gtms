@@ -221,7 +221,7 @@ SIMPLE_JWT = {
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-FACE_IDENTIFY_LOG_PHOTOS_ENABLED = True
+FACE_IDENTIFY_LOG_PHOTOS_ENABLED = False
 FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API response)
 # 1:N kiosk identification — margin check stops wrong-user; tolerance allows haircut/appearance drift
 FACE_IDENTIFY_TOLERANCE = 0.45  # relaxed pass (quality retry / appearance change e.g. haircut)
