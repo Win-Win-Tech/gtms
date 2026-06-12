@@ -175,56 +175,45 @@ def _search_top_k(
     ]
 
 
-def _evaluate_ranked(
-    ranked: List[Tuple[str, float]],
-    tolerance: float,
+def _margin_ok(ranked: List[Tuple[str, float]], min_margin: float) -> bool:
+    if len(ranked) < 2:
+        return True
+    best_user_id, best_dist = ranked[0]
+    second_user_id, second_dist = ranked[1]
+    if second_user_id == best_user_id:
+        return True
+    return (second_dist - best_dist) >= min_margin
+
+
+def _match_encoding_tiered(
+    entry: FaceLocationIndex,
+    encoding: Optional[np.ndarray],
+    top_k: int,
+    strict_tol: float,
+    relaxed_tol: float,
     min_margin: float,
-) -> Tuple[str, Optional[str], Optional[float]]:
+) -> Tuple[str, Optional[str], Optional[float], str]:
     """
-    Returns (verdict, user_id, distance).
-    verdict: ok | over_tolerance | ambiguous | no_match
+    One FAISS search; accept strict first, then relaxed on the same vector.
+    Returns (verdict, user_id, distance, tier) where tier is strict|relaxed|none.
     """
+    if encoding is None:
+        return "no_face", None, None, "none"
+
+    query = np.asarray(encoding, dtype=np.float32).reshape(1, -1)
+    ranked = _search_top_k(entry, query, top_k)
     if not ranked:
-        return "no_match", None, None
+        return "no_match", None, None, "none"
 
     best_user_id, best_dist = ranked[0]
-    if best_dist > tolerance:
-        return "over_tolerance", best_user_id, best_dist
+    if not _margin_ok(ranked, min_margin):
+        return "ambiguous", best_user_id, best_dist, "none"
 
-    if len(ranked) >= 2:
-        second_user_id, second_dist = ranked[1]
-        margin = second_dist - best_dist
-        if second_user_id != best_user_id and margin < min_margin:
-            return "ambiguous", best_user_id, best_dist
-
-    return "ok", best_user_id, best_dist
-
-
-def _match_from_frame(
-    entry: FaceLocationIndex,
-    frame: IdentifyFrameResult,
-    top_k: int,
-    tolerance: float,
-    min_margin: float,
-) -> Tuple[str, Optional[str], Optional[float]]:
-    if frame.encoding is None:
-        return "no_face", None, None
-
-    query = np.asarray(frame.encoding, dtype=np.float32).reshape(1, -1)
-    ranked = _search_top_k(entry, query, top_k)
-    return _evaluate_ranked(ranked, tolerance, min_margin)
-
-
-def _should_quality_retry(verdict: str, distance: Optional[float], relaxed_tol: float) -> bool:
-    if not getattr(settings, "FACE_IDENTIFY_QUALITY_RETRY", True):
-        return False
-    if verdict == "no_face":
-        return True
-    if verdict == "ambiguous":
-        return True
-    if verdict == "over_tolerance" and distance is not None and distance <= relaxed_tol + 0.08:
-        return True
-    return False
+    if best_dist <= strict_tol:
+        return "ok", best_user_id, best_dist, "strict"
+    if best_dist <= relaxed_tol:
+        return "ok", best_user_id, best_dist, "relaxed"
+    return "over_tolerance", best_user_id, best_dist, "none"
 
 
 def identify_user_in_location(
@@ -237,7 +226,9 @@ def identify_user_in_location(
     - code: success | face_not_detected | multiple_faces_detected |
             no_enrolled_faces | ambiguous_match | face_not_matched
 
-    Fast path first (~1s); quality retry only for borderline / no-face cases.
+    One fast encode (~1s) + one FAISS search:
+      strict tolerance (0.38) then relaxed (0.45) on same vector, with margin check.
+    Quality encode only when fast detect finds no face.
     """
     loc = str(location_id)
     relaxed_tol = float(tolerance if tolerance is not None else get_identify_tolerance())
@@ -245,59 +236,61 @@ def identify_user_in_location(
     min_margin = get_identify_min_margin()
     top_k = get_identify_top_k()
     reject_multi = getattr(settings, "FACE_IDENTIFY_REJECT_MULTIPLE_FACES", True)
+    quality_retry = getattr(settings, "FACE_IDENTIFY_QUALITY_RETRY", True)
 
     entry = get_or_rebuild_location_index(loc)
     if entry.vectors32.shape[0] == 0:
         return _identify_fail(loc, "no_enrolled_faces", live_image_bytes)
 
-    # --- Tier 1: fast detect (640px, same as kiosk) ---
-    fast_frame = extract_identify_frame(live_image_bytes, use_quality=False)
-    if reject_multi and fast_frame.face_count > 1:
-        logger.info(
-            "Face identify rejected: multiple_faces_detected location=%s count=%s",
-            loc,
-            fast_frame.face_count,
+    def _dual_match(frame: IdentifyFrameResult, tier_label: str):
+        if reject_multi and frame.face_count > 1:
+            return "multi", None, None
+        verdict, user_id, dist, match_tier = _match_encoding_tiered(
+            entry,
+            frame.encoding,
+            top_k,
+            strict_tol,
+            relaxed_tol,
+            min_margin,
         )
-        return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
-
-    verdict, user_id, dist = _match_from_frame(
-        entry, fast_frame, top_k, strict_tol, min_margin
-    )
-    if verdict == "ok" and user_id:
-        logger.info(
-            "Face identify success (fast) location=%s user=%s dist=%.4f",
-            loc,
-            user_id,
-            dist,
-        )
-        return user_id, "success", dist
-
-    # --- Tier 2: quality retry for haircut / blur / borderline only ---
-    need_retry = _should_quality_retry(verdict, dist, relaxed_tol)
-    if need_retry:
-        quality_frame = extract_identify_frame(live_image_bytes, use_quality=True)
-        if reject_multi and quality_frame.face_count > 1:
-            return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
-
-        q_verdict, q_user_id, q_dist = _match_from_frame(
-            entry, quality_frame, top_k, relaxed_tol, min_margin
-        )
-        if q_verdict == "ok" and q_user_id:
+        if verdict == "ok" and user_id:
             logger.info(
-                "Face identify success (quality) location=%s user=%s dist=%.4f",
+                "Face identify success (%s/%s) location=%s user=%s dist=%.4f",
+                tier_label,
+                match_tier,
                 loc,
-                q_user_id,
-                q_dist,
+                user_id,
+                dist,
             )
-            return q_user_id, "success", q_dist
-        if q_verdict == "ambiguous":
-            return _identify_fail(loc, "ambiguous_match", live_image_bytes, q_dist)
-        if quality_frame.encoding is None and fast_frame.encoding is None:
-            return _identify_fail(loc, "face_not_detected", live_image_bytes)
-        return _identify_fail(loc, "face_not_matched", live_image_bytes, q_dist or dist)
+            return "ok", user_id, dist
+        if verdict == "ambiguous":
+            return "ambiguous", user_id, dist
+        if frame.encoding is None:
+            return "no_face", None, None
+        return "no_match", user_id, dist
 
-    if fast_frame.encoding is None:
-        return _identify_fail(loc, "face_not_detected", live_image_bytes)
-    if verdict == "ambiguous":
+    fast_frame = extract_identify_frame(live_image_bytes, use_quality=False)
+    outcome, user_id, dist = _dual_match(fast_frame, "fast")
+    if outcome == "multi":
+        return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
+    if outcome == "ok" and user_id:
+        return user_id, "success", dist
+    if outcome == "ambiguous":
         return _identify_fail(loc, "ambiguous_match", live_image_bytes, dist)
+    if outcome == "no_match":
+        return _identify_fail(loc, "face_not_matched", live_image_bytes, dist)
+
+    if not quality_retry:
+        return _identify_fail(loc, "face_not_detected", live_image_bytes)
+
+    quality_frame = extract_identify_frame(live_image_bytes, use_quality=True)
+    outcome, user_id, dist = _dual_match(quality_frame, "quality")
+    if outcome == "multi":
+        return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
+    if outcome == "ok" and user_id:
+        return user_id, "success", dist
+    if outcome == "ambiguous":
+        return _identify_fail(loc, "ambiguous_match", live_image_bytes, dist)
+    if outcome == "no_face":
+        return _identify_fail(loc, "face_not_detected", live_image_bytes)
     return _identify_fail(loc, "face_not_matched", live_image_bytes, dist)

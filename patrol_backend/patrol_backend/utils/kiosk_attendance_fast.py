@@ -17,6 +17,7 @@ from django.utils import timezone
 from patrol_backend.utils.attendance_resolve import (
     apply_v4_attendance_after_log,
     build_log_window_filter,
+    enforce_checkin_allowed_after_checkout,
     lock_or_create_attendance_for_shift_day,
 )
 
@@ -65,6 +66,10 @@ def _duplicate_punch_seconds() -> int:
     return int(getattr(settings, "FACE_KIOSK_DUPLICATE_PUNCH_SECONDS", 15))
 
 
+def _min_checkout_minutes() -> int:
+    return int(getattr(settings, "FACE_KIOSK_MIN_CHECKOUT_MINUTES", 5))
+
+
 def _finalize_from_existing_log(
     attendance,
     *,
@@ -98,6 +103,7 @@ def _finalize_from_existing_log(
         img_name="",
         user_tz=user_tz,
         refresh_fn=refresh_fn,
+        skip_sibling_reconcile=getattr(settings, "FACE_KIOSK_SKIP_SIBLING_RECONCILE", True),
     )
     attendance.refresh_from_db()
 
@@ -117,7 +123,7 @@ def kiosk_apply_punch(
     search_start_utc,
     search_end_utc,
     user_tz,
-    min_checkout_minutes: int = 5,
+    min_checkout_minutes: Optional[int] = None,
     refresh_fn: Optional[Callable] = None,
     latest_checkin=None,
     latest_checkout=None,
@@ -134,6 +140,8 @@ def kiosk_apply_punch(
         user, assignment, shift, org_location, search_start_utc, search_end_utc
     )
     burst_seconds = _duplicate_punch_seconds()
+    if min_checkout_minutes is None:
+        min_checkout_minutes = _min_checkout_minutes()
     now = timezone.now()
 
     with transaction.atomic():
@@ -172,6 +180,18 @@ def kiosk_apply_punch(
             return "checkin", attendance, recent_checkin, 200
 
         action_mode = "checkout" if has_open_session else "checkin"
+        if action_mode == "checkin":
+            enforce_checkin_allowed_after_checkout(
+                user,
+                assignment,
+                shift,
+                org_location,
+                search_start_utc,
+                search_end_utc,
+                latest_checkin_ts=latest_checkin,
+                latest_checkout_ts=latest_checkout,
+                has_open_session=has_open_session,
+            )
         if action_mode == "checkout" and latest_checkin:
             elapsed = int((now - latest_checkin).total_seconds())
             if elapsed < min_checkout_minutes * 60:
@@ -192,6 +212,7 @@ def kiosk_apply_punch(
         )
         log.image.save(img_name, ContentFile(raw_bytes), save=True)
 
+        skip_sibling = getattr(settings, "FACE_KIOSK_SKIP_SIBLING_RECONCILE", True)
         apply_v4_attendance_after_log(
             attendance=attendance,
             user=user,
@@ -208,7 +229,19 @@ def kiosk_apply_punch(
             img_name=img_name,
             user_tz=user_tz,
             refresh_fn=refresh_fn,
+            skip_sibling_reconcile=skip_sibling,
         )
+        if refresh_fn is None:
+            update_fields = ["modified_on"]
+            if action_mode == "checkin":
+                attendance.checkin_count = int(attendance.checkin_count or 0) + 1
+                attendance.last_checkin_time = log.timestamp
+                update_fields.extend(["checkin_count", "last_checkin_time"])
+            else:
+                attendance.checkout_count = int(attendance.checkout_count or 0) + 1
+                attendance.last_checkout_time = log.timestamp
+                update_fields.extend(["checkout_count", "last_checkout_time"])
+            attendance.save(update_fields=update_fields)
         http_status = 200 if action_mode == "checkout" else 201
 
     return action_mode, attendance, log, http_status

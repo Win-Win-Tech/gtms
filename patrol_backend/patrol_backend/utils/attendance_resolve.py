@@ -99,6 +99,76 @@ def build_log_window_filter(
     }
 
 
+class CheckinTooSoonAfterCheckout(Exception):
+    """Raised when user tries to check in too soon after their last checkout."""
+
+    def __init__(self, remaining: int, min_minutes: int):
+        self.remaining = remaining
+        self.min_minutes = min_minutes
+
+
+def min_checkin_after_checkout_minutes() -> int:
+    from django.conf import settings
+
+    return int(getattr(settings, "FACE_KIOSK_MIN_CHECKIN_AFTER_CHECKOUT_MINUTES", 1))
+
+
+def enforce_checkin_allowed_after_checkout(
+    user,
+    assignment,
+    shift,
+    org_location,
+    search_start_utc,
+    search_end_utc,
+    *,
+    min_minutes: Optional[int] = None,
+    latest_checkin_ts=None,
+    latest_checkout_ts=None,
+    has_open_session: Optional[bool] = None,
+) -> None:
+    """
+    Block a new check-in when the last punch in the shift window was a checkout
+    and the minimum gap has not elapsed.
+    """
+    from dashboard.models import CheckInLog
+
+    if latest_checkout_ts is None:
+        log_filter = build_log_window_filter(
+            user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+        latest_checkin = (
+            CheckInLog.objects.filter(**log_filter, type="checkin")
+            .order_by("-timestamp")
+            .first()
+        )
+        latest_checkout = (
+            CheckInLog.objects.filter(**log_filter, type="checkout")
+            .order_by("-timestamp")
+            .first()
+        )
+        if not latest_checkout:
+            return
+        latest_checkin_ts = latest_checkin.timestamp if latest_checkin else None
+        latest_checkout_ts = latest_checkout.timestamp
+        has_open_session = bool(
+            latest_checkin
+            and (not latest_checkout or latest_checkin.timestamp > latest_checkout.timestamp)
+        )
+    elif not latest_checkout_ts:
+        return
+
+    if has_open_session:
+        return
+
+    gap_minutes = min_minutes if min_minutes is not None else min_checkin_after_checkout_minutes()
+    elapsed = int((timezone.now() - latest_checkout_ts).total_seconds())
+    if elapsed < gap_minutes * 60:
+        raise CheckinTooSoonAfterCheckout(
+            remaining=max(0, (gap_minutes * 60) - elapsed),
+            min_minutes=gap_minutes,
+        )
+
+
 def sync_attendance_times_from_logs(attendance, log_filter) -> None:
     """
     Set checkin_time / checkout_time / lat / lon from logs in the shift window.
@@ -227,6 +297,7 @@ def apply_v4_attendance_after_log(
     img_name: str,
     user_tz,
     refresh_fn: Optional[Callable] = None,
+    skip_sibling_reconcile: bool = False,
 ) -> None:
     """
     Update attendance row after CheckInLog was created — shared v4 field rules.
@@ -255,12 +326,13 @@ def apply_v4_attendance_after_log(
             refresh_fn,
         )
         attendance.refresh_from_db()
-        reconcile_sibling_attendance_rows(
-            user,
-            assignment,
-            shift,
-            org_location,
-            shift_start_date,
-            user_tz,
-            refresh_fn,
-        )
+        if not skip_sibling_reconcile:
+            reconcile_sibling_attendance_rows(
+                user,
+                assignment,
+                shift,
+                org_location,
+                shift_start_date,
+                user_tz,
+                refresh_fn,
+            )

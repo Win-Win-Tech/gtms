@@ -38,7 +38,7 @@ def get_identify_min_margin() -> float:
 def get_identify_top_k() -> int:
     from django.conf import settings
 
-    return max(2, int(getattr(settings, "FACE_IDENTIFY_TOP_K", 5)))
+    return max(2, int(getattr(settings, "FACE_IDENTIFY_TOP_K", 3)))
 
 _face_recognition = None  # lazy module or None; False = import failed
 _face_recognition_failed = False

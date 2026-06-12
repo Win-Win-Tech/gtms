@@ -364,11 +364,75 @@ def _shift_required_duration_minutes(shift):
     return max(0, int((end_dt - start_dt).total_seconds() // 60))
 
 
-def _attendance_v3_compute_pa_status_from_duration(duration_minutes, shift, _location_id=None):
+def _parse_present_duration_hours(raw):
+    try:
+        if raw is None:
+            return None
+        hours = int(raw)
+        return hours if hours > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_present_duration_hours(location_id, cache=None):
     """
-    After checkout: compare total worked minutes to scheduled shift length.
-    - P : duration >= shift length
-    - LD: duration < shift length
+    SiteSetting `present_duration` (hours) for a location.
+    Optional cache dict avoids repeated DB reads in bulk report loops.
+    """
+    if cache is not None and location_id in cache:
+        return cache[location_id]
+    hours = _parse_present_duration_hours(
+        _get_site_setting_int(
+            key="present_duration",
+            location_id=location_id,
+            default_value=None,
+        )
+    )
+    if cache is not None:
+        cache[location_id] = hours
+    return hours
+
+
+def _prefetch_present_duration_hours(location_ids):
+    """One query: present_duration hours per location (location override > global)."""
+    cache = {}
+    unique_ids = [loc_id for loc_id in dict.fromkeys(location_ids or []) if loc_id]
+    if not unique_ids:
+        return cache
+    rows = SiteSetting.objects.filter(
+        key="present_duration",
+        is_deleted=False,
+    ).filter(
+        Q(location_id__in=unique_ids) | Q(location_id__isnull=True)
+    ).values_list("location_id", "value")
+    global_hours = None
+    by_loc = {}
+    for loc_id, raw in rows:
+        if loc_id is None:
+            global_hours = _parse_present_duration_hours(raw)
+        else:
+            by_loc[loc_id] = _parse_present_duration_hours(raw)
+    for loc_id in unique_ids:
+        cache[loc_id] = by_loc.get(loc_id, global_hours)
+    return cache
+
+
+def _present_required_minutes(location_id, shift, cache=None):
+    """Minutes required for Present; uses present_duration site setting, else shift length."""
+    hours = _get_present_duration_hours(location_id, cache=cache)
+    if hours:
+        return hours * 60
+    return _shift_required_duration_minutes(shift)
+
+
+def _attendance_v3_compute_pa_status_from_duration(
+    duration_minutes, shift, _location_id=None, _present_duration_cache=None
+):
+    """
+    After checkout: compare total worked minutes to present_duration (hours) site setting.
+    Falls back to scheduled shift length when present_duration is not configured.
+    - P : duration >= required minutes
+    - LD: duration < required minutes
     """
     if duration_minutes is None:
         return None
@@ -376,16 +440,20 @@ def _attendance_v3_compute_pa_status_from_duration(duration_minutes, shift, _loc
         worked = int(duration_minutes)
     except (TypeError, ValueError):
         return None
-    required = _shift_required_duration_minutes(shift)
+    required = _present_required_minutes(
+        _location_id, shift, cache=_present_duration_cache
+    )
     if required <= 0:
         return "LD"
     return "P" if worked >= required else "LD"
 
 
-def _attendance_v3_compute_pa_status_from_summary(summary, shift, _location_id=None, window_end_utc=None):
+def _attendance_v3_compute_pa_status_from_summary(
+    summary, shift, _location_id=None, window_end_utc=None, _present_duration_cache=None
+):
     """
     - OW: open session (still checked in / no closing checkout in window).
-    - P/LD: after checkout — worked duration vs scheduled shift length.
+    - P/LD: after checkout — worked duration vs present_duration (or shift length).
     """
     if not summary:
         return None
@@ -395,7 +463,10 @@ def _attendance_v3_compute_pa_status_from_summary(summary, shift, _location_id=N
             return "M"
         return "OW"
     return _attendance_v3_compute_pa_status_from_duration(
-        summary.get("duration_minutes"), shift
+        summary.get("duration_minutes"),
+        shift,
+        _location_id=_location_id,
+        _present_duration_cache=_present_duration_cache,
     )
 
 
@@ -414,7 +485,7 @@ def _attendance_v3_refresh_saved_fields(attendance, user, assignment, shift, org
     attendance.pa_status = _attendance_v3_compute_pa_status_from_summary(
         summary,
         shift,
-        _location_id=None,
+        _location_id=getattr(org_location, "id", None),
         window_end_utc=search_end_utc,
     )
     attendance.save()
@@ -450,6 +521,11 @@ def _attendance_v3_response_extras(attendance, summary, user_tz, request, shift=
         "pa_status": _attendance_v3_compute_pa_status_from_summary(
             summary,
             (attendance.shift if attendance else shift),
+            _location_id=(
+                getattr(attendance, "org_location_id", None)
+                if attendance
+                else None
+            ),
             window_end_utc=window_end_utc,
         ),
         "checkin_image": _img_url(attendance.checkin_image) if attendance else None,
@@ -1870,6 +1946,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         Same as checkin_v3, plus if location.is_face_attendance_enabled:
         require live image and match to user's enrolled face_encoding / face_photo.
         """
+        from patrol_backend.utils.attendance_resolve import CheckinTooSoonAfterCheckout, enforce_checkin_allowed_after_checkout
         from patrol_backend.utils.face_utils import (
             is_face_attendance_available,
             verify_user_face,
@@ -1899,6 +1976,21 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
         )
+
+        try:
+            enforce_checkin_allowed_after_checkout(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+        except CheckinTooSoonAfterCheckout as exc:
+            return Response(
+                {
+                    "error": f"Check-in allowed {exc.min_minutes} minute(s) after checkout",
+                    "code": "checkin_too_soon_after_checkout",
+                    "min_checkin_after_checkout_minutes": exc.min_minutes,
+                    "remaining_seconds": exc.remaining,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
         raw_bytes = image_file.read() if image_file else None
@@ -2272,6 +2364,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             img_name = getattr(image_file, "name", img_name) or img_name
 
         if getattr(settings, "FACE_KIOSK_FAST_PATH", True):
+            from patrol_backend.utils.attendance_resolve import CheckinTooSoonAfterCheckout
             from patrol_backend.utils.kiosk_attendance_fast import (
                 CheckoutTooEarly,
                 build_kiosk_light_payload,
@@ -2305,6 +2398,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         "user_id": str(user.id),
                         "has_shift": True,
                         "min_checkout_minutes": exc.min_checkout_minutes,
+                        "remaining_seconds": exc.remaining,
+                    },
+                )
+            except CheckinTooSoonAfterCheckout as exc:
+                return _kiosk_error(
+                    "checkin_too_soon_after_checkout",
+                    f"Check-in allowed {exc.min_minutes} minute(s) after checkout",
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "min_checkin_after_checkout_minutes": exc.min_minutes,
                         "remaining_seconds": exc.remaining,
                     },
                 )
@@ -2423,7 +2527,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         action_mode = "checkin"
         if has_open_session:
             action_mode = "checkout"
-            min_checkout_minutes = 5
+            min_checkout_minutes = int(getattr(settings, "FACE_KIOSK_MIN_CHECKOUT_MINUTES", 5))
             elapsed_seconds = int((timezone.now() - latest_checkin.timestamp).total_seconds())
             if elapsed_seconds < (min_checkout_minutes * 60):
                 remaining = max(0, (min_checkout_minutes * 60) - elapsed_seconds)
@@ -2435,6 +2539,27 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         "has_shift": True,
                         "min_checkout_minutes": min_checkout_minutes,
                         "remaining_seconds": remaining,
+                    },
+                )
+        else:
+            from patrol_backend.utils.attendance_resolve import (
+                CheckinTooSoonAfterCheckout,
+                enforce_checkin_allowed_after_checkout,
+            )
+
+            try:
+                enforce_checkin_allowed_after_checkout(
+                    user, assignment, shift, org_location, search_start_utc, search_end_utc
+                )
+            except CheckinTooSoonAfterCheckout as exc:
+                return _kiosk_error(
+                    "checkin_too_soon_after_checkout",
+                    f"Check-in allowed {exc.min_minutes} minute(s) after checkout",
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "min_checkin_after_checkout_minutes": exc.min_minutes,
+                        "remaining_seconds": exc.remaining,
                     },
                 )
 
@@ -5500,9 +5625,14 @@ def generate_attendance_excel_report_internal(date_filter='today', start_date=No
             hours, remainder = divmod(delta.total_seconds(), 3600)
             minutes = remainder // 60
             duration = f"{int(hours):02}:{int(minutes):02}"
-            # Compare first-checkin → last-checkout duration to scheduled shift length (hours).
+            # Compare worked duration to present_duration site setting (hours), else shift length.
             if shift:
-                req_hours = _shift_required_duration_minutes(shift) / 60.0
+                req_hours = (
+                    _present_required_minutes(
+                        getattr(obj, "org_location_id", None), shift
+                    )
+                    / 60.0
+                )
                 if req_hours > 0:
                     if total_hours >= req_hours:
                         attendance_status = "Present"
@@ -6350,6 +6480,8 @@ def _get_monthly_attendance_summary_data(
             for uid, loc, wd in weekoff_qs.values_list("user_id", "location_id", "weekoff_date")
         }
 
+    present_duration_cache = _prefetch_present_duration_hours(grouped_location_ids)
+
     # Build summary for each guard-location combination
     for (guard_id, loc_id), data in grouped.items():
         guard = data["guard"]
@@ -6430,7 +6562,10 @@ def _get_monthly_attendance_summary_data(
                 # Fallback for any records created before the new persist logic.
                 computed_status = (
                     _attendance_v3_compute_pa_status_from_duration(
-                        attendance.duration_minutes, attendance.shift
+                        attendance.duration_minutes,
+                        attendance.shift,
+                        _location_id=loc_id,
+                        _present_duration_cache=present_duration_cache,
                     )
                     or "LD"
                 )
@@ -6811,6 +6946,8 @@ def _get_monthly_attendance_summary_data_v2(
                 if new_l and (not old_l or new_l > old_l): a_lookup[key] = att
             else: a_lookup[key] = att
 
+    present_duration_cache = _prefetch_present_duration_hours(lids)
+
     summary_data = []
     for (g_pk, l_pk), data in grouped.items():
         guard, sgid, slid = data["guard"], str(g_pk), str(l_pk) if l_pk else None
@@ -6835,7 +6972,15 @@ def _get_monthly_attendance_summary_data_v2(
             if att.get('pa_status'): row[k] = _monthly_normalize_status(att['pa_status'])
             elif att.get('checkout_time') or att.get('last_checkout_time'):
                  s_obj = next((a.shift for a in data['assignments'] if a.shift_id == att['shift_id']), None)
-                 row[k] = _monthly_normalize_status(_attendance_v3_compute_pa_status_from_duration(att['duration_minutes'], s_obj) or "LD")
+                 row[k] = _monthly_normalize_status(
+                     _attendance_v3_compute_pa_status_from_duration(
+                         att['duration_minutes'],
+                         s_obj,
+                         _location_id=l_pk,
+                         _present_duration_cache=present_duration_cache,
+                     )
+                     or "LD"
+                 )
             else: row[k] = "OW" if (att.get('checkin_time') or att.get('last_checkin_time')) else ""
         _append_monthly_day_totals(row, date_range); summary_data.append(row)
     

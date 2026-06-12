@@ -227,9 +227,9 @@ FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API respo
 FACE_IDENTIFY_TOLERANCE = 0.45  # relaxed pass (quality retry / appearance change e.g. haircut)
 FACE_IDENTIFY_TOLERANCE_STRICT = 0.38  # fast-path instant accept when clearly best match
 FACE_IDENTIFY_MIN_MARGIN = 0.055  # best must beat 2nd place (main wrong-user guard)
-FACE_IDENTIFY_TOP_K = 5
+FACE_IDENTIFY_TOP_K = 3
 FACE_IDENTIFY_REJECT_MULTIPLE_FACES = True
-# Quality retry only when fast path is borderline — keeps most punches under ~1s
+# Quality encode only when fast 640px detect finds no face (blur / distance)
 FACE_IDENTIFY_QUALITY_RETRY = True
 FACE_IDENTIFY_MAX_IMAGE_WIDTH = 960
 FACE_IDENTIFY_UPSAMPLE = 1
@@ -241,9 +241,15 @@ FACE_KIOSK_MAX_IMAGE_WIDTH = 640
 FACE_KIOSK_NUM_JITTERS = 0
 FACE_KIOSK_UPSAMPLE = 0
 FACE_KIOSK_LIGHT_RESPONSE = True
-FACE_KIOSK_DEFER_METRICS_REFRESH = False
+FACE_KIOSK_DEFER_METRICS_REFRESH = True
+# Skip per-punch sibling row reconcile on kiosk (heavy); full metrics refresh runs in background.
+FACE_KIOSK_SKIP_SIBLING_RECONCILE = True
 # Ignore duplicate kiosk scans for the same guard within N seconds (one row / one log).
 FACE_KIOSK_DUPLICATE_PUNCH_SECONDS = 15
+# Minimum minutes from check-in before checkout is allowed (kiosk + mobile).
+FACE_KIOSK_MIN_CHECKOUT_MINUTES = 5
+# Minimum minutes after checkout before a new check-in is allowed (kiosk + mobile).
+FACE_KIOSK_MIN_CHECKIN_AFTER_CHECKOUT_MINUTES = 1
 # If fast detect fails (common on some phones: EXIF/glare/tilt), retry stronger detect
 FACE_KIOSK_DETECT_RETRY = True
 FACE_KIOSK_RETRY_UPSAMPLE = 1

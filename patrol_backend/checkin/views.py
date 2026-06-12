@@ -230,7 +230,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
 
             data = request.data
             site_settings = SiteSetting.objects.all()
-
+       
             # -------- PARAM EXTRACTION --------
             guard_id = data.get('guard')
             shift_id = data.get('shift')
@@ -269,7 +269,7 @@ class CheckInViewSet(viewsets.ModelViewSet):
             except User.DoesNotExist:
                 logger.error(f"[SCAN_CHECKPOINT_API] Guard NOT FOUND → id={guard_id}")
                 return Response({"error": "Invalid guard ID"}, status=status.HTTP_400_BAD_REQUEST)
-
+            
             # -------- ASSIGNMENT VALIDATION --------
             logger.info(
                 "[SCAN_CHECKPOINT_API] Checking Assignment → "
@@ -301,24 +301,24 @@ class CheckInViewSet(viewsets.ModelViewSet):
             if not checkpoint:
                 logger.error(f"[SCAN_CHECKPOINT_API] Checkpoint NOT FOUND → id={checkpoint_id}")
                 return Response({"error": "Checkpoint not found"}, status=status.HTTP_400_BAD_REQUEST)
-
+            
             logger.info(
                 "[SCAN_CHECKPOINT_API] Checkpoint FOUND → "
                 f"id={checkpoint.id}, lat={checkpoint.latitude}, lng={checkpoint.longitude}, data={checkpoint.data}"
             )
-
+            
             if qr_data != checkpoint.data:
                 logger.error("[SCAN_CHECKPOINT_API] QR DATA MISMATCH")
                 return Response(
                     {"detail": "Check-in not allowed. QR code mismatch."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-
+                      
             # -------- DISTANCE CHECK --------
             checkpoint_coords = (checkpoint.latitude, checkpoint.longitude)
             user_coords = (latitude, longitude)
             distance = geodesic(checkpoint_coords, user_coords).meters
-
+       
             # Fetch allowed distance from SiteSetting (with fallback)
             allowed_distance_str = SiteSetting.get_setting(
                 key='distance', 
