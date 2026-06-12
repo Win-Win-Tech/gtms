@@ -18,6 +18,7 @@ from patrol_backend.utils.attendance_resolve import (
     apply_v4_attendance_after_log,
     build_log_window_filter,
     enforce_checkin_allowed_after_checkout,
+    ensure_punch_sites,
     lock_or_create_attendance_for_shift_day,
 )
 
@@ -162,6 +163,13 @@ def kiosk_apply_punch(
             recent_checkin
             and (now - recent_checkin.timestamp) < timedelta(seconds=burst_seconds)
         ):
+            if matched_site and not recent_checkin.site_id:
+                from dashboard.models import CheckInLog
+
+                CheckInLog.objects.filter(pk=recent_checkin.pk).update(
+                    site_id=matched_site.pk
+                )
+                recent_checkin.site_id = matched_site.pk
             _finalize_from_existing_log(
                 attendance,
                 user=user,
@@ -232,6 +240,7 @@ def kiosk_apply_punch(
             skip_sibling_reconcile=skip_sibling,
         )
         if refresh_fn is None:
+            ensure_punch_sites(attendance, matched_site, log_filter)
             update_fields = ["modified_on"]
             if action_mode == "checkin":
                 attendance.checkin_count = int(attendance.checkin_count or 0) + 1
@@ -241,6 +250,8 @@ def kiosk_apply_punch(
                 attendance.checkout_count = int(attendance.checkout_count or 0) + 1
                 attendance.last_checkout_time = log.timestamp
                 update_fields.extend(["checkout_count", "last_checkout_time"])
+            if matched_site and attendance.site_id == matched_site.pk:
+                update_fields.append("site")
             attendance.save(update_fields=update_fields)
         http_status = 200 if action_mode == "checkout" else 201
 
@@ -300,6 +311,7 @@ def defer_attendance_v3_refresh(
     org_location,
     search_start_utc,
     search_end_utc,
+    matched_site=None,
 ) -> None:
     """Optional: recompute duration/pa_status in background (not recommended for production)."""
     att_id = attendance.pk
@@ -311,9 +323,17 @@ def defer_attendance_v3_refresh(
             from dashboard.models import AttendanceCheckin
 
             att = AttendanceCheckin.objects.get(pk=att_id)
+            log_filter = build_log_window_filter(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+            if matched_site:
+                ensure_punch_sites(att, matched_site, log_filter)
             refresh_fn(
                 att, user, assignment, shift, org_location, search_start_utc, search_end_utc
             )
+            if matched_site:
+                att = AttendanceCheckin.objects.get(pk=att_id)
+                ensure_punch_sites(att, matched_site, log_filter)
         except Exception as exc:
             logger.warning("Deferred kiosk attendance refresh failed att=%s: %s", att_id, exc)
         finally:

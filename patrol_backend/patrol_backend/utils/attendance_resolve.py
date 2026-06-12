@@ -169,6 +169,27 @@ def enforce_checkin_allowed_after_checkout(
         )
 
 
+def ensure_punch_sites(attendance, matched_site, log_filter) -> None:
+    """
+    Persist geofence site on attendance + backfill any punch logs in the window missing site_id.
+    Kiosk/mobile should always store the resolved LocationSite, not only org_location.
+    """
+    if not matched_site:
+        return
+
+    from dashboard.models import CheckInLog
+
+    site_pk = getattr(matched_site, "pk", None) or getattr(matched_site, "id", None)
+    if not site_pk:
+        return
+
+    CheckInLog.objects.filter(**log_filter, site_id__isnull=True).update(site_id=site_pk)
+
+    if attendance.site_id != site_pk:
+        attendance.site_id = site_pk
+        attendance.save(update_fields=["site", "modified_on"])
+
+
 def sync_attendance_times_from_logs(attendance, log_filter) -> None:
     """
     Set checkin_time / checkout_time / lat / lon from logs in the shift window.
@@ -306,6 +327,7 @@ def apply_v4_attendance_after_log(
     attendance.shift_date = shift_start_date
     attendance.site = matched_site
     sync_attendance_times_from_logs(attendance, log_filter)
+    ensure_punch_sites(attendance, matched_site, log_filter)
 
     if action_mode == "checkin" and raw_bytes is not None:
         attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)

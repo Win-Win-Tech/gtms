@@ -2423,6 +2423,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     org_location,
                     search_start_utc,
                     search_end_utc,
+                    matched_site=matched_site,
                 )
 
             event_user = to_user_timezone(log.timestamp, user_tz)

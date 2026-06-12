@@ -69,13 +69,52 @@ def _pa_status_display(pa_status, live_state, has_checkin, has_checkout):
     return text or "—"
 
 
-def _build_punch_records(matched_logs, user_tz):
+def _resolve_punch_site_fallback(obj, matched_logs):
+    """Site label for punches missing site_id — never use org/company name."""
+    if obj.site_id and obj.site:
+        return obj.site.name
+    for log in reversed(matched_logs):
+        if getattr(log, "site_id", None) and getattr(log, "site", None):
+            return log.site.name
+    if matched_logs and obj.org_location_id:
+        from patrol_backend.utils.proximity_utils import get_site_within_proximity
+
+        last = matched_logs[-1]
+        try:
+            site, _dist = get_site_within_proximity(
+                float(last.latitude),
+                float(last.longitude),
+                obj.org_location_id,
+            )
+            if site:
+                return site.name
+        except (TypeError, ValueError):
+            pass
+    if obj.org_location_id:
+        from scheduler.models import LocationSite
+
+        site_names = list(
+            LocationSite.objects.filter(
+                location_id=obj.org_location_id,
+                is_active=True,
+            ).values_list("name", flat=True)[:2]
+        )
+        if len(site_names) == 1:
+            return site_names[0]
+    return None
+
+
+def _build_punch_records(matched_logs, user_tz, fallback_site_name=None):
     parts = []
     for log in matched_logs:
         local = to_user_timezone(log.timestamp, user_tz)
         t = local.strftime("%H:%M")
         kind = "in" if log.type == "checkin" else "out"
-        site = getattr(getattr(log, "site", None), "name", None) or "Kiosk"
+        site = (
+            getattr(getattr(log, "site", None), "name", None)
+            or fallback_site_name
+            or "—"
+        )
         parts.append(f"{t}:{kind}({site})")
     return ",".join(parts)
 
@@ -259,7 +298,11 @@ def gather_attendance_v4_export_context(
                     obj.pa_status, live_state, has_checkin, has_checkout
                 ),
                 "pa_status": obj.pa_status,
-                "punch_records": _build_punch_records(matched_logs, user_tz),
+                "punch_records": _build_punch_records(
+                    matched_logs,
+                    user_tz,
+                    fallback_site_name=_resolve_punch_site_fallback(obj, matched_logs),
+                ),
                 "location_name": obj.org_location.name if obj.org_location else "",
                 "site_name": obj.site.name if obj.site else "",
             }
