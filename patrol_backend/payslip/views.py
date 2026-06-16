@@ -1,12 +1,13 @@
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q, Subquery
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django.core.files.base import ContentFile
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from authapp.models import User
 from patrol_backend.utils.timezone_utils import get_user_timezone_from_request
@@ -30,7 +31,13 @@ from .serializers import (
     PayslipReopenSerializer,
     PayslipRecordAttendanceEditSerializer,
 )
-from .services import calculate_attendance_from_master, calculate_hourly_attendance_from_master, calculate_salary_fields
+from .services import (
+    calculate_attendance_from_master,
+    calculate_hourly_attendance_from_master,
+    calculate_salary_fields,
+    gather_quick_pay_report_context,
+    resolve_quick_pay_date_range,
+)
 from .pdf_utils import build_simple_payslip_pdf_bytes
 from decimal import Decimal
 
@@ -1063,4 +1070,104 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             record.save()
 
         return Response(PayslipRecordSerializer(record).data, status=status.HTTP_200_OK)
+
+
+class HourlyWageSummaryReportView(AdminOnlyMixin, APIView):
+    """Read-only Quick Pay Report export (today, this month, or custom date range)."""
+
+    def _build_context(self, request):
+        params = request.query_params
+        location_id = params.get("location_id")
+        if not location_id:
+            if getattr(request.user, "is_superuser", False):
+                raise ValueError("location_id is required")
+            location_id = str(getattr(request.user, "location_id", "") or "")
+        if not location_id:
+            raise ValueError("location_id is required")
+
+        date_filter = params.get("date_filter", "today")
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
+        start_date, end_date = resolve_quick_pay_date_range(
+            date_filter,
+            params.get("start_date"),
+            params.get("end_date"),
+            user_tz,
+        )
+        user_ids_raw = params.get("user_ids")
+        user_ids = None
+        if user_ids_raw:
+            user_ids = [part.strip() for part in str(user_ids_raw).split(",") if part.strip()]
+
+        field_config_overrides = None
+        field_config_map_raw = params.get("field_config_map")
+        if field_config_map_raw:
+            import json
+
+            try:
+                parsed = json.loads(field_config_map_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("field_config_map must be valid JSON") from exc
+            if isinstance(parsed, dict):
+                field_config_overrides = {
+                    str(user_id): str(config_id)
+                    for user_id, config_id in parsed.items()
+                    if user_id and config_id
+                }
+
+        context = gather_quick_pay_report_context(
+            location_id=location_id,
+            start_date=start_date,
+            end_date=end_date,
+            user_tz=user_tz,
+            acting_user=request.user,
+            search=params.get("search"),
+            role=params.get("role"),
+            date_filter=date_filter,
+            user_ids=user_ids,
+            field_config_overrides=field_config_overrides,
+        )
+        if not context.get("hourly_rows") and not context.get("monthly_rows"):
+            raise ValueError(
+                "No quick pay data found for the selected period. "
+                "Ensure employees have active payroll profiles and attendance in the period."
+            )
+        return context, start_date, end_date
+
+    def get(self, request, export_format):
+        try:
+            context, start_date, end_date = self._build_context(request)
+            if export_format == "excel":
+                from .hourly_wage_summary_excel import generate_hourly_wage_summary_excel_internal
+
+                result = generate_hourly_wage_summary_excel_internal(context)
+                content_type = (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                ext = "xlsx"
+            elif export_format == "pdf":
+                from .hourly_wage_summary_pdf import generate_hourly_wage_summary_pdf_internal
+
+                result = generate_hourly_wage_summary_pdf_internal(context)
+                content_type = "application/pdf"
+                ext = "pdf"
+            else:
+                return Response({"error": "Invalid export format"}, status=status.HTTP_400_BAD_REQUEST)
+
+            with open(result["file_path"], "rb") as fh:
+                content = fh.read()
+            if start_date == end_date:
+                period_slug = start_date.strftime("%Y%m%d")
+            else:
+                period_slug = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+            filename = f"quick_pay_report_{period_slug}.{ext}"
+            response = HttpResponse(content, content_type=content_type)
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to generate quick pay report: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
