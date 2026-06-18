@@ -162,6 +162,14 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         alignment=TA_LEFT,
         leading=11,
     )
+    header_cell_style = _para_style(
+        "HeaderCellBold",
+        parent=styles["Normal"],
+        fontSize=9,
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+        leading=11,
+    )
     punch_style = _para_style(
         "PunchCellBold",
         parent=styles["Normal"],
@@ -226,7 +234,7 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         "Status",
         "Punch Records",
     ]
-    col_ratios = [0.09, 0.06, 0.06, 0.08, 0.06, 0.06, 0.07, 0.07, 0.11, 0.34]
+    col_ratios = [0.09, 0.06, 0.06, 0.08, 0.07, 0.07, 0.07, 0.07, 0.11, 0.32]
     ratio_sum = sum(col_ratios)
     col_widths = [content_width * (r / ratio_sum) for r in col_ratios]
 
@@ -266,7 +274,12 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
                 return ""
             return Paragraph(str(text).replace("&", "&amp;"), cell_style)
 
-        table_data = [col_headers]
+        def _header_cell(text):
+            if not text:
+                return ""
+            return Paragraph(str(text).replace("&", "&amp;"), header_cell_style)
+
+        table_data = [[_header_cell(h) for h in col_headers]]
         for row in group.get("rows") or []:
             punch = row.get("punch_records") or ""
             punch_para = (
@@ -311,7 +324,7 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
                 )
             )
         )
-        block.append(Spacer(1, 10))
+        block.append(Spacer(1, 20))
         story.append(KeepTogether(block))
 
     if not employee_groups:

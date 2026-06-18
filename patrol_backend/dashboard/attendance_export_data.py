@@ -145,7 +145,7 @@ def gather_attendance_v4_export_context(
 
     queryset = AttendanceCheckin.objects.select_related(
         "guard", "shift", "org_location", "site", "assignment"
-    )
+    ).exclude(guard__role__iexact="admin")
 
     if request:
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
@@ -308,7 +308,118 @@ def gather_attendance_v4_export_context(
             }
         )
 
-    from scheduler.models import Location, LocationSite
+    from scheduler.models import Assignment, Location, LocationSite
+
+    should_add_absent = True
+    if defaulters:
+        should_add_absent = False
+    if status_filter:
+        v = str(status_filter).strip().lower()
+        if v not in ("absent", "all", ""):
+            should_add_absent = False
+
+    if should_add_absent:
+        from authapp.models import User
+
+        assignments = Assignment.objects.filter(
+            start_date__lte=range_end,
+            end_date__gte=range_start,
+            is_deleted=False
+        ).select_related("guard", "shift", "location")
+
+        users_qs = User.objects.filter(is_active=True, is_deleted=False).select_related("location").exclude(role__iexact="admin")
+
+        if guard_id:
+            assignments = assignments.filter(guard_id=guard_id)
+            users_qs = users_qs.filter(id=guard_id)
+        if search and str(search).strip():
+            s = str(search).strip()
+            assignments = assignments.filter(
+                Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
+            )
+            users_qs = users_qs.filter(
+                Q(name__icontains=s) | Q(employee_code__icontains=s)
+            )
+        if role and str(role).strip().lower() not in ("", "all"):
+            assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
+            users_qs = users_qs.filter(role__iexact=str(role).strip().lower())
+        if location_id:
+            assignments = assignments.filter(location_id=location_id)
+            users_qs = users_qs.filter(location_id=location_id)
+        if site_id:
+            site_obj = LocationSite.objects.filter(id=site_id).first()
+            if site_obj:
+                assignments = assignments.filter(location_id=site_obj.location_id)
+                users_qs = users_qs.filter(location_id=site_obj.location_id)
+            else:
+                assignments = assignments.none()
+                users_qs = users_qs.none()
+        if shift_id:
+            assignments = assignments.filter(shift_id=shift_id)
+
+        # Cache the users queryset to a list to prevent running a DB query on every date loop iteration
+        users_list = list(users_qs)
+
+        # Build assignment lookup by (guard_id_str, date) -> assignment
+        assignment_lookup = {}
+        for assignment in assignments:
+            date_start = max(range_start, assignment.start_date)
+            date_end = min(range_end, assignment.end_date)
+            curr_d = date_start
+            while curr_d <= date_end:
+                key = (str(assignment.guard_id), curr_d)
+                if key not in assignment_lookup:
+                    assignment_lookup[key] = assignment
+                curr_d += timedelta(days=1)
+
+        existing_keys = {
+            (str(r["guard_id"]), r["att_date"])
+            for r in detail_rows
+            if r["guard_id"] and r["att_date"]
+        }
+
+        # For each date and each user, if no entry exists in existing_keys, add a dummy entry
+        curr_d = range_start
+        while curr_d <= range_end:
+            for u in users_list:
+                key = (str(u.id), curr_d)
+                if key not in existing_keys:
+                    assignment = assignment_lookup.get(key)
+                    
+                    # If shift_id is filtered, only include if the user is scheduled for this shift on this date
+                    if shift_id and (not assignment or str(assignment.shift_id) != str(shift_id)):
+                        continue
+
+                    sched_in = assignment.shift.start_time.strftime("%H:%M") if (assignment and assignment.shift) else ""
+                    sched_out = assignment.shift.end_time.strftime("%H:%M") if (assignment and assignment.shift) else ""
+                    shift_name = assignment.shift.name if (assignment and assignment.shift) else ""
+                    loc_name = (assignment.location.name if (assignment and assignment.location) else None) or (u.location.name if (u and u.location) else "")
+
+                    detail_rows.append(
+                        {
+                            "guard_id": u.id,
+                            "emp_code": getattr(u, "employee_code", None) or "",
+                            "emp_name": u.name or "",
+                            "designation": (getattr(u, "role", None) or "").strip(),
+                            "att_date": curr_d,
+                            "att_date_display": curr_d.strftime("%d-%b-%Y"),
+                            "in_time": "",
+                            "out_time": "",
+                            "shift_name": shift_name,
+                            "sched_in": sched_in,
+                            "sched_out": sched_out,
+                            "work_dur": "00:00",
+                            "work_minutes": 0,
+                            "tot_dur": "00:00",
+                            "status": "Absent",
+                            "pa_status": "A",
+                            "punch_records": "",
+                            "location_name": loc_name,
+                            "site_name": "",
+                        }
+                    )
+                    existing_keys.add(key)
+            curr_d += timedelta(days=1)
 
     org_name = ""
     dept_name = ""
@@ -331,7 +442,7 @@ def gather_attendance_v4_export_context(
         "org_name": org_name,
         "dept_name": dept_name,
         "printed_at": to_user_timezone(datetime.now(pytz.UTC), user_tz),
-        "row_count": len(page_items),
+        "row_count": len(detail_rows),
     }
 
 
