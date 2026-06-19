@@ -24,7 +24,15 @@ def _draw_pdf_footer(canvas, doc):
         0.15 * inch,
         PDF_FOOTER_TEXT,
     )
+    # Right-aligned page number
+    page_num = canvas.getPageNumber()
+    canvas.drawRightString(
+        doc.leftMargin + doc.width,
+        0.15 * inch,
+        f"Page {page_num}",
+    )
     canvas.restoreState()
+
 
 
 def _build_section_table(columns, rows, content_width, header_style, cell_style):

@@ -193,7 +193,14 @@ def _on_page_border(canvas, doc):
     w, h = doc.pagesize
     m = doc.leftMargin
     canvas.rect(m, m, w - 2 * m, h - 2 * m)
+
+    # Draw page number outside the border in the bottom-right margin
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(colors.HexColor("#64748b"))
+    page_num = canvas.getPageNumber()
+    canvas.drawRightString(w - m, 10, f"Page {page_num}")
     canvas.restoreState()
+
 
 
 def _build_reportlab_pdf(record) -> bytes:
