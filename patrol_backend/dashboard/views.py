@@ -3266,6 +3266,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         search = (request.query_params.get("search") or "").strip()
         role_filter = (request.query_params.get("role") or "").strip().lower()
+        user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
         user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
 
         users_qs = User.objects.filter(
@@ -3277,7 +3278,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         )
         if role_filter and role_filter not in ("all",):
             users_qs = users_qs.filter(role__iexact=role_filter)
-        if search:
+        if user_id:
+            users_qs = users_qs.filter(id=user_id)
+        elif search:
             users_qs = users_qs.filter(
                 Q(name__icontains=search) |
                 Q(employee_code__icontains=search) |
@@ -3392,6 +3395,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         search = (request.query_params.get("search") or "").strip()
         role_filter = (request.query_params.get("role") or "").strip().lower()
+        user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
         user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
 
         users_qs = User.objects.filter(
@@ -3403,7 +3407,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         )
         if role_filter and role_filter not in ("all",):
             users_qs = users_qs.filter(role__iexact=role_filter)
-        if search:
+        if user_id:
+            users_qs = users_qs.filter(id=user_id)
+        elif search:
             users_qs = users_qs.filter(
                 Q(name__icontains=search) |
                 Q(employee_code__icontains=search) |
@@ -7477,15 +7483,17 @@ def _weekoff_parse_month(month_str):
     return start_date, end_date, year
 
 
-def _weekoff_eligible_users_qs(location_id, search=None, role=None):
+def _weekoff_eligible_users_qs(location_id, search=None, role=None, user_id=None):
     qs = User.objects.filter(
         is_deleted=False,
         is_active=True,
         location_id=location_id,
     ).exclude(Q(role__iexact="admin") | Q(is_superuser=True))
-    if role and str(role).strip().lower() not in ("", "all"):
+    if user_id:
+        qs = qs.filter(id=user_id)
+    elif role and str(role).strip().lower() not in ("", "all"):
         qs = qs.filter(role__iexact=str(role).strip().lower())
-    if search and str(search).strip():
+    if not user_id and search and str(search).strip():
         s = str(search).strip()
         qs = qs.filter(
             Q(name__icontains=s) | Q(employee_code__icontains=s) | Q(email__icontains=s)
@@ -7595,12 +7603,13 @@ class AttendanceWeekOffViewSetV2(ViewSet):
         month = request.query_params.get("month")
         search = request.query_params.get("search")
         role = request.query_params.get("role")
+        user_id = request.query_params.get("user_id") or request.query_params.get("id")
         try:
             start_date, end_date, _year = _weekoff_parse_month(month)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role)
+        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role, user_id=user_id)
         users = list(users_qs.only("id", "name", "employee_code", "role"))
         user_ids = [u.id for u in users]
 
@@ -7646,6 +7655,7 @@ class AttendanceWeekOffViewSetV2(ViewSet):
         month = request.query_params.get("month")
         search = request.query_params.get("search")
         role = request.query_params.get("role")
+        user_id = request.query_params.get("user_id") or request.query_params.get("id")
         try:
             start_date, end_date, _year = _weekoff_parse_month(month)
         except ValueError as e:
@@ -7655,7 +7665,7 @@ class AttendanceWeekOffViewSetV2(ViewSet):
         if not loc:
             return Response({"error": "Location not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role)
+        users_qs = _weekoff_eligible_users_qs(scoped_location_id, search=search, role=role, user_id=user_id)
         users = list(users_qs.only("id", "name", "employee_code", "role"))
         user_ids = [u.id for u in users]
 

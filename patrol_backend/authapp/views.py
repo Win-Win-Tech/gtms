@@ -324,15 +324,19 @@ class UserListView(generics.ListAPIView):
         queryset = User.objects.filter(is_deleted=False)
         role = self.request.query_params.get('role')
         location_id = self.request.query_params.get('location_id')
+        user_id = self.request.query_params.get('user_id') or self.request.query_params.get('id') or self.request.query_params.get('guard')
         
         # Admin restriction: Only superusers can see Admin users
         if not self.request.user.is_superuser:
             queryset = queryset.exclude(role__iexact='admin')
 
-        if role and role.lower() != 'all':
-            queryset = queryset.filter(role__iexact=role)
-        if location_id:
-            queryset = queryset.filter(location_id=location_id)
+        if user_id:
+            queryset = queryset.filter(id=user_id)
+        else:
+            if role and role.lower() != 'all':
+                queryset = queryset.filter(role__iexact=role)
+            if location_id:
+                queryset = queryset.filter(location_id=location_id)
         return queryset
 
     def list(self, request, *args, **kwargs):

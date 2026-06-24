@@ -85,6 +85,7 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
         roles_param = request.query_params.get("roles")
         role_param = request.query_params.get("role")
         search = (request.query_params.get("search") or "").strip()
+        user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
 
         # Start with base queryset
         users_qs = User.objects.filter(is_active=True, is_deleted=False).select_related("location")
@@ -92,6 +93,9 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
         # Admin restriction: Only superusers see Admins in employee lists
         if not request.user.is_superuser:
             users_qs = users_qs.exclude(role__iexact='admin')
+
+        if user_id:
+            users_qs = users_qs.filter(id=user_id)
 
         if roles_param:
             requested_roles = [r.strip().lower() for r in roles_param.split(",") if r.strip()]
@@ -656,7 +660,7 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
         qs = super().get_queryset()
         month = self.request.query_params.get("month")
         location_id = self.request.query_params.get("location_id")
-        user_id = self.request.query_params.get("user_id")
+        user_id = self.request.query_params.get("user_id") or self.request.query_params.get("id") or self.request.query_params.get("guard")
         status_q = self.request.query_params.get("status")
         if month:
             qs = qs.filter(month=month)

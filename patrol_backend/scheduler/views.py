@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 from datetime import date
 
 
-def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None):
+def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None, user_id=None):
     """
     Optimized helper to fetch monthly assignment summary for a location.
     Uses .values() to minimize DB load and object instantiation.
@@ -59,6 +59,8 @@ def _get_monthly_location_summary_data_v2(location_id, year, month, search=None,
         end_date__gte=m_start,
         is_deleted=False
     )
+    if user_id:
+        aq = aq.filter(guard_id=user_id)
     
 
     
@@ -620,6 +622,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
             search = request.query_params.get("search")
             role = request.query_params.get("role")
+            user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
 
             # Get all assignments for the location
             assignments = Assignment.objects.select_related('guard', 'shift', 'shift__location').filter(
@@ -628,7 +631,9 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 end_date__gte=datetime(year, month, 1),
                 is_deleted=False
             )
-            if search and str(search).strip():
+            if user_id:
+                assignments = assignments.filter(guard_id=user_id)
+            elif search and str(search).strip():
                 s = str(search).strip()
                 assignments = assignments.filter(
                     Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
@@ -690,6 +695,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
 
             search = request.query_params.get("search")
             role = request.query_params.get("role")
+            user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
 
             assignments = Assignment.objects.select_related('guard', 'shift', 'shift__location').filter(
                 shift__location_id=location_id,
@@ -697,7 +703,9 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 end_date__gte=datetime(year, month, 1),
                 is_deleted=False
             )
-            if search and str(search).strip():
+            if user_id:
+                assignments = assignments.filter(guard_id=user_id)
+            elif search and str(search).strip():
                 s = str(search).strip()
                 assignments = assignments.filter(
                     Q(guard__name__icontains=s) | Q(guard__employee_code__icontains=s)
@@ -768,6 +776,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path=r'v2/monthly-location-summary/(?P<location_id>[^/.]+)/(?P<year>\d{4})/(?P<month>\d{1,2})')
     def monthly_location_summary_v2(self, request, location_id=None, year=None, month=None):
         try:
+            user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
             res = _get_monthly_location_summary_data_v2(
                 location_id=location_id, 
                 year=year, 
@@ -775,6 +784,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 search=request.query_params.get("search"), 
                 role=request.query_params.get("role"),
                 request=request,
+                user_id=user_id,
             )
             return Response({
                 'headers': res['headers'],
@@ -787,6 +797,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path=r'v2/monthly-location-summary-excel/(?P<location_id>[^/.]+)/(?P<year>\d{4})/(?P<month>\d{1,2})')
     def monthly_location_summary_excel_v2(self, request, location_id=None, year=None, month=None):
         try:
+            user_id = request.query_params.get("user_id") or request.query_params.get("id") or request.query_params.get("guard")
             res = _get_monthly_location_summary_data_v2(
                 location_id=location_id, 
                 year=year, 
@@ -794,6 +805,7 @@ class AssignmentViewSet(viewsets.ModelViewSet):
                 search=request.query_params.get("search"), 
                 role=request.query_params.get("role"),
                 request=request,
+                user_id=user_id,
             )
             
             wb = Workbook()
