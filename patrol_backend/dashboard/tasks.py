@@ -2,7 +2,7 @@ from datetime import timedelta
 
 import pytz
 from celery import shared_task
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from scheduler.models import SiteSetting
@@ -42,10 +42,10 @@ def mark_missed_checkout_v3(batch_size=1000):
         AttendanceCheckin.objects.select_related("shift", "org_location")
         .filter(pa_status="OW")
         .filter(last_checkin_time__isnull=False)
-        .filter(last_checkout_time__isnull=True)
-        .filter(checkout_time__isnull=True)
+        .filter(Q(last_checkout_time__isnull=True) | Q(last_checkin_time__gt=F("last_checkout_time")))
         .order_by("shift_date")
     )
+
 
     tz_cache = {}
     grace_cache = {}
