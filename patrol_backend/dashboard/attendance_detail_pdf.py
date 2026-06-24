@@ -268,12 +268,10 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         emp_code = group.get("emp_code") or "—"
         emp_name = group.get("emp_name") or "—"
         block.append(
-            _full_width(
-                Paragraph(
-                    f"Emp Code: {emp_code} &nbsp;&nbsp;&nbsp;&nbsp; "
-                    f"Employee Name: {emp_name}",
-                    emp_line_style,
-                )
+            Paragraph(
+                f"Emp Code: {emp_code} &nbsp;&nbsp;&nbsp;&nbsp; "
+                f"Employee Name: {emp_name}",
+                emp_line_style,
             )
         )
 
@@ -311,7 +309,7 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
         tbl.setStyle(data_table_style)
         tbl.hAlign = "LEFT"
-        block.append(_full_width(tbl))
+        block.append(tbl)
 
         present_days = group.get("present_days", 0)
         present_display = (
@@ -321,19 +319,17 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         )
         total_dur = _duration_hrs_min(group.get("total_duration") or "00:00")
         block.append(
-            _full_width(
-                Paragraph(
-                    f"Total Duration={total_dur} , "
-                    f"PresentDays={present_display} , "
-                    "Leaves=0 , Holiday=0 , "
-                    f"AbsentDays={int(group.get('absent_days') or 0)} , "
-                    "Weekly Off =0",
-                    summary_style,
-                )
+            Paragraph(
+                f"Total Duration={total_dur} , "
+                f"PresentDays={present_display} , "
+                "Leaves=0 , Holiday=0 , "
+                f"AbsentDays={int(group.get('absent_days') or 0)} , "
+                "Weekly Off =0",
+                summary_style,
             )
         )
         block.append(Spacer(1, 20))
-        story.append(KeepTogether(block))
+        story.extend(block)
 
     if not employee_groups:
         story.append(Paragraph("No attendance records for the selected filters.", meta_style))
