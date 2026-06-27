@@ -95,3 +95,78 @@ def mark_missed_checkout_v3(batch_size=1000):
             modified_on=now_utc,
         )
 
+
+@shared_task
+def cleanup_old_media_files(days=61):
+    """
+    Periodic task to clean up media files older than 61 days (2 months) on Sunday.
+    Deletes files from:
+      - media/attendance_checkinlog/
+      - media/attendance_checkins/
+      - media/attendance_checkouts/
+      - media/payslips/
+      - media/logphoto/
+      - media/*.pdf and media/*.xlsx in media root
+    """
+    import os
+    from django.conf import settings
+    from datetime import datetime, timedelta
+
+    media_dir = settings.MEDIA_ROOT
+    if not media_dir or not os.path.isdir(media_dir):
+        return "Media directory not found or not configured."
+
+    cutoff_date = datetime.now() - timedelta(days=days)
+    
+    target_folders = [
+        "attendance_checkinlog",
+        "attendance_checkins",
+        "attendance_checkouts",
+        "payslips",
+        "logphoto"
+    ]
+    
+    deleted_count = 0
+    total_bytes_freed = 0
+
+    # 1. Clear target subfolders
+    for folder in target_folders:
+        folder_path = os.path.join(media_dir, folder)
+        if not os.path.isdir(folder_path):
+            continue
+
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                try:
+                    mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    if mtime < cutoff_date:
+                        size = os.path.getsize(file_path)
+                        os.remove(file_path)
+                        deleted_count += 1
+                        total_bytes_freed += size
+                except Exception:
+                    pass
+
+    # 2. Clear root files (.pdf, .xlsx)
+    try:
+        for file in os.listdir(media_dir):
+            file_path = os.path.join(media_dir, file)
+            if os.path.isfile(file_path):
+                ext = os.path.splitext(file)[1].lower()
+                if ext in ['.pdf', '.xlsx']:
+                    try:
+                        mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+                        if mtime < cutoff_date:
+                            size = os.path.getsize(file_path)
+                            os.remove(file_path)
+                            deleted_count += 1
+                            total_bytes_freed += size
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return f"Cleanup complete. Deleted {deleted_count} files, freed {total_bytes_freed} bytes."
+
+

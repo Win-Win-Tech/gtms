@@ -333,6 +333,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'dashboard.tasks.mark_missed_checkout_v3',
         'schedule': crontab(minute='*/5'),
     },
+    'cleanup-old-media-files': {
+        'task': 'dashboard.tasks.cleanup_old_media_files',
+        'schedule': crontab(day_of_week="Sunday", hour=0,minute=0),
+    },
 }
 
 # Use Django DB backend for Celery Beat schedule (recommended for production)

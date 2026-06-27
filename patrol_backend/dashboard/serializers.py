@@ -253,21 +253,44 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
 
         pairs = []
         open_checkin = None
+        open_checkin_id = None
         for log in logs:
             if log.type == "checkin":
+                if open_checkin is not None:
+                    pairs.append({
+                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                        "checkout_id": None,
+                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                        "checkout_time": None,
+                        "duration_minutes": None,
+                    })
                 open_checkin = log.timestamp
-                continue
-            if log.type == "checkout" and open_checkin is not None and log.timestamp > open_checkin:
-                duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
-                pairs.append({
-                    "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                    "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                    "duration_minutes": duration_minutes,
-                })
-                open_checkin = None
+                open_checkin_id = log.id
+            elif log.type == "checkout":
+                if open_checkin is not None:
+                    duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
+                    pairs.append({
+                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                        "checkout_id": str(log.id),
+                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
+                        "duration_minutes": duration_minutes,
+                    })
+                    open_checkin = None
+                    open_checkin_id = None
+                else:
+                    pairs.append({
+                        "checkin_id": None,
+                        "checkout_id": str(log.id),
+                        "checkin_time": None,
+                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
+                        "duration_minutes": None,
+                    })
 
         if open_checkin is not None:
             pairs.append({
+                "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                "checkout_id": None,
                 "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
                 "checkout_time": None,
                 "duration_minutes": None,
@@ -449,21 +472,44 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
 
         pairs = []
         open_checkin = None
+        open_checkin_id = None
         for log in logs:
             if log.type == "checkin":
+                if open_checkin is not None:
+                    pairs.append({
+                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                        "checkout_id": None,
+                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                        "checkout_time": None,
+                        "duration_minutes": None,
+                    })
                 open_checkin = log.timestamp
-                continue
-            if log.type == "checkout" and open_checkin is not None and log.timestamp > open_checkin:
-                duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
-                pairs.append({
-                    "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                    "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                    "duration_minutes": duration_minutes,
-                })
-                open_checkin = None
+                open_checkin_id = log.id
+            elif log.type == "checkout":
+                if open_checkin is not None:
+                    duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
+                    pairs.append({
+                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                        "checkout_id": str(log.id),
+                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
+                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
+                        "duration_minutes": duration_minutes,
+                    })
+                    open_checkin = None
+                    open_checkin_id = None
+                else:
+                    pairs.append({
+                        "checkin_id": None,
+                        "checkout_id": str(log.id),
+                        "checkin_time": None,
+                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
+                        "duration_minutes": None,
+                    })
 
         if open_checkin is not None:
             pairs.append({
+                "checkin_id": str(open_checkin_id) if open_checkin_id else None,
+                "checkout_id": None,
                 "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
                 "checkout_time": None,
                 "duration_minutes": None,

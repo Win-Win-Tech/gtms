@@ -3,6 +3,7 @@ gms_venv/
 venv/
 env/
 ENV/
+patrol_backend/celerybeat-schedule
 
 # Python cache
 __pycache__/

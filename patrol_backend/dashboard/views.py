@@ -3054,12 +3054,359 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
             )
 
-        response_data = AttendanceCheckinSerializer(attendance, context={"request": request}).data
+        response_data = AttendanceCheckinDashboardV3Serializer(attendance, context={"request": request}).data
         response_data.update({
             "edited": True,
             "edited_by": str(actor.id),
             "edited_by_role": actor_role,
-            "edit_reason": data["reason"],
+            "edit_reason": reason,
+        })
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="add-punch_v3")
+    def add_punch_v3(self, request):
+        """
+        Add a manual check-in or check-out punch record.
+        """
+        actor = request.user
+        actor_role = getattr(actor, "role", None)
+        allowed_roles = {"admin"}
+        if not (getattr(actor, "is_superuser", False) or actor_role in allowed_roles):
+            return Response({"error": "Only admin or super_admin can add punches"}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        attendance_id = data.get("attendance_id")
+        punch_type = data.get("type")
+        timestamp_str = data.get("timestamp")
+        reason = data.get("reason")
+        site_id = data.get("site_id")
+
+        if not all([attendance_id, punch_type, timestamp_str, reason]):
+            return Response({"error": "attendance_id, type, timestamp, and reason are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if punch_type not in ("checkin", "checkout"):
+            return Response({"error": "type must be 'checkin' or 'checkout'"}, status=status.HTTP_400_BAD_REQUEST)
+
+        attendance = AttendanceCheckin.objects.select_related(
+            "guard", "assignment", "shift", "org_location"
+        ).filter(id=attendance_id).first()
+        if not attendance:
+            return Response({"error": "Attendance record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(actor, "is_superuser", False):
+            if str(getattr(actor, "location_id", "")) != str(getattr(attendance.guard, "location_id", "")):
+                return Response(
+                    {"error": "You can only edit guards in your organization"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        guard = attendance.guard
+        assignment = attendance.assignment
+        shift = attendance.shift
+        org_location = attendance.org_location
+
+        guard_tz = get_user_timezone_from_request(request, location_id=getattr(guard, "location_id", None))
+        
+        # Parse timestamp to UTC
+        try:
+            s = str(timestamp_str).strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = guard_tz.localize(parsed)
+            new_punch_utc = parsed.astimezone(pytz.UTC)
+        except Exception:
+            return Response({"error": "Invalid timestamp format. Use ISO format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Shift boundaries check
+        if attendance.shift_date:
+            shift_start_date = attendance.shift_date
+        elif attendance.checkin_time:
+            shift_start_date = _attendance_v3_compute_shift_date(to_user_timezone(attendance.checkin_time, guard_tz), shift)
+        else:
+            shift_start_date = to_user_timezone(attendance.created_on, guard_tz).date()
+
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, guard_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        if new_punch_utc < search_start_utc or new_punch_utc >= search_end_utc:
+            return Response({"error": "Punch time must be inside the shift window."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get existing logs
+        existing_logs = list(
+            CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            )
+        )
+
+        # Alternation check
+        # We simulate the list of logs with the new one added
+        proposed_logs = sorted(
+            existing_logs + [CheckInLog(timestamp=new_punch_utc, type=punch_type)],
+            key=lambda l: l.timestamp
+        )
+
+        # Check for consecutive identical types
+        for i in range(len(proposed_logs) - 1):
+            if proposed_logs[i].type == proposed_logs[i+1].type:
+                return Response(
+                    {"error": f"Invalid punch sequence: Cannot add a {punch_type} at this time because it would result in consecutive {proposed_logs[i].type}s. Please ensure punches alternate between Check-In and Check-Out."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Save and refresh
+        with transaction.atomic():
+            new_log = CheckInLog.objects.create(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type=punch_type,
+                site_id=site_id,
+                latitude=0.0,
+                longitude=0.0,
+            )
+            # Bypass auto_now_add=True by performing a direct SQL update
+            CheckInLog.objects.filter(id=new_log.id).update(timestamp=new_punch_utc)
+            new_log.refresh_from_db()
+
+            attendance.edited_by = actor
+            attendance.edited_on = timezone.now()
+            attendance.edit_reason = reason
+            attendance.save()
+
+            _attendance_v3_refresh_saved_fields(
+                attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+        response_data = AttendanceCheckinDashboardV3Serializer(attendance, context={"request": request}).data
+        response_data.update({
+            "edited": True,
+            "edited_by": str(actor.id),
+            "edited_by_role": actor_role,
+            "edit_reason": reason,
+        })
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="edit-punch_v3")
+    def edit_punch_v3(self, request):
+        """
+        Edit the timestamp or details of an existing punch log.
+        """
+        actor = request.user
+        actor_role = getattr(actor, "role", None)
+        allowed_roles = {"admin"}
+        if not (getattr(actor, "is_superuser", False) or actor_role in allowed_roles):
+            return Response({"error": "Only admin or super_admin can edit punches"}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        log_id = data.get("log_id")
+        timestamp_str = data.get("timestamp")
+        reason = data.get("reason")
+
+        if not all([log_id, timestamp_str, reason]):
+            return Response({"error": "log_id, timestamp, and reason are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        log = CheckInLog.objects.filter(id=log_id).first()
+        if not log:
+            return Response({"error": "Punch record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(actor, "is_superuser", False):
+            if str(getattr(actor, "location_id", "")) != str(getattr(log.guard, "location_id", "")):
+                return Response(
+                    {"error": "You can only edit guards in your organization"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        guard = log.guard
+        assignment = log.assignment
+        shift = log.shift
+        org_location = log.org_location
+
+        guard_tz = get_user_timezone_from_request(request, location_id=getattr(guard, "location_id", None))
+
+        # Parse timestamp to UTC
+        try:
+            s = str(timestamp_str).strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = guard_tz.localize(parsed)
+            new_punch_utc = parsed.astimezone(pytz.UTC)
+        except Exception:
+            return Response({"error": "Invalid timestamp format. Use ISO format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Get shift start date and boundaries
+        shift_start_date = _attendance_v3_compute_shift_date(to_user_timezone(log.timestamp, guard_tz), shift)
+        
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, guard_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        if new_punch_utc < search_start_utc or new_punch_utc >= search_end_utc:
+            return Response({"error": "Punch time must be inside the shift window."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Fetch parent attendance
+        attendance = AttendanceCheckin.objects.filter(
+            guard=guard,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            shift_date=shift_start_date
+        ).first()
+        if not attendance:
+            return Response({"error": "Parent Attendance record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Get all existing logs except the one being edited
+        other_logs = list(
+            CheckInLog.objects.filter(
+                guard=guard,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                timestamp__gte=search_start_utc,
+                timestamp__lt=search_end_utc,
+            ).exclude(id=log_id)
+        )
+
+        # Alternation check
+        # We simulate the list of logs with the edited log updated to the new timestamp
+        simulated_log = CheckInLog(id=log.id, timestamp=new_punch_utc, type=log.type)
+        proposed_logs = sorted(
+            other_logs + [simulated_log],
+            key=lambda l: l.timestamp
+        )
+
+        # Check for consecutive identical types
+        for i in range(len(proposed_logs) - 1):
+            if proposed_logs[i].type == proposed_logs[i+1].type:
+                return Response(
+                    {"error": f"Invalid punch sequence: Editing this punch would result in consecutive {proposed_logs[i].type}s. Please ensure punches alternate between Check-In and Check-Out."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        # Save and refresh
+        with transaction.atomic():
+            CheckInLog.objects.filter(id=log_id).update(timestamp=new_punch_utc)
+            attendance.edited_by = actor
+            attendance.edited_on = timezone.now()
+            attendance.edit_reason = reason
+            attendance.save()
+
+            _attendance_v3_refresh_saved_fields(
+                attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+        response_data = AttendanceCheckinDashboardV3Serializer(attendance, context={"request": request}).data
+        response_data.update({
+            "edited": True,
+            "edited_by": str(actor.id),
+            "edited_by_role": actor_role,
+            "edit_reason": reason,
+        })
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=["post"], url_path="delete-punch_v3")
+    def delete_punch_v3(self, request):
+        """
+        Delete an existing punch log.
+        """
+        actor = request.user
+        actor_role = getattr(actor, "role", None)
+        allowed_roles = {"admin"}
+        if not (getattr(actor, "is_superuser", False) or actor_role in allowed_roles):
+            return Response({"error": "Only admin or super_admin can delete punches"}, status=status.HTTP_403_FORBIDDEN)
+
+        data = request.data
+        log_id = data.get("log_id")
+        reason = data.get("reason")
+
+        if not all([log_id, reason]):
+            return Response({"error": "log_id and reason are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        log = CheckInLog.objects.filter(id=log_id).first()
+        if not log:
+            return Response({"error": "Punch record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not getattr(actor, "is_superuser", False):
+            if str(getattr(actor, "location_id", "")) != str(getattr(log.guard, "location_id", "")):
+                return Response(
+                    {"error": "You can only edit guards in your organization"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        guard = log.guard
+        assignment = log.assignment
+        shift = log.shift
+        org_location = log.org_location
+
+        guard_tz = get_user_timezone_from_request(request, location_id=getattr(guard, "location_id", None))
+
+        # Get shift start date and boundaries
+        shift_start_date = _attendance_v3_compute_shift_date(to_user_timezone(log.timestamp, guard_tz), shift)
+        
+        search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+            shift_start_date, shift, guard_tz, location_id=getattr(org_location, "id", None)
+        )
+
+        # Fetch parent attendance
+        attendance = AttendanceCheckin.objects.filter(
+            guard=guard,
+            assignment=assignment,
+            shift=shift,
+            org_location=org_location,
+            shift_date=shift_start_date
+        ).first()
+        if not attendance:
+            return Response({"error": "Parent Attendance record not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Get all existing logs except the one being deleted
+        proposed_logs = sorted(
+            list(
+                CheckInLog.objects.filter(
+                    guard=guard,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    timestamp__gte=search_start_utc,
+                    timestamp__lt=search_end_utc,
+                ).exclude(id=log_id)
+            ),
+            key=lambda l: l.timestamp
+        )
+
+        # Alternation check
+        # If proposed_logs is empty, that's fine. If not, verify alternation.
+        if proposed_logs:
+            for i in range(len(proposed_logs) - 1):
+                if proposed_logs[i].type == proposed_logs[i+1].type:
+                    return Response(
+                        {"error": f"Invalid punch sequence: Deleting this punch would result in consecutive {proposed_logs[i].type}s. Please ensure punches alternate between Check-In and Check-Out."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+        # Save and refresh
+        with transaction.atomic():
+            CheckInLog.objects.filter(id=log_id).delete()
+            attendance.edited_by = actor
+            attendance.edited_on = timezone.now()
+            attendance.edit_reason = reason
+            attendance.save()
+
+            _attendance_v3_refresh_saved_fields(
+                attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+        response_data = AttendanceCheckinDashboardV3Serializer(attendance, context={"request": request}).data
+        response_data.update({
+            "deleted": True,
+            "edited_by": str(actor.id),
+            "edited_by_role": actor_role,
+            "edit_reason": reason,
         })
         return Response(response_data, status=status.HTTP_200_OK)
 
@@ -3573,18 +3920,22 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         user_tz = get_user_timezone_from_request(request, location_id=scoped_location_id)
         try:
             checkin_utc = self._parse_bulk_datetime_to_utc(checkin_time_raw, user_tz, "checkin_time")
-            checkout_utc = self._parse_bulk_datetime_to_utc(checkout_time_raw, user_tz, "checkout_time")
+            if checkout_time_raw not in (None, ""):
+                checkout_utc = self._parse_bulk_datetime_to_utc(checkout_time_raw, user_tz, "checkout_time")
+            else:
+                checkout_utc = None
         except ValueError as ex:
             return Response({"error": str(ex)}, status=status.HTTP_400_BAD_REQUEST)
 
-        if checkout_utc <= checkin_utc:
+        if checkout_utc and checkout_utc <= checkin_utc:
             return Response(
                 {"error": "checkout_time must be later than checkin_time"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         checkin_local = to_user_timezone(checkin_utc, user_tz)
-        checkout_local = to_user_timezone(checkout_utc, user_tz)
+        if checkout_utc:
+            checkout_local = to_user_timezone(checkout_utc, user_tz)
         is_overnight_shift = bool(shift.end_time <= shift.start_time)
 
         # Strict date guardrails for bulk entry:
@@ -3595,19 +3946,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 {"error": "For bulk entry, checkin_time date must match selected date"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not is_overnight_shift:
-            if checkout_local.date() != target_date:
-                return Response(
-                    {"error": "For normal shift, checkout_time date must match selected date"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        else:
-            allowed_checkout_dates = {target_date, target_date + timedelta(days=1)}
-            if checkout_local.date() not in allowed_checkout_dates:
-                return Response(
-                    {"error": "For overnight shift, checkout_time must be on selected date or next date"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+        if checkout_utc:
+            if not is_overnight_shift:
+                if checkout_local.date() != target_date:
+                    return Response(
+                        {"error": "For normal shift, checkout_time date must match selected date"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                allowed_checkout_dates = {target_date, target_date + timedelta(days=1)}
+                if checkout_local.date() not in allowed_checkout_dates:
+                    return Response(
+                        {"error": "For overnight shift, checkout_time must be on selected date or next date"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         if latitude is None or longitude is None:
             if shift.location and shift.location.latitude is not None and shift.location.longitude is not None:
@@ -3688,7 +4040,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
                     if checkin_utc < search_start_utc or checkin_utc >= search_end_utc:
                         raise ValueError("checkin_time is outside selected shift window")
-                    if checkout_utc < search_start_utc or checkout_utc >= search_end_utc:
+                    if checkout_utc and (checkout_utc < search_start_utc or checkout_utc >= search_end_utc):
                         raise ValueError("checkout_time is outside selected shift window")
 
                     checkin_log = CheckInLog.objects.create(
@@ -3703,17 +4055,18 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     )
                     CheckInLog.objects.filter(id=checkin_log.id).update(timestamp=checkin_utc)
 
-                    checkout_log = CheckInLog.objects.create(
-                        guard=guard,
-                        assignment=assignment,
-                        shift=shift,
-                        org_location=shift.location,
-                        type="checkout",
-                        latitude=latitude,
-                        longitude=longitude,
-                        site_id=site_id,
-                    )
-                    CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
+                    if checkout_utc:
+                        checkout_log = CheckInLog.objects.create(
+                            guard=guard,
+                            assignment=assignment,
+                            shift=shift,
+                            org_location=shift.location,
+                            type="checkout",
+                            latitude=latitude,
+                            longitude=longitude,
+                            site_id=site_id,
+                        )
+                        CheckInLog.objects.filter(id=checkout_log.id).update(timestamp=checkout_utc)
 
                     attendance, _ = AttendanceCheckin.objects.get_or_create(
                         guard=guard,
