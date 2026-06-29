@@ -289,3 +289,185 @@ class PayslipRecord(models.Model):
     def __str__(self):
         return f"{self.month} - {self.user_id} - {self.status}"
 
+
+class PayrollAdvance(models.Model):
+    STATUS_CHOICES = [
+        ("OPEN", "Open"),
+        ("CLOSED", "Closed"),
+        ("CANCELLED", "Cancelled"),
+    ]
+    PAYMENT_MODE_CHOICES = PayslipRecord.PAYMENT_MODE_CHOICES
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="payroll_advances",
+    )
+    location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        related_name="payroll_advances",
+    )
+    settlement_month = models.CharField(max_length=7)  # YYYY-MM
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    advance_date = models.DateField()
+    payment_mode = models.CharField(
+        max_length=20,
+        choices=PAYMENT_MODE_CHOICES,
+        default="cash",
+    )
+    reference_no = models.CharField(max_length=128, null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="OPEN")
+
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payroll_advance_created",
+    )
+
+    class Meta:
+        ordering = ["-advance_date", "-created_on"]
+        indexes = [
+            models.Index(fields=["user", "settlement_month", "status"]),
+            models.Index(fields=["location", "settlement_month"]),
+        ]
+
+    def __str__(self):
+        return f"Advance {self.amount} - {self.user_id} - {self.settlement_month}"
+
+
+class PayrollAdvanceRecovery(models.Model):
+    SOURCE_CHOICES = [
+        ("QUICK_PAY", "Quick Pay"),
+        ("MONTHLY_PAYSLIP", "Monthly Payslip"),
+        ("MANUAL_ADJ", "Manual Adjustment"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    advance = models.ForeignKey(
+        PayrollAdvance,
+        on_delete=models.CASCADE,
+        related_name="recoveries",
+    )
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    recovery_date = models.DateField()
+    source_type = models.CharField(max_length=20, choices=SOURCE_CHOICES)
+    source_id = models.UUIDField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    created_on = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payroll_advance_recovery_created",
+    )
+
+    class Meta:
+        ordering = ["-recovery_date", "-created_on"]
+        indexes = [
+            models.Index(fields=["advance", "recovery_date"]),
+            models.Index(fields=["source_type", "source_id"]),
+        ]
+
+    def __str__(self):
+        return f"Recovery {self.amount} - {self.advance_id}"
+
+
+class QuickPayDisbursement(models.Model):
+    EXPORT_FORMAT_CHOICES = [
+        ("excel", "Excel"),
+        ("pdf", "PDF"),
+    ]
+    PAYMENT_STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("PAID", "Paid"),
+    ]
+    PAYMENT_MODE_CHOICES = PayslipRecord.PAYMENT_MODE_CHOICES
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="quick_pay_disbursements",
+    )
+    location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        related_name="quick_pay_disbursements",
+    )
+    settlement_month = models.CharField(max_length=7)
+    period_start = models.DateField()
+    period_end = models.DateField()
+    date_filter = models.CharField(max_length=20, default="today")
+    salary_type = models.CharField(
+        max_length=20,
+        choices=EmployeePayrollProfile.SALARY_TYPE_CHOICES,
+        default="monthly",
+    )
+    field_config = models.ForeignKey(
+        PayslipFieldConfig,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="quick_pay_disbursements",
+    )
+
+    attendance_snapshot = models.JSONField(default=dict, blank=True)
+    field_values = models.JSONField(default=dict, blank=True)
+    gross_earnings = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    total_deductions = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    net_before_advance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    advance_recovery = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    net_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    export_format = models.CharField(max_length=10, choices=EXPORT_FORMAT_CHOICES, default="pdf")
+    exported_on = models.DateTimeField(auto_now_add=True)
+    exported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="quick_pay_disbursements_exported",
+    )
+
+    payment_status = models.CharField(
+        max_length=20,
+        choices=PAYMENT_STATUS_CHOICES,
+        default="PENDING",
+    )
+    paid_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    paid_on = models.DateTimeField(null=True, blank=True)
+    payment_mode = models.CharField(
+        max_length=20,
+        choices=PAYMENT_MODE_CHOICES,
+        null=True,
+        blank=True,
+    )
+    payment_ref_no = models.CharField(max_length=128, null=True, blank=True)
+    payment_notes = models.TextField(null=True, blank=True)
+    paid_marked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="quick_pay_disbursements_paid_marked",
+    )
+
+    class Meta:
+        ordering = ["-exported_on"]
+        indexes = [
+            models.Index(fields=["user", "settlement_month"]),
+            models.Index(fields=["location", "period_start", "period_end"]),
+        ]
+
+    def __str__(self):
+        return f"QuickPay {self.user_id} {self.period_start} - {self.period_end}"
+

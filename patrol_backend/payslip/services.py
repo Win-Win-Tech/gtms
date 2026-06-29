@@ -128,6 +128,25 @@ def resolve_quick_pay_date_range(date_filter, start_date_str, end_date_str, user
     raise ValueError("date_filter must be 'today', 'month', or 'custom'.")
 
 
+def use_full_monthly_salary_calc(date_filter, start_date, end_date) -> bool:
+    """
+    When true, monthly employees use the same salary engine as end-of-month payslip
+    (full calendar month attendance + standard gross/deductions).
+    """
+    df = (date_filter or "today").strip().lower()
+    if df == "month":
+        return True
+    if df == "custom" and start_date.day == 1:
+        year, month = start_date.year, start_date.month
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        return (
+            end_date == last_day
+            and end_date.year == year
+            and end_date.month == month
+        )
+    return False
+
+
 def resolve_hourly_wage_date_range(date_filter, start_date_str, end_date_str, user_tz):
     """Backward-compatible alias for quick pay date resolution."""
     return resolve_quick_pay_date_range(date_filter, start_date_str, end_date_str, user_tz)
@@ -363,6 +382,12 @@ def gather_hourly_wage_summary_rows(
     }
 
 
+def _serialize_snapshot_for_json(snapshot):
+    if not snapshot:
+        return {}
+    return {k: str(v) if hasattr(v, "quantize") else v for k, v in snapshot.items()}
+
+
 def gather_quick_pay_report_context(
     location_id,
     start_date,
@@ -374,6 +399,7 @@ def gather_quick_pay_report_context(
     date_filter="today",
     user_ids=None,
     field_config_overrides=None,
+    advance_recovery_overrides=None,
 ):
     """
     Quick Pay Report: hourly + monthly sections using payslip formula engine.
@@ -402,6 +428,7 @@ def gather_quick_pay_report_context(
 
     profile_list = list(profiles)
     overrides = field_config_overrides or {}
+    recovery_overrides = advance_recovery_overrides or {}
     period_label = _format_quick_pay_period_label(start_date, end_date, date_filter)
     loc = Location.objects.filter(id=location_id, is_deleted=False).only("name").first()
     org_name = loc.name if loc else ""
@@ -418,6 +445,15 @@ def gather_quick_pay_report_context(
 
     hourly_rows = []
     monthly_rows = []
+
+    from payslip.advance_services import (
+        build_row_breakdown,
+        get_outstanding_advance,
+        settlement_month_from_date,
+        validate_advance_recovery,
+    )
+
+    settlement_month = settlement_month_from_date(end_date)
 
     for profile in profile_list:
         salary_type = profile.salary_type or "monthly"
@@ -455,6 +491,15 @@ def gather_quick_pay_report_context(
                 salary_type="hourly",
                 hourly_rate=profile.hourly_rate,
             )
+            outstanding = get_outstanding_advance(profile.user_id, settlement_month)
+            recovery_raw = recovery_overrides.get(str(profile.user_id))
+            if recovery_raw is not None:
+                recovery_amt = validate_advance_recovery(
+                    outstanding, calc["net_pay"], recovery_raw
+                )
+            else:
+                recovery_amt = Decimal("0")
+            breakdown = build_row_breakdown(calc, outstanding, recovery_amt)
             hourly_rows.append(
                 {
                     "user_id": str(profile.user_id),
@@ -463,31 +508,74 @@ def gather_quick_pay_report_context(
                     "name": name,
                     "rate": _to_decimal(profile.hourly_rate, "0"),
                     "worked_hours": _to_decimal(attendance_snapshot.get("paid_hours"), "0"),
-                    "salary": calc["net_pay"],
+                    "gross_earnings": breakdown["gross_earnings"],
+                    "salary_type": "hourly",
+                    "field_config_id": str(field_config.id) if field_config else None,
+                    "attendance_snapshot": _serialize_snapshot_for_json(attendance_snapshot),
+                    **breakdown,
                 }
             )
         else:
-            attendance_snapshot = calculate_attendance_from_master_for_range(
-                user, start_date, end_date, user_tz
-            )
-            if not attendance_snapshot.get("has_attendance"):
-                continue
-            calc = calculate_salary_fields(
-                profile.gross_salary,
-                fields,
-                attendance_snapshot,
-                salary_type="monthly",
-                hourly_rate=profile.hourly_rate,
-            )
+            full_month_calc = use_full_monthly_salary_calc(date_filter, start_date, end_date)
+            if full_month_calc:
+                month_str = end_date.strftime("%Y-%m")
+                attendance_snapshot = calculate_attendance_from_master(
+                    user, month_str, user_tz
+                )
+                paid_days = _to_decimal(attendance_snapshot.get("paid_days"), "0")
+                absent_days = _to_decimal(attendance_snapshot.get("absent_days"), "0")
+                if paid_days <= Decimal("0") and absent_days <= Decimal("0"):
+                    continue
+                calc = calculate_salary_fields(
+                    profile.gross_salary,
+                    fields,
+                    attendance_snapshot,
+                    salary_type="monthly",
+                    hourly_rate=profile.hourly_rate,
+                )
+                period_gross = _to_decimal(profile.gross_salary, "0")
+            else:
+                attendance_snapshot = calculate_attendance_from_master_for_range(
+                    user, start_date, end_date, user_tz
+                )
+                if not attendance_snapshot.get("has_attendance"):
+                    continue
+                month_days = _to_decimal(attendance_snapshot.get("month_days"), "0")
+                paid_days = _to_decimal(attendance_snapshot.get("paid_days"), "0")
+                full_gross = _to_decimal(profile.gross_salary, "0")
+                if month_days > Decimal("0"):
+                    period_gross = (full_gross * paid_days / month_days).quantize(Decimal("0.01"))
+                else:
+                    period_gross = Decimal("0")
+                calc = calculate_salary_fields(
+                    profile.gross_salary,
+                    fields,
+                    attendance_snapshot,
+                    salary_type="monthly",
+                    hourly_rate=profile.hourly_rate,
+                    period_gross_override=period_gross,
+                )
+            outstanding = get_outstanding_advance(profile.user_id, settlement_month)
+            recovery_raw = recovery_overrides.get(str(profile.user_id))
+            if recovery_raw is not None:
+                recovery_amt = validate_advance_recovery(
+                    outstanding, calc["net_pay"], recovery_raw
+                )
+            else:
+                recovery_amt = Decimal("0")
+            breakdown = build_row_breakdown(calc, outstanding, recovery_amt)
             monthly_rows.append(
                 {
                     "user_id": str(profile.user_id),
                     "employee_code": employee_code,
                     "date_label": period_label,
                     "name": name,
-                    "gross_salary": _to_decimal(profile.gross_salary, "0"),
-                    "paid_days": _to_decimal(attendance_snapshot.get("paid_days"), "0"),
-                    "salary": calc["net_pay"],
+                    "gross_salary": period_gross,
+                    "paid_days": paid_days,
+                    "salary_type": "monthly",
+                    "field_config_id": str(field_config.id) if field_config else None,
+                    "attendance_snapshot": _serialize_snapshot_for_json(attendance_snapshot),
+                    **breakdown,
                 }
             )
 
@@ -505,6 +593,7 @@ def gather_quick_pay_report_context(
         "period_label": period_label,
         "start_date": start_date,
         "end_date": end_date,
+        "settlement_month": settlement_month,
     }
 
 
@@ -619,6 +708,8 @@ def calculate_salary_fields(
     attendance_snapshot,
     salary_type="monthly",
     hourly_rate=None,
+    period_gross_override=None,
+    advance_recovery_amount=None,
 ):
     """
     Simple field engine:
@@ -627,6 +718,14 @@ def calculate_salary_fields(
     - FORMULA: python expression referencing computed fields + attendance vars
     """
     gross = _to_decimal(gross_salary, "0")
+    prorate_partial = period_gross_override is not None and salary_type == "monthly"
+    prorate_factor = Decimal("1")
+    if prorate_partial:
+        gross = _to_decimal(period_gross_override, "0")
+        month_days_for_prorate = _to_decimal(attendance_snapshot.get("month_days"), "0")
+        paid_days_for_prorate = _to_decimal(attendance_snapshot.get("paid_days"), "0")
+        if month_days_for_prorate > Decimal("0"):
+            prorate_factor = paid_days_for_prorate / month_days_for_prorate
     hourly = _to_decimal(hourly_rate, "0")
     worked_minutes = _to_decimal(attendance_snapshot.get("worked_minutes"), "0")
     base_pay = gross
@@ -669,9 +768,14 @@ def calculate_salary_fields(
 
         if zero_attendance and row.field_type in ("EARNING", "DEDUCTION"):
             amount = Decimal("0")
+        elif prorate_partial and code == "ABSENT_DEDUCTION":
+            # Paid days already drive period gross; skip duplicate absent penalty.
+            amount = Decimal("0")
         else:
             if value_type == "FIXED":
                 amount = _to_decimal(raw_value, "0")
+                if prorate_partial and row.field_type == "DEDUCTION":
+                    amount = (amount * prorate_factor).quantize(Decimal("0.01"))
             elif value_type == "PERCENTAGE":
                 pct = _to_decimal(raw_value, "0")
                 amount = (gross * pct) / Decimal("100")
@@ -693,10 +797,17 @@ def calculate_salary_fields(
             total_deductions += field_values[code]
 
     net_pay = total_earnings - total_deductions
+    net_before_advance = net_pay.quantize(Decimal("0.01"))
+    recovery = _to_decimal(advance_recovery_amount, "0")
+    if recovery > Decimal("0"):
+        net_pay = net_before_advance - recovery
     return {
         "field_values": {k: str(v) for k, v in field_values.items()},
         "total_earnings": total_earnings.quantize(Decimal("0.01")),
         "total_deductions": total_deductions.quantize(Decimal("0.01")),
-        "net_pay": net_pay.quantize(Decimal("0.01")),
+        "net_pay": net_before_advance,
+        "net_before_advance": net_before_advance,
+        "advance_recovery": recovery.quantize(Decimal("0.01")),
+        "net_paid": net_pay.quantize(Decimal("0.01")),
     }
 

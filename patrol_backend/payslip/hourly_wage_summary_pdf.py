@@ -44,7 +44,10 @@ def _build_section_table(columns, rows, content_width, header_style, cell_style)
     col_count = len(columns)
     col_width = content_width / col_count if col_count else content_width
 
-    numeric_keys = {"rate", "worked_hours", "salary", "gross_salary", "paid_days"}
+    numeric_keys = {
+        "rate", "worked_hours", "salary", "gross_salary", "gross_earnings",
+        "paid_days", "pf", "esi", "pt", "advance_recovery", "net_paid",
+    }
 
     def _cell_val(row, key):
         val = row.get(key, "")

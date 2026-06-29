@@ -14,16 +14,23 @@ HOURLY_COLUMNS = [
     ("Name", "name"),
     ("Rate", "rate"),
     ("Worked Duration (hours)", "worked_hours"),
-    ("Salary", "salary"),
+    ("Gross", "gross_earnings"),
+    ("PF", "pf"),
+    ("ESI", "esi"),
+    ("Advance Recovery", "advance_recovery"),
+    ("Net Paid", "net_paid"),
 ]
 
 MONTHLY_COLUMNS = [
     ("Employee Code", "employee_code"),
     ("Date", "date_label"),
     ("Name", "name"),
-    ("Gross Salary", "gross_salary"),
+    ("Gross", "gross_salary"),
     ("Paid Days", "paid_days"),
-    ("Salary", "salary"),
+    ("PF", "pf"),
+    ("ESI", "esi"),
+    ("Advance Recovery", "advance_recovery"),
+    ("Net Paid", "net_paid"),
 ]
 
 
@@ -46,7 +53,10 @@ def _write_section(ws, start_row, section_title, columns, rows, styles):
         cell.alignment = center
 
     data_start = header_row + 1
-    numeric_keys = {"rate", "worked_hours", "salary", "gross_salary", "paid_days"}
+    numeric_keys = {
+        "rate", "worked_hours", "salary", "gross_salary", "gross_earnings",
+        "paid_days", "pf", "esi", "pt", "advance_recovery", "net_paid",
+    }
     left_keys = {"name", "employee_code", "date_label"}
 
     if not rows:
@@ -107,7 +117,7 @@ def build_hourly_wage_summary_excel_bytes(context):
     left = Alignment(horizontal="left", vertical="center")
     styles = (section_font, header_font, cell_font, border, center, left)
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
     ws.cell(row=1, column=1, value=f"Quick Pay Report — {org_name} — {period_label}")
     ws.cell(row=1, column=1).font = title_font
     ws.cell(row=1, column=1).alignment = center
@@ -121,7 +131,7 @@ def build_hourly_wage_summary_excel_bytes(context):
         ws, next_row, "Monthly Employees", MONTHLY_COLUMNS, monthly_rows, styles
     )
 
-    widths = [14, 24, 28, 14, 22, 12]
+    widths = [14, 24, 28, 12, 18, 12, 10, 10, 16, 12]
     for idx, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = w
 

@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from authapp.models import User
-from patrol_backend.utils.timezone_utils import get_user_timezone_from_request
+from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, get_user_today
 from .models import (
     EmployeePayrollProfile,
     PayslipTemplate,
@@ -37,6 +37,18 @@ from .services import (
     calculate_salary_fields,
     gather_quick_pay_report_context,
     resolve_quick_pay_date_range,
+    _to_decimal,
+)
+from .advance_services import (
+    apply_advance_recoveries_fifo,
+    get_advance_given_total,
+    get_advance_recovered_total,
+    get_outstanding_advance,
+    get_outstanding_advances_bulk,
+    get_quick_paid_total,
+    reverse_monthly_recoveries,
+    settlement_month_from_date,
+    validate_advance_recovery,
 )
 from .pdf_utils import build_simple_payslip_pdf_bytes
 from decimal import Decimal
@@ -127,13 +139,39 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             payroll_profile_id=Subquery(active_profile_subquery.values("id")[:1]),
         ).order_by("name", "email")
 
+        users = list(users_qs)
+        user_ids = [u.id for u in users]
+
         profile_map = {
             str(p.user_id): p
             for p in EmployeePayrollProfile.objects.filter(
-                user_id__in=[u.id for u in users_qs],
+                user_id__in=user_ids,
                 is_active=True,
-            ).select_related("default_field_config", "default_template")
+            ).only("user_id", "default_field_config_id", "default_template_id")
         }
+
+        settlement_month = (
+            request.query_params.get("settlement_month")
+            or request.query_params.get("month")
+            or ""
+        ).strip()
+        if not settlement_month:
+            user_tz = get_user_timezone_from_request(
+                request, location_id=effective_location_id
+            )
+            settlement_month = get_user_today(user_tz).strftime("%Y-%m")
+        else:
+            try:
+                year, mon = [int(x) for x in settlement_month.split("-")]
+                if not (1 <= mon <= 12):
+                    raise ValueError
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "settlement_month must be in YYYY-MM format"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        outstanding_map = get_outstanding_advances_bulk(user_ids, settlement_month)
 
         result = [
             {
@@ -157,8 +195,10 @@ class EmployeePayrollProfileViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                     if profile_map.get(str(u.id)) and profile_map[str(u.id)].default_template_id
                     else None
                 ),
+                "outstanding_advance": str(outstanding_map.get(str(u.id), Decimal("0"))),
+                "settlement_month": settlement_month,
             }
-            for u in users_qs
+            for u in users
         ]
         return Response(result, status=status.HTTP_200_OK)
 
@@ -733,7 +773,7 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
 
         record.pdf_file.save(filename, ContentFile(pdf_bytes), save=False)
 
-    def _generate_for_user(self, *, employee, month, field_config_id, template_id, request):
+    def _generate_for_user(self, *, employee, month, field_config_id, template_id, request, advance_recovery=None):
         profile = EmployeePayrollProfile.objects.filter(user=employee, is_active=True).first()
         if not profile:
             return None, {"error": "Active payroll profile not found for employee"}, status.HTTP_400_BAD_REQUEST
@@ -769,6 +809,38 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             hourly_rate=profile.hourly_rate,
         )
 
+        monthly_net = calc["net_pay"]
+        outstanding = get_outstanding_advance(employee.id, month)
+        quick_paid = get_quick_paid_total(employee.id, month)
+        advance_given = get_advance_given_total(employee.id, month)
+        advance_recovered_so_far = get_advance_recovered_total(employee.id, month)
+
+        settlement_base = (monthly_net - quick_paid).quantize(Decimal("0.01"))
+        if advance_recovery is not None:
+            requested_recovery = _to_decimal(advance_recovery, "0")
+        elif outstanding > Decimal("0") and settlement_base > Decimal("0"):
+            requested_recovery = min(outstanding, settlement_base)
+        else:
+            requested_recovery = Decimal("0")
+
+        try:
+            recovery_amt = validate_advance_recovery(
+                outstanding, settlement_base, requested_recovery
+            )
+        except ValueError as exc:
+            return None, {"error": str(exc)}, status.HTTP_400_BAD_REQUEST
+
+        final_net = monthly_net - recovery_amt - quick_paid
+
+        field_values = dict(calc["field_values"])
+        field_values["QUICK_PAY_PAID"] = str(quick_paid.quantize(Decimal("0.01")))
+        field_values["ADVANCE_GIVEN"] = str(advance_given.quantize(Decimal("0.01")))
+        field_values["ADVANCE_RECOVERED_PRIOR"] = str(advance_recovered_so_far.quantize(Decimal("0.01")))
+        field_values["OUTSTANDING_ADVANCE"] = str(outstanding.quantize(Decimal("0.01")))
+        field_values["ADVANCE_RECOVERY"] = str(recovery_amt.quantize(Decimal("0.01")))
+        field_values["MONTHLY_NET_BEFORE_SETTLEMENT"] = str(monthly_net.quantize(Decimal("0.01")))
+        field_values["FINAL_NET_PAY"] = str(final_net.quantize(Decimal("0.01")))
+
         with transaction.atomic():
             existing = PayslipRecord.objects.filter(user=employee, month=month).first()
             if existing and existing.status == "PAID":
@@ -792,8 +864,8 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                 "paid_hours": attendance_snapshot.get("paid_hours", Decimal("0")),
                 "total_earnings": calc["total_earnings"],
                 "total_deductions": calc["total_deductions"],
-                "net_pay": calc["net_pay"],
-                "field_values": calc["field_values"],
+                "net_pay": final_net.quantize(Decimal("0.01")),
+                "field_values": field_values,
                 "attendance_snapshot": {
                     k: str(v) if hasattr(v, "quantize") else v for k, v in attendance_snapshot.items()
                 },
@@ -804,6 +876,7 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             if existing:
                 if not self._can_edit_record(existing):
                     return None, {"error": "This payslip cannot be edited in current state."}, status.HTTP_400_BAD_REQUEST
+                reverse_monthly_recoveries(existing.id)
                 for key, value in payload.items():
                     setattr(existing, key, value)
                 self._save_pdf_snapshot(existing)
@@ -813,6 +886,22 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                 record = PayslipRecord.objects.create(user=employee, month=month, **payload)
                 self._save_pdf_snapshot(record)
                 record.save(update_fields=["pdf_file"])
+
+            if recovery_amt > Decimal("0"):
+                from datetime import datetime
+
+                year, mon = month.split("-")
+                recovery_date = datetime(int(year), int(mon), 1).date()
+                apply_advance_recoveries_fifo(
+                    user_id=employee.id,
+                    settlement_month=month,
+                    recovery_amount=recovery_amt,
+                    source_type="MONTHLY_PAYSLIP",
+                    source_id=record.id,
+                    recovery_date=recovery_date,
+                    acting_user=request.user,
+                    notes=f"Monthly payslip {month}",
+                )
         return record, None, None
 
     @action(detail=False, methods=["post"], url_path="generate")
@@ -832,6 +921,7 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             field_config_id=data.get("field_config_id"),
             template_id=data.get("template_id"),
             request=request,
+            advance_recovery=data.get("advance_recovery"),
         )
         if err:
             return Response(err, status=err_status)
@@ -873,6 +963,7 @@ class PayslipRecordViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
                 field_config_id=data.get("field_config_id"),
                 template_id=data.get("template_id"),
                 request=request,
+                advance_recovery=data.get("advance_recovery"),
             )
             if err:
                 skipped.append(
@@ -1118,6 +1209,22 @@ class HourlyWageSummaryReportView(AdminOnlyMixin, APIView):
                     if user_id and config_id
                 }
 
+        advance_recovery_overrides = None
+        advance_recovery_map_raw = params.get("advance_recovery_map")
+        if advance_recovery_map_raw:
+            import json
+
+            try:
+                parsed_recovery = json.loads(advance_recovery_map_raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("advance_recovery_map must be valid JSON") from exc
+            if isinstance(parsed_recovery, dict):
+                advance_recovery_overrides = {
+                    str(user_id): parsed_recovery[user_id]
+                    for user_id in parsed_recovery
+                    if user_id is not None
+                }
+
         context = gather_quick_pay_report_context(
             location_id=location_id,
             start_date=start_date,
@@ -1129,6 +1236,7 @@ class HourlyWageSummaryReportView(AdminOnlyMixin, APIView):
             date_filter=date_filter,
             user_ids=user_ids,
             field_config_overrides=field_config_overrides,
+            advance_recovery_overrides=advance_recovery_overrides,
         )
         if not context.get("hourly_rows") and not context.get("monthly_rows"):
             raise ValueError(
@@ -1140,6 +1248,7 @@ class HourlyWageSummaryReportView(AdminOnlyMixin, APIView):
     def get(self, request, export_format):
         try:
             context, start_date, end_date = self._build_context(request)
+            persist = str(request.query_params.get("persist", "true")).lower() not in ("false", "0", "no")
             if export_format == "excel":
                 from .hourly_wage_summary_excel import generate_hourly_wage_summary_excel_internal
 
@@ -1156,6 +1265,38 @@ class HourlyWageSummaryReportView(AdminOnlyMixin, APIView):
                 ext = "pdf"
             else:
                 return Response({"error": "Invalid export format"}, status=status.HTTP_400_BAD_REQUEST)
+
+            if persist:
+                from .advance_services import persist_quick_pay_disbursements
+
+                location_id = request.query_params.get("location_id")
+                if not location_id and not getattr(request.user, "is_superuser", False):
+                    location_id = str(getattr(request.user, "location_id", "") or "")
+
+                all_rows = (context.get("hourly_rows") or []) + (context.get("monthly_rows") or [])
+                field_config_by_user = {}
+                salary_type_by_user = {}
+                attendance_by_user = {}
+                for row in all_rows:
+                    uid = str(row.get("user_id"))
+                    if row.get("field_config_id"):
+                        field_config_by_user[uid] = row.get("field_config_id")
+                    salary_type_by_user[uid] = row.get("salary_type") or "monthly"
+                    attendance_by_user[uid] = row.get("attendance_snapshot") or {}
+
+                persist_quick_pay_disbursements(
+                    rows=all_rows,
+                    location_id=location_id,
+                    settlement_month=context.get("settlement_month") or settlement_month_from_date(end_date),
+                    period_start=start_date,
+                    period_end=end_date,
+                    date_filter=request.query_params.get("date_filter", "today"),
+                    export_format=export_format,
+                    acting_user=request.user,
+                    field_config_by_user=field_config_by_user,
+                    salary_type_by_user=salary_type_by_user,
+                    attendance_by_user=attendance_by_user,
+                )
 
             with open(result["file_path"], "rb") as fh:
                 content = fh.read()

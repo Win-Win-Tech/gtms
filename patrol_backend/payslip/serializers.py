@@ -8,6 +8,9 @@ from .models import (
     PayslipFieldConfig,
     PayslipField,
     PayslipRecord,
+    PayrollAdvance,
+    PayrollAdvanceRecovery,
+    QuickPayDisbursement,
 )
 
 
@@ -262,6 +265,9 @@ class PayslipGenerateSerializer(serializers.Serializer):
     month = serializers.CharField(max_length=7)
     field_config_id = serializers.UUIDField(required=False, allow_null=True)
     template_id = serializers.UUIDField(required=False, allow_null=True)
+    advance_recovery = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
 
 
 class PayslipBulkGenerateSerializer(serializers.Serializer):
@@ -269,6 +275,9 @@ class PayslipBulkGenerateSerializer(serializers.Serializer):
     month = serializers.CharField(max_length=7)
     field_config_id = serializers.UUIDField(required=False, allow_null=True)
     template_id = serializers.UUIDField(required=False, allow_null=True)
+    advance_recovery = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, allow_null=True, min_value=0
+    )
 
 
 class PayslipMarkPaidSerializer(serializers.Serializer):
@@ -316,4 +325,143 @@ class PayslipRecordAttendanceEditSerializer(serializers.Serializer):
                 {"half_days": "half_days must be a whole number (0, 1, 2, ...)."}
             )
         return attrs
+
+
+class PayrollAdvanceRecoverySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PayrollAdvanceRecovery
+        fields = (
+            "id",
+            "amount",
+            "recovery_date",
+            "source_type",
+            "source_id",
+            "notes",
+            "created_on",
+        )
+
+
+class PayrollAdvanceSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.name", read_only=True)
+    employee_code = serializers.CharField(source="user.employee_code", read_only=True)
+    recoveries = PayrollAdvanceRecoverySerializer(many=True, read_only=True)
+    recovered_total = serializers.SerializerMethodField()
+    outstanding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PayrollAdvance
+        fields = (
+            "id",
+            "user",
+            "user_name",
+            "employee_code",
+            "location",
+            "settlement_month",
+            "amount",
+            "advance_date",
+            "payment_mode",
+            "reference_no",
+            "notes",
+            "status",
+            "created_on",
+            "modified_on",
+            "created_by",
+            "recoveries",
+            "recovered_total",
+            "outstanding",
+        )
+        read_only_fields = ("created_on", "modified_on", "created_by", "status")
+
+    def get_recovered_total(self, obj):
+        from django.db.models import Sum
+
+        total = obj.recoveries.aggregate(total=Sum("amount"))["total"]
+        return str(total or Decimal("0"))
+
+    def get_outstanding(self, obj):
+        from django.db.models import Sum
+
+        recovered = obj.recoveries.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+        remaining = Decimal(obj.amount) - Decimal(recovered)
+        return str(remaining if remaining > Decimal("0") else Decimal("0"))
+
+
+class PayrollAdvanceCreateSerializer(serializers.Serializer):
+    user_id = serializers.UUIDField()
+    location_id = serializers.UUIDField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"))
+    advance_date = serializers.DateField()
+    settlement_month = serializers.CharField(max_length=7, required=False, allow_blank=True)
+    payment_mode = serializers.ChoiceField(
+        choices=[c[0] for c in PayslipRecord.PAYMENT_MODE_CHOICES],
+        required=False,
+        default="cash",
+    )
+    reference_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class AdvanceSummarySerializer(serializers.Serializer):
+    user_id = serializers.UUIDField()
+    settlement_month = serializers.CharField(max_length=7)
+    advance_given = serializers.CharField()
+    advance_recovered = serializers.CharField()
+    outstanding_advance = serializers.CharField()
+    quick_paid_total = serializers.CharField()
+
+
+class QuickPayDisbursementSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source="user.name", read_only=True)
+    employee_code = serializers.CharField(source="user.employee_code", read_only=True)
+    exported_by_name = serializers.CharField(source="exported_by.name", read_only=True)
+    period_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuickPayDisbursement
+        fields = (
+            "id",
+            "user",
+            "user_name",
+            "employee_code",
+            "location",
+            "settlement_month",
+            "period_start",
+            "period_end",
+            "period_label",
+            "date_filter",
+            "salary_type",
+            "gross_earnings",
+            "total_deductions",
+            "net_before_advance",
+            "advance_recovery",
+            "net_paid",
+            "export_format",
+            "exported_on",
+            "exported_by",
+            "exported_by_name",
+            "payment_status",
+            "paid_amount",
+            "paid_on",
+            "payment_mode",
+            "payment_ref_no",
+            "payment_notes",
+            "paid_marked_by",
+        )
+
+    def get_period_label(self, obj):
+        if obj.period_start == obj.period_end:
+            return str(obj.period_start)
+        return f"{obj.period_start} to {obj.period_end}"
+
+
+class QuickPayMarkPaidSerializer(serializers.Serializer):
+    paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    paid_on = serializers.DateTimeField(required=False)
+    payment_mode = serializers.ChoiceField(
+        choices=[c[0] for c in PayslipRecord.PAYMENT_MODE_CHOICES],
+        required=False,
+        allow_null=True,
+    )
+    payment_ref_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    payment_notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
