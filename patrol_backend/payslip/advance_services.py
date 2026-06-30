@@ -223,6 +223,56 @@ def create_payroll_advance(
     )
 
 
+def _advance_recovered_total(advance: PayrollAdvance) -> Decimal:
+    total = advance.recoveries.aggregate(total=Sum("amount"))["total"]
+    return _to_decimal(total, "0")
+
+
+@transaction.atomic
+def update_payroll_advance(
+    advance: PayrollAdvance,
+    *,
+    amount=None,
+    advance_date=None,
+    payment_mode=None,
+    reference_no=None,
+    notes=None,
+):
+    locked = PayrollAdvance.objects.select_for_update().get(pk=advance.pk)
+    recovered = _advance_recovered_total(locked)
+
+    if amount is not None:
+        new_amt = _to_decimal(amount, "0").quantize(Decimal("0.01"))
+        if new_amt <= Decimal("0"):
+            raise ValueError("Advance amount must be greater than zero.")
+        if new_amt < recovered:
+            raise ValueError(
+                f"Amount cannot be less than already recovered ({recovered.quantize(Decimal('0.01'))})."
+            )
+        locked.amount = new_amt
+
+    if advance_date is not None:
+        locked.advance_date = advance_date
+    if payment_mode is not None:
+        locked.payment_mode = payment_mode
+    if reference_no is not None:
+        locked.reference_no = reference_no
+    if notes is not None:
+        locked.notes = notes
+
+    locked.save()
+    _refresh_advance_status(locked)
+    return locked
+
+
+@transaction.atomic
+def delete_payroll_advance(advance: PayrollAdvance):
+    locked = PayrollAdvance.objects.select_for_update().get(pk=advance.pk)
+    if _advance_recovered_total(locked) > Decimal("0"):
+        raise ValueError("Cannot delete an advance that has recoveries.")
+    locked.delete()
+
+
 def _field_amount(field_values, *codes):
     for code in codes:
         val = field_values.get(code)
@@ -351,3 +401,80 @@ def reverse_monthly_recoveries(source_id):
         advance = PayrollAdvance.objects.filter(id=advance_id).first()
         if advance:
             _refresh_advance_status(advance)
+
+
+@transaction.atomic
+def reverse_quick_pay_recoveries(source_id):
+    """Remove Quick Pay recoveries linked to a disbursement."""
+    recoveries = PayrollAdvanceRecovery.objects.filter(
+        source_type="QUICK_PAY",
+        source_id=source_id,
+    ).select_related("advance")
+    advances_to_refresh = set()
+    for rec in recoveries:
+        advances_to_refresh.add(rec.advance_id)
+    recoveries.delete()
+    for advance_id in advances_to_refresh:
+        advance = PayrollAdvance.objects.filter(id=advance_id).first()
+        if advance:
+            _refresh_advance_status(advance)
+
+
+@transaction.atomic
+def update_quick_pay_disbursement(
+    disbursement,
+    *,
+    advance_recovery=None,
+    paid_amount=None,
+    payment_mode=None,
+    payment_ref_no=None,
+    payment_notes=None,
+    acting_user=None,
+):
+    locked = QuickPayDisbursement.objects.select_for_update().get(pk=disbursement.pk)
+
+    if locked.payment_status == "PAID":
+        if advance_recovery is not None:
+            raise ValueError("Cannot change advance recovery on a paid disbursement.")
+        if paid_amount is not None:
+            locked.paid_amount = _to_decimal(paid_amount, "0").quantize(Decimal("0.01"))
+        if payment_mode is not None:
+            locked.payment_mode = payment_mode
+        if payment_ref_no is not None:
+            locked.payment_ref_no = payment_ref_no
+        if payment_notes is not None:
+            locked.payment_notes = payment_notes
+        locked.save()
+        return locked
+
+    if advance_recovery is not None:
+        reverse_quick_pay_recoveries(locked.id)
+        recovery = validate_advance_recovery(
+            get_outstanding_advance(locked.user_id, locked.settlement_month),
+            locked.net_before_advance,
+            advance_recovery,
+        )
+        locked.advance_recovery = recovery
+        locked.net_paid = (locked.net_before_advance - recovery).quantize(Decimal("0.01"))
+        locked.save(update_fields=["advance_recovery", "net_paid"])
+        if recovery > Decimal("0"):
+            apply_advance_recoveries_fifo(
+                user_id=locked.user_id,
+                settlement_month=locked.settlement_month,
+                recovery_amount=recovery,
+                source_type="QUICK_PAY",
+                source_id=locked.id,
+                recovery_date=locked.period_end,
+                acting_user=acting_user,
+                notes=f"Quick Pay {locked.period_start} to {locked.period_end}",
+            )
+    return locked
+
+
+@transaction.atomic
+def delete_quick_pay_disbursement(disbursement):
+    locked = QuickPayDisbursement.objects.select_for_update().get(pk=disbursement.pk)
+    if locked.payment_status == "PAID":
+        raise ValueError("Cannot delete a disbursement already marked as paid.")
+    reverse_quick_pay_recoveries(locked.id)
+    locked.delete()

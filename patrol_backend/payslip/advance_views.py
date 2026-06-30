@@ -12,12 +12,15 @@ from patrol_backend.utils.timezone_utils import get_user_timezone_from_request
 
 from .advance_services import (
     create_payroll_advance,
+    delete_payroll_advance,
     get_advance_summary,
+    update_payroll_advance,
 )
 from .models import EmployeePayrollProfile, PayrollAdvance
 from .serializers import (
     PayrollAdvanceCreateSerializer,
     PayrollAdvanceSerializer,
+    PayrollAdvanceUpdateSerializer,
 )
 from .services import gather_quick_pay_report_context, resolve_quick_pay_date_range
 from .views import AdminOnlyMixin
@@ -37,7 +40,7 @@ def _resolve_location_id(request):
 class PayrollAdvanceViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
     queryset = PayrollAdvance.objects.select_related("user", "location").prefetch_related("recoveries").all()
     serializer_class = PayrollAdvanceSerializer
-    http_method_names = ["get", "post", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -98,6 +101,52 @@ class PayrollAdvanceViewSet(AdminOnlyMixin, viewsets.ModelViewSet):
             PayrollAdvanceSerializer(advance).data,
             status=status.HTTP_201_CREATED,
         )
+
+    def _get_advance_for_request(self, pk):
+        location_id, err = _resolve_location_id(self.request)
+        if err:
+            return None, Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+        advance = self.get_queryset().filter(pk=pk, location_id=location_id).first()
+        if not advance:
+            return None, Response({"error": "Advance not found"}, status=status.HTTP_404_NOT_FOUND)
+        return advance, None
+
+    def partial_update(self, request, *args, **kwargs):
+        advance, err_resp = self._get_advance_for_request(kwargs.get("pk"))
+        if err_resp:
+            return err_resp
+
+        serializer = PayrollAdvanceUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not data:
+            return Response({"error": "No fields to update"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            updated = update_payroll_advance(
+                advance,
+                amount=data.get("amount"),
+                advance_date=data.get("advance_date"),
+                payment_mode=data.get("payment_mode"),
+                reference_no=data.get("reference_no"),
+                notes=data.get("notes"),
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(PayrollAdvanceSerializer(updated).data)
+
+    def destroy(self, request, *args, **kwargs):
+        advance, err_resp = self._get_advance_for_request(kwargs.get("pk"))
+        if err_resp:
+            return err_resp
+
+        try:
+            delete_payroll_advance(advance)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["get"], url_path="summary")
     def summary(self, request):

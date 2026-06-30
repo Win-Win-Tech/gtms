@@ -401,6 +401,19 @@ class PayrollAdvanceCreateSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
+class PayrollAdvanceUpdateSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0.01"), required=False
+    )
+    advance_date = serializers.DateField(required=False)
+    payment_mode = serializers.ChoiceField(
+        choices=[c[0] for c in PayslipRecord.PAYMENT_MODE_CHOICES],
+        required=False,
+    )
+    reference_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
 class AdvanceSummarySerializer(serializers.Serializer):
     user_id = serializers.UUIDField()
     settlement_month = serializers.CharField(max_length=7)
@@ -435,6 +448,8 @@ class QuickPayDisbursementSerializer(serializers.ModelSerializer):
             "net_before_advance",
             "advance_recovery",
             "net_paid",
+            "field_values",
+            "attendance_snapshot",
             "export_format",
             "exported_on",
             "exported_by",
@@ -464,4 +479,35 @@ class QuickPayMarkPaidSerializer(serializers.Serializer):
     )
     payment_ref_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     payment_notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class QuickPayDisbursementUpdateSerializer(serializers.Serializer):
+    advance_recovery = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0"), required=False
+    )
+    paid_amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0.01"), required=False
+    )
+    payment_mode = serializers.ChoiceField(
+        choices=[c[0] for c in PayslipRecord.PAYMENT_MODE_CHOICES],
+        required=False,
+        allow_null=True,
+    )
+    payment_ref_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    payment_notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class QuickPayBulkMarkPaidSerializer(serializers.Serializer):
+    ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=False)
+    payment_mode = serializers.ChoiceField(
+        choices=[c[0] for c in PayslipRecord.PAYMENT_MODE_CHOICES],
+        required=False,
+        default="cash",
+    )
+    payment_ref_no = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    payment_notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    paid_amounts = serializers.DictField(
+        child=serializers.DecimalField(max_digits=12, decimal_places=2),
+        required=False,
+    )
 

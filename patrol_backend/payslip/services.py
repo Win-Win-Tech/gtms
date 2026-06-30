@@ -108,11 +108,14 @@ def calculate_attendance_from_master(user, month_str, user_tz):
 
 
 def resolve_quick_pay_date_range(date_filter, start_date_str, end_date_str, user_tz):
-    """Resolve today, this month (1st through today), or custom range (capped at user today)."""
+    """Resolve today, this week, this month (1st through today), or custom range (capped at user today)."""
     user_today = get_user_today(user_tz)
     df = (date_filter or "today").strip().lower()
     if df == "today":
         return user_today, user_today
+    if df == "week":
+        week_start = user_today - timedelta(days=user_today.weekday())
+        return week_start, user_today
     if df == "month":
         return user_today.replace(day=1), user_today
     if df == "custom":
@@ -125,7 +128,7 @@ def resolve_quick_pay_date_range(date_filter, start_date_str, end_date_str, user
         if end_date > user_today:
             end_date = user_today
         return start_date, end_date
-    raise ValueError("date_filter must be 'today', 'month', or 'custom'.")
+    raise ValueError("date_filter must be 'today', 'week', 'month', or 'custom'.")
 
 
 def use_full_monthly_salary_calc(date_filter, start_date, end_date) -> bool:
