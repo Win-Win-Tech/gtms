@@ -226,14 +226,25 @@ FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API respo
 # 1:N kiosk identification — margin check stops wrong-user; tolerance allows haircut/appearance drift
 FACE_IDENTIFY_TOLERANCE = 0.45  # relaxed pass (quality retry / appearance change e.g. haircut)
 FACE_IDENTIFY_TOLERANCE_STRICT = 0.38  # fast-path instant accept when clearly best match
-FACE_IDENTIFY_MIN_MARGIN = 0.055  # best must beat 2nd place (main wrong-user guard)
+FACE_IDENTIFY_MIN_MARGIN = 0.08  # best must beat 2nd place (main wrong-user guard)
 FACE_IDENTIFY_TOP_K = 3
 FACE_IDENTIFY_REJECT_MULTIPLE_FACES = True
+
+# FACE_IDENTIFY_TOLERANCE → 0.40 (or 0.39)
+# FACE_IDENTIFY_TOLERANCE_STRICT → 0.35
+# FACE_IDENTIFY_MIN_MARGIN → 0.08 (or 0.10)
+
 # Quality encode only when fast 640px detect finds no face (blur / distance)
 FACE_IDENTIFY_QUALITY_RETRY = True
 FACE_IDENTIFY_MAX_IMAGE_WIDTH = 960
 FACE_IDENTIFY_UPSAMPLE = 1
 FACE_IDENTIFY_NUM_JITTERS = 1
+# Extra safety: re-verify matched user (1:1) for borderline relaxed matches.
+# Kept fast by default: runs only on relaxed-tier outcomes.
+FACE_IDENTIFY_SECOND_PASS_VERIFY = True
+FACE_IDENTIFY_SECOND_PASS_RELAXED_ONLY = True
+FACE_IDENTIFY_SECOND_PASS_USE_QUALITY = True
+FACE_IDENTIFY_SECOND_PASS_TOLERANCE = 0.42
 
 # Kiosk face_attendance performance
 FACE_KIOSK_FAST_PATH = True

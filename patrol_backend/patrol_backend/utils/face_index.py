@@ -216,6 +216,18 @@ def _match_encoding_tiered(
     return "over_tolerance", best_user_id, best_dist, "none"
 
 
+def _distance_to_user(entry: FaceLocationIndex, user_id: str, encoding: Optional[np.ndarray]) -> Optional[float]:
+    if encoding is None:
+        return None
+    try:
+        idx = entry.user_ids.index(str(user_id))
+    except ValueError:
+        return None
+    ref = entry.vectors32[idx]
+    query = np.asarray(encoding, dtype=np.float32)
+    return float(np.linalg.norm(ref - query))
+
+
 def identify_user_in_location(
     location_id: str,
     live_image_bytes: bytes,
@@ -237,6 +249,12 @@ def identify_user_in_location(
     top_k = get_identify_top_k()
     reject_multi = getattr(settings, "FACE_IDENTIFY_REJECT_MULTIPLE_FACES", True)
     quality_retry = getattr(settings, "FACE_IDENTIFY_QUALITY_RETRY", True)
+    second_pass_verify = getattr(settings, "FACE_IDENTIFY_SECOND_PASS_VERIFY", True)
+    second_pass_relaxed_only = getattr(settings, "FACE_IDENTIFY_SECOND_PASS_RELAXED_ONLY", True)
+    second_pass_use_quality = getattr(settings, "FACE_IDENTIFY_SECOND_PASS_USE_QUALITY", True)
+    second_pass_tol = float(
+        getattr(settings, "FACE_IDENTIFY_SECOND_PASS_TOLERANCE", strict_tol)
+    )
 
     entry = get_or_rebuild_location_index(loc)
     if entry.vectors32.shape[0] == 0:
@@ -244,7 +262,7 @@ def identify_user_in_location(
 
     def _dual_match(frame: IdentifyFrameResult, tier_label: str):
         if reject_multi and frame.face_count > 1:
-            return "multi", None, None
+            return "multi", None, None, "none"
         verdict, user_id, dist, match_tier = _match_encoding_tiered(
             entry,
             frame.encoding,
@@ -262,18 +280,45 @@ def identify_user_in_location(
                 user_id,
                 dist,
             )
-            return "ok", user_id, dist
+            return "ok", user_id, dist, match_tier
         if verdict == "ambiguous":
-            return "ambiguous", user_id, dist
+            return "ambiguous", user_id, dist, "none"
         if frame.encoding is None:
-            return "no_face", None, None
-        return "no_match", user_id, dist
+            return "no_face", None, None, "none"
+        return "no_match", user_id, dist, "none"
 
     fast_frame = extract_identify_frame(live_image_bytes, use_quality=False)
-    outcome, user_id, dist = _dual_match(fast_frame, "fast")
+    outcome, user_id, dist, match_tier = _dual_match(fast_frame, "fast")
     if outcome == "multi":
         return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
     if outcome == "ok" and user_id:
+        needs_second_pass = second_pass_verify and (
+            (not second_pass_relaxed_only) or match_tier == "relaxed"
+        )
+        if needs_second_pass:
+            verify_frame = (
+                extract_identify_frame(live_image_bytes, use_quality=True)
+                if second_pass_use_quality
+                else fast_frame
+            )
+            if reject_multi and verify_frame.face_count > 1:
+                return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
+            verify_dist = _distance_to_user(entry, user_id, verify_frame.encoding)
+            if verify_dist is None or verify_dist > second_pass_tol:
+                logger.info(
+                    "Face identify second-pass rejected location=%s user=%s dist=%s tol=%.4f tier=%s",
+                    loc,
+                    user_id,
+                    f"{verify_dist:.4f}" if verify_dist is not None else "none",
+                    second_pass_tol,
+                    match_tier,
+                )
+                return _identify_fail(
+                    loc,
+                    "face_not_matched",
+                    live_image_bytes,
+                    verify_dist if verify_dist is not None else dist,
+                )
         return user_id, "success", dist
     if outcome == "ambiguous":
         return _identify_fail(loc, "ambiguous_match", live_image_bytes, dist)
@@ -284,7 +329,7 @@ def identify_user_in_location(
         return _identify_fail(loc, "face_not_detected", live_image_bytes)
 
     quality_frame = extract_identify_frame(live_image_bytes, use_quality=True)
-    outcome, user_id, dist = _dual_match(quality_frame, "quality")
+    outcome, user_id, dist, _match_tier = _dual_match(quality_frame, "quality")
     if outcome == "multi":
         return _identify_fail(loc, "multiple_faces_detected", live_image_bytes)
     if outcome == "ok" and user_id:
