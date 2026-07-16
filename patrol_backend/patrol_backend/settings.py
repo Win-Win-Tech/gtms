@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     'reports',  # Added for Celery tasks
     'corsheaders',
     'incident',
+    'rollcall',
     'django_celery_beat',
     'livetracking',  # Sokcet app
     ]
