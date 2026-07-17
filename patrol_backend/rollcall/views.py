@@ -1,4 +1,5 @@
 from django.db.models import Q
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -8,6 +9,7 @@ from rest_framework.views import APIView
 
 from scheduler.models import Location, Shift
 
+from .exports import generate_rollcall_excel, generate_rollcall_pdf
 from .models import RollCallSession
 from .serializers import RollCallSessionSerializer
 from .utils import (
@@ -238,3 +240,48 @@ class RollCallDashboardFilterView(RollCallSessionListView):
     """Backward-compatible alias for GET /rollcall/dashboard/filter/."""
 
     pass
+
+
+class RollCallExcelExportView(APIView):
+    """GET /rollcall/sessions/export/ — Excel download (same filters as list)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs, err, err_status = _list_rollcall_sessions(request)
+        if err:
+            return Response({"error": err}, status=err_status)
+        try:
+            content, filename = generate_rollcall_excel(qs, request)
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to generate Excel: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(
+            content,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class RollCallPdfExportView(APIView):
+    """GET /rollcall/sessions/export-pdf/ — PDF download (same filters as list)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs, err, err_status = _list_rollcall_sessions(request)
+        if err:
+            return Response({"error": err}, status=err_status)
+        try:
+            content, filename = generate_rollcall_pdf(qs, request)
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to generate PDF: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response

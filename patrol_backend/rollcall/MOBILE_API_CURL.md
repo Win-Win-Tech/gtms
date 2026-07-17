@@ -79,6 +79,20 @@ curl -s "http://localhost:8000/rollcall/sessions/?date_filter=today&status=open&
 
 Legacy alias (still works): `GET /rollcall/dashboard/filter/`
 
+### Admin export (Excel / PDF)
+
+Same filters as the list endpoint:
+
+```bash
+# Excel
+curl -OJ "http://localhost:8000/rollcall/sessions/export/?date_filter=today&status=all&location_id=<LOCATION_UUID>" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+
+# PDF
+curl -OJ "http://localhost:8000/rollcall/sessions/export-pdf/?date_filter=today&status=all&location_id=<LOCATION_UUID>" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
 ---
 
 ## 3) Start a new session (upload start / group photo)
