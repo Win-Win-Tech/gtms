@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'incident',
     'rollcall',
+    'visitor',
     'django_celery_beat',
     'livetracking',  # Sokcet app
     ]

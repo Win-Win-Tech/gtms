@@ -1,233 +1,372 @@
-# GTMS Visitor Management Module: AI/ML-Powered Implementation Plan
+# GTMS Visitor Management — Implementation Plan
 
-This revised implementation plan outlines the database architecture, API designs, screen workflows, and project timelines for the **GTMS Visitor Entry & Visitor Management Module**. 
+Revised plan for the **Visitor Entry & Visitor Management** module.
 
-It incorporates a backend-only AI pipeline using **YOLOv8-nano** and **PaddleOCR** to auto-detect vehicle license plates and ID numbers, and provides a clear strategy for classifying and parsing different international ID cards.
+**Locked decisions**
+- **Iteration 1 = manual only** (models + APIs + web). AI/OCR is **Iteration 2**.
+- `ic_passport_number` is **unique per location** (not global).
+- **QR expiry / Expired status** — deferred; revisit later.
+- Walk-in check-in allowed without a prior invitation.
+- When AI lands: OCR/plate results always **editable** (AI pre-fills; never blocks check-in).
 
----
-
-## 1. AI/ML Extraction Pipeline (Backend-Only)
-
-We will implement a modular image-processing pipeline in Python on the Django backend using two open-source frameworks:
-* **YOLOv8-nano (Ultralytics)**: A lightweight object detection model (approx. 6MB) used to localize regions of interest (e.g., license plates or ID text zones) in under 50ms on a standard CPU.
-* **PaddleOCR**: A highly accurate OCR engine used to extract text strings from cropped bounding boxes.
-
-### Pipeline A: Vehicle License Plate Detection & Extraction
-For vehicle photos captured during entry or exit:
-```
-[Raw Vehicle Image] 
-       │
-       ▼ (YOLOv8-nano)
-[Detect Bounding Box of License Plate]
-       │
-       ▼ (Image Crop)
-[Cropped License Plate Image]
-       │
-       ▼ (PaddleOCR)
-[Raw Text: "W N D 12 3 4"]
-       │
-       ▼ (RegEx Cleansing)
-[Extracted Plate: "WND1234"]
-```
-1. **YOLOv8-nano Localization**: The backend runs the uploaded vehicle photo through a pre-trained YOLOv8-nano model fine-tuned for license plate detection. It returns the coordinates `[x_min, y_min, x_max, y_max]` of the license plate.
-2. **Cropping**: Python's `Pillow` library crops the image to the plate boundaries.
-3. **Text Extraction**: The cropped image is passed to PaddleOCR to read the characters.
-4. **Post-Processing**: RegEx strips non-alphanumeric characters, corrects common OCR substitutions (e.g., `O` $\rightarrow$ `0`, `I` $\rightarrow$ `1`), and returns the cleaned plate number.
+Aligns with GTMS conventions: app prefix `/visitors/`, location scoping, soft delete, JWT auth, Excel export, `MOBILE_API_CURL.md`.
 
 ---
 
-### Pipeline B: ID Card Classification & Extraction (Solving the ID Doubt)
-**The Challenge:** Since PaddleOCR extracts raw text lines, how do we distinguish between an Indian Driving License, Malaysian MyKad, or a Passport, and isolate the correct ID number?
+## Why this order (manual → AI)
 
-**The Solution:** We will implement a **Dual-Verification Strategy** combining **Document Hinting** (Primary) and **RegEx Pattern Classifiers** (Secondary).
+| Approach | Verdict |
+|----------|---------|
+| **A. Manual first, AI second (this plan)** | **Preferred.** Core product (check-in/out, history, uniqueness, location scoping) ships without ML install risk. AI becomes a thin prefill layer on stable fields. |
+| **B. AI + manual together in Iter 1** | Riskier. YOLO/PaddleOCR setup, timeouts, and CPU deps sit on the critical path and can delay a usable gatehouse flow. |
 
-#### 1. Document Hinting (Metadata-driven)
-In the Web and Mobile manual check-in screens, when uploading an ID proof, the user is required to select the **Document Type** from a dropdown:
-* Malaysian MyKad
-* Indian Aadhaar
-* Indian Driving License
-* Passport
-* Other ID
-
-This selected value is sent to the backend as a string field (`document_type`) along with the image.
-
-#### 2. RegEx Pattern Classifier (Backend Parser)
-Based on the selected `document_type` (or as an auto-detect fallback if "Other" is chosen), the backend runs PaddleOCR on the card and applies specialized regular expression matchers:
-
-```python
-import re
-
-def parse_extracted_text(text_lines, document_type):
-    # Flatten text lines into a single searchable string
-    full_text = " ".join(text_lines).upper().replace(" ", "")
-
-    if document_type == "malaysian_mykad":
-        # Matches Malaysian ID format YYMMDD-PB-### or YYMMDDPB### (12 digits)
-        match = re.search(r"\b\d{6}-?\d{2}-?\d{4}\b", full_text)
-        return match.group(0) if match else None
-
-    elif document_type == "indian_aadhaar":
-        # Matches 12-digit Indian Aadhaar card number
-        match = re.search(r"\b\d{12}\b", full_text)
-        return match.group(0) if match else None
-
-    elif document_type == "indian_dl":
-        # Matches Indian Driving License: State code (2 letters) + Year (2/4 digits) + 11 digits
-        # Example: DL-1320110123456
-        match = re.search(r"\b[A-Z]{2}-?\d{2}-?\d{11}\b", full_text)
-        return match.group(0) if match else None
-
-    elif document_type == "passport":
-        # Matches standard passport formats: 1 letter + 7 or 8 digits
-        match = re.search(r"\b[A-Z][0-9]{7,8}\b", full_text)
-        return match.group(0) if match else None
-
-    else:
-        # Fallback Auto-Detection: Check all patterns in order of confidence
-        for pattern in [r"\b\d{6}-?\d{2}-?\d{4}\b", r"\b\d{12}\b", r"\b[A-Z]{2}-?\d{2}-?\d{11}\b", r"\b[A-Z][0-9]{7,8}\b"]:
-            match = re.search(pattern, full_text)
-            if match:
-                return match.group(0)
-        return None
-```
+AI is an accelerator, not the source of truth. Staff must always be able to type IC / plate manually — so build that path first, then bolt OCR on.
 
 ---
 
-## 2. Relational Database Design
+## 1. Database design (Iteration 1)
 
-The database schema consists of three normalized tables in Django:
+Three tables in Django app `visitor`:
 
 ```mermaid
 erDiagram
+    Location ||--o{ Visitor : scopes
     Visitor ||--o{ VisitorEntry : has
     VisitorEntry ||--o{ VisitorAsset : contains
-    
+    User ||--o{ VisitorEntry : hosts
+
     Visitor {
         UUID id PK
-        string ic_passport_number UK "Unique ID Code"
+        UUID location_id FK
+        string ic_passport_number "Unique with location"
+        string document_type
         string visitor_name
         string phone_number
+        bool is_deleted
+        datetime created_on
     }
-    
+
     VisitorEntry {
         UUID id PK
         UUID visitor_id FK
-        UUID host_id FK "User Model"
+        UUID host_id FK "User"
         UUID location_id FK
-        string visitor_type "Contractor | Client | Delivery | Guest | Other"
-        string status "Open | Checked-In | Checked-Out | Expired"
+        string visitor_type "contractor|client|delivery|guest|other"
+        string status "open|checked_in|checked_out|cancelled"
         string purpose_of_visit
         string vehicle_number
         string remarks
         datetime check_in_time
         datetime check_out_time
+        datetime visit_date_time "Invitations"
         string qr_token UK
         file qr_image
-        datetime visit_date_time "For invitations"
+        UUID created_by FK
+        bool is_deleted
         datetime created_on
     }
-    
+
     VisitorAsset {
         UUID id PK
         UUID visitor_entry_id FK
-        string asset_type "VisitorPhoto | IDProof | ExitPhoto | AdditionalImage"
-        file file "Already timestamped by Mobile client"
+        string asset_type "visitor_photo|id_proof|exit_photo|vehicle_photo|other"
+        file file
         datetime created_on
     }
 ```
 
----
-
-## 3. API Logical Workflows & State Machine
-
-### Flow A: OCR Extract API (`POST /api/visitors/ocr-id/`)
-Extracts text from uploaded ID documents:
-* **Request**: Multipart Form:
-  - `id_proof` (Image File)
-  - `document_type` (String, e.g. `'malaysian_mykad'`, `'passport'`)
-* **Logic**:
-  1. Backend runs PaddleOCR on the image.
-  2. Runs `parse_extracted_text` filter using the `document_type` metadata.
-  3. Returns the extracted number string.
-* **Response**: `{"success": true, "extracted_id": "950812105432"}`.
-
-### Flow B: Vehicle Plate Extract API (`POST /api/visitors/detect-plate/`)
-Extracts license numbers from vehicle photos:
-* **Request**: Multipart Form containing `vehicle_image`.
-* **Logic**:
-  1. Runs YOLOv8-nano to detect license plate bounding box.
-  2. Crops plate image using Pillow.
-  3. Runs PaddleOCR on cropped image.
-  4. Returns the plate number text.
-* **Response**: `{"success": true, "plate_number": "WND1234"}`.
-
-### Flow C: Manual Check-In API (`POST /api/visitors/checkin/`)
-Handles manual entries:
-* **Request**: Form fields containing visitor parameters and assets (`photo`, `id_proof`).
-* **Logic**:
-  1. Creates or updates the `Visitor` profile.
-  2. Maps to an existing `'Open'` invitation if found, updating status to `'Checked-In'` and setting `check_in_time = now()`.
-  3. If no open invitation exists, creates a new `VisitorEntry` (status `'Checked-In'`), generating a unique `qr_token` and `qr_image` checkout pass.
-  4. Saves images in the `VisitorAsset` table.
-
-### Flow D: Single QR Scan API (`POST /api/visitors/qr-scan/`)
-* **Scan 1 (Status: `'Open'`)**: Returns pre-populated invitation details to show the Check-In form.
-* **Scan 2 (Status: `'Checked-In'`)**: Returns status and redirects user to the Check-Out form.
-* **Scan 3+ (Status: `'Checked-Out'` / `'Expired'`)**: Returns error: `{"error": "QR Code Expired / Invalid"}`.
+### Constraints & conventions
+| Rule | Detail |
+|------|--------|
+| IC uniqueness | `UniqueConstraint(location, ic_passport_number)` where `is_deleted=False` (or equivalent) |
+| Location scoping | Non-superuser locked to `request.user.location`; superadmin may pass `location_id` |
+| Soft delete | `is_deleted` on Visitor / VisitorEntry |
+| Status (v1) | `open` (invite), `checked_in`, `checked_out`, `cancelled` — **no `expired` yet** |
+| QR | Generated on invite and/or check-in; reusable until checkout/cancel |
+| Document type | Stored on `Visitor` for later OCR parsers; required or optional in manual form (product choice) |
 
 ---
 
-## 4. Web Panel Screens
+## 2. API surface (GTMS style — `/visitors/`)
 
-1. **Visitor History Page**: Lazy-loaded datagrid of entries, status filters, details drawer, and a **Mark Exit** button with optional exit image capture.
-2. **Manual Entry Screen**: Registration form. Dropdown for `Document Type`. Selecting it and dropping the ID Proof triggers the backend OCR API and auto-fills the read-only IC number field. Includes a vehicle image scanner helper. Generates printable QR pass on check-in.
-3. **Invitation Screen**: Standard scheduler form for hosts/HR generating `'Open'` entries and printable QR passes.
+Auth: `Authorization: Bearer <token>` on all endpoints.
+
+### Iteration 1 — Manual entry (no AI)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/visitors/search/?ic_number=` | Lookup visitor profile **in current location** |
+| `POST` | `/visitors/entries/checkin/` | Walk-in check-in; multipart assets; IC / plate typed by user |
+| `POST` | `/visitors/entries/<id>/checkout/` | Checkout; optional `exit_photo` |
+| `GET` | `/visitors/entries/` | History: `date_filter`, `status`, `location_id`, `search`, pagination |
+| `GET` | `/visitors/entries/export/` | Excel (same filters) |
+
+### Iteration 2 — AI extraction (prefill helpers)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/visitors/ocr-id/` | Multipart: `id_proof`, `document_type` → `{ extracted_id, confidence?, raw_lines? }` |
+| `POST` | `/visitors/detect-plate/` | Multipart: `vehicle_image` → `{ plate_number }` |
+
+These endpoints **do not** create entries. Web/Mobile call them, then put results into the same manual check-in form fields (always editable).
+
+### Iteration 3 — Invitations & QR scan
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/visitors/invitations/` | Create `open` entry + QR |
+| `GET` | `/visitors/invitations/` | List open/cancelled invites |
+| `POST` | `/visitors/invitations/<id>/cancel/` | Cancel invite |
+| `POST` | `/visitors/qr-scan/` | Token → payload by status (open → check-in form; checked_in → checkout; else error) |
+| `GET` | `/visitors/hosts/` | Host autocomplete for location (or reuse existing user search) |
+
+### Check-in logic (v1 — manual)
+1. Resolve `location` from JWT (or superadmin param).
+2. Upsert `Visitor` on `(location, ic_passport_number)`.
+3. If matching `open` invitation for same visitor/location → set `checked_in`, `check_in_time=now()` (once Iter 3 exists; until then always create new entry).
+4. Else create new `VisitorEntry` (`checked_in`) + QR if not present.
+5. Save `VisitorAsset` rows (photo, id_proof, vehicle_photo as provided).
+
+### QR scan logic (v3; expiry later)
+- `open` → return invite details for check-in UI  
+- `checked_in` → return entry for checkout UI  
+- `checked_out` / `cancelled` → error  
+- **Expired rules: out of scope for now**
 
 ---
 
-## 5. Schedules & Timelines (Table Format)
+## 3. AI/ML Extraction Pipeline (Backend-Only) — Iteration 2
 
-### Iteration 1: Manual Entry, Core Models, History, & Backend AI/ML Integration
+Modular image pipeline on Django using:
+- **YOLOv8-nano (Ultralytics)** — localize license plates (~6MB, CPU-friendly).
+- **PaddleOCR** — read text from cropped regions / ID cards.
+- **Pillow** — crop / light preprocess.
 
-#### Backend Tasks (Iteration 1)
-| Task ID | Task Title | Description | Est. Duration |
-| :--- | :--- | :--- | :--- |
-| **B1.1** | DB Models & Migration | Scaffold Django app `visitor`. Create `Visitor`, `VisitorEntry`, `VisitorAsset` models. Run migrations. | 1.5 Days |
-| **B1.2** | Search IC API | Build search-endpoint `GET /api/visitors/search-ic/?ic_number=<val>`. | 0.5 Day |
-| **B1.3** | AI/ML Pipeline Setup | Set up YOLOv8-nano model loading and PaddleOCR packages in Django environment. | 1.0 Day |
-| **B1.4** | OCR ID API | Implement `/api/visitors/ocr-id/` with RegEx classifiers for MyKad, Aadhaar, Driving License, and Passport. | 1.0 Day |
-| **B1.5** | Vehicle Plate API | Implement `/api/visitors/detect-plate/` plate cropping and extraction pipeline. | 1.0 Day |
-| **B1.6** | Check-in / Out APIs | Build manual check-in `POST /api/visitors/checkin/` (generates QR pass) and manual checkout `/api/visitors/entries/<entry_id>/checkout/`. | 1.0 Day |
-| **B1.7** | History & Exports | Build paginated `/api/visitors/` history log (lazy loading) and `/api/visitors/export/` Excel download. | 1.0 Day |
-| **Total** | | | **7.0 Days** |
+Models load **lazily** on first request (or app ready signal). On timeout/failure, APIs return `success: false` and the UI keeps manual entry.
 
-#### Web Panel Tasks (Iteration 1)
-| Task ID | Task Title | Description | Est. Duration |
-| :--- | :--- | :--- | :--- |
-| **W1.1** | Routing & Layout | Setup visitor routes in React Router, sidebar links, and overall layout framework. | 1.0 Day |
-| **W1.2** | Manual Entry UI | Build registration form with Document Type selector, file uploads, OCR auto-extraction, vehicle plate scanner widgets, and QR display modal. | 1.5 Days |
-| **W1.3** | Visitor History Grid | Implement paginated React datagrid table for visitor logs with search filters. | 2.0 Days |
-| **W1.4** | Details Panel | Build detail view slider showing check-in/out logs, status, host info, and asset attachments. | 0.5 Day |
-| **W1.5** | Mark Exit & Export | Add "Mark Exit" action button to table rows (pop-up form for optional photo) and link the Excel report download. | 1.0 Day |
-| **Total** | | | **6.0 Days** |
+### Pipeline A: Vehicle license plate
+
+```
+[Raw Vehicle Image]
+       │
+       ▼ YOLOv8-nano
+[Plate bounding box]
+       │
+       ▼ Pillow crop
+[Plate crop]
+       │
+       ▼ PaddleOCR
+[Raw text]
+       │
+       ▼ RegEx clean (strip noise, O→0 / I→1 heuristics)
+[plate_number]
+```
+
+### Pipeline B: ID card (document hint + regex)
+
+User selects **Document Type** on Web/Mobile before/with upload:
+- `malaysian_mykad`
+- `indian_aadhaar`
+- `indian_dl`
+- `passport`
+- `other`
+
+Backend runs PaddleOCR, then document-specific parsers. `"other"` tries patterns in confidence order. Always return raw OCR lines for debugging if needed.
+
+```python
+def parse_extracted_text(text_lines, document_type):
+    full_text = " ".join(text_lines).upper().replace(" ", "")
+
+    if document_type == "malaysian_mykad":
+        # YYMMDD-PB-#### (12 digits with optional dashes)
+        match = re.search(r"\b\d{6}-?\d{2}-?\d{4}\b", full_text)
+        return match.group(0) if match else None
+
+    if document_type == "indian_aadhaar":
+        match = re.search(r"\b\d{12}\b", full_text)
+        return match.group(0) if match else None
+
+    if document_type == "indian_dl":
+        # e.g. DL-1320110123456
+        match = re.search(r"\b[A-Z]{2}-?\d{2,4}-?\d{7,11}\b", full_text)
+        return match.group(0) if match else None
+
+    if document_type == "passport":
+        match = re.search(r"\b[A-Z][0-9]{7,8}\b", full_text)
+        return match.group(0) if match else None
+
+    # other / fallback: try patterns in order
+    for pattern in [
+        r"\b\d{6}-?\d{2}-?\d{4}\b",
+        r"\b\d{12}\b",
+        r"\b[A-Z]{2}-?\d{2,4}-?\d{7,11}\b",
+        r"\b[A-Z][0-9]{7,8}\b",
+    ]:
+        match = re.search(pattern, full_text)
+        if match:
+            return match.group(0)
+    return None
+```
+
+**Ops notes (Iteration 2)**
+- Pin versions in `requirements-visitor-ai.txt` (or extend main requirements).
+- Document install CPU vs GPU; model weights path under `media/` or `static_models/`.
+- Soft timeout (~5–8s); never hang check-in.
+- Separate from existing face-attendance (`face_recognition` / FAISS) stack.
+- Check-in/checkout APIs from Iter 1 stay unchanged; only web/mobile widgets call OCR helpers.
 
 ---
 
-### Iteration 2: Pre-Authorized Invitations & Scan Validation
+## 4. Web panel
 
-#### Backend Tasks (Iteration 2)
-| Task ID | Task Title | Description | Est. Duration |
-| :--- | :--- | :--- | :--- |
-| **B2.1** | Invitation API | Implement `/api/visitors/invitations/` to create invitations and generate QR badge images. | 1.5 Days |
-| **B2.2** | Stateful QR Scan API | Build unified scanner `/api/visitors/qr-scan/` that returns details if Open, redirects to checkout if Checked-In, and rejects if Expired. | 1.5 Days |
-| **B2.3** | Staff Lookup Directory | Create autocomplete directory helper endpoints to easily search hosts on Web. | 0.5 Day |
-| **B2.4** | Integration Testing | Write API test scripts validating first-scan/second-scan behaviors, YOLO/OCR execution speed, and QR expiration. | 0.5 Day |
-| **Total** | | | **4.0 Days** |
+**Top-level module** (like Incident), not only a Dashboard tab:
+- Sidebar: **Visitor** (`Role.pages` + `menuConfig`)
+- Routes: history, manual entry, invitations (Iter 3)
 
-#### Web Panel Tasks (Iteration 2)
-| Task ID | Task Title | Description | Est. Duration |
-| :--- | :--- | :--- | :--- |
-| **W2.1** | Invite Form Screen | Build Form Dialog for host/HR to schedule visitor details and host search fields. | 1.5 Days |
-| **W2.2** | QR Invite Pass View | Design printable invitation card layout displaying guest QR pass with PNG download. | 1.0 Day |
-| **W2.3** | Active Invitations List| Create datagrid showing active scheduled visits with an option to expire/cancel invitations manually. | 1.5 Days |
-| **Total** | | | **4.0 Days** |
+### Iteration 1 screens (manual)
+1. **Manual Entry** — document type, IC/name/phone typed by user, optional ID/visitor/vehicle photo uploads, host, purpose, type → check-in → QR pass modal  
+2. **Visitor History** — filters (date, status, search, location for superadmin), detail drawer, assets, **Mark Exit**, Excel export  
+
+### Iteration 2 screens (AI on top of Iter 1 form)
+- Same Manual Entry form: ID upload → OCR autofill (editable IC); optional vehicle photo → plate detect autofill  
+- Failure / skip → user types as in Iter 1  
+
+### Iteration 3 screens
+3. **Create Invitation** — host search, visit datetime, visitor details, printable QR  
+4. **Active Invitations** — list + cancel  
+
+Reuse: `GTMSFilterBar`, export button pattern (Roll Call / Attendance), location org dropdown for superadmin.
+
+---
+
+## 5. Mobile (document early; implement with each iteration’s APIs)
+
+| Iteration | Docs / APIs |
+|-----------|-------------|
+| **1** | Search IC, check-in / checkout (multipart), history if needed — `MOBILE_API_CURL.md` |
+| **2** | Add OCR ID / detect plate curl examples; UI can trail web |
+| **3** | QR scan |
+
+Mobile UI can trail web slightly; **API contracts freeze per iteration**.
+
+---
+
+## 6. Schedules
+
+### Iteration 1 — Models + manual APIs + web
+
+#### Backend
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **B1.1** | App + models | `visitor` app, models, migration, `INSTALLED_APPS` + `/visitors/` urls, location util | 1.5d |
+| **B1.2** | Search + check-in/out | IC search (location-scoped), checkin, checkout + assets + QR on check-in | 1.5d |
+| **B1.3** | History + Excel | Paginated list + export | 1.0d |
+| **B1.4** | Mobile curl docs | `MOBILE_API_CURL.md` for Iter 1 endpoints | 0.5d |
+| **Total** | | | **~4.5d** |
+
+#### Web
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **W1.1** | Routing + menu | Routes, sidebar, Role.pages label | 0.5d |
+| **W1.2** | Manual Entry form | Full typed form + photo uploads + QR modal (no OCR yet) | 1.5d |
+| **W1.3** | History grid | Filters, pagination, detail drawer | 2.0d |
+| **W1.4** | Mark Exit + Export | Checkout action + Excel | 1.0d |
+| **Total** | | | **~5.0d** |
+
+**Iteration 1 calendar:** ~5–7 working days with BE/FE overlap. Gatehouse can go live on typed entry.
+
+---
+
+### Iteration 2 — AI service + wire into Manual Entry
+
+#### Backend
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **B2.1** | AI env + loader | YOLOv8-nano + PaddleOCR install, lazy model load, health/fallback | 1.5d |
+| **B2.2** | OCR ID API | `/visitors/ocr-id/` + document_type parsers | 1.0d |
+| **B2.3** | Plate API | `/visitors/detect-plate/` YOLO crop + OCR + clean | 1.0d |
+| **B2.4** | Docs + smoke | Curl examples; failure does not block check-in | 0.5d |
+| **Total** | | | **~4.0d** |
+
+#### Web
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **W2.1** | OCR + plate widgets | Call AI APIs; autofill editable fields; graceful fallback | 1.5d |
+| **Total** | | | **~1.5d** |
+
+**Iteration 2 calendar:** ~4–5 working days. No schema rewrite if Iter 1 fields already match (`document_type`, `ic_passport_number`, `vehicle_number`, assets).
+
+---
+
+### Iteration 3 — Invitations & QR scan
+
+#### Backend
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **B3.1** | Invitation APIs | Create / list / cancel + QR badge | 1.5d |
+| **B3.2** | QR scan API | Stateful scan (open / checked_in / reject) — **no expiry** | 1.0d |
+| **B3.3** | Host lookup | Autocomplete by location (or wire existing users API) | 0.5d |
+| **B3.4** | Tests | Check-in linking to invite, OCR smoke, QR path | 0.5d |
+| **Total** | | | **~3.5d** |
+
+#### Web
+| Task ID | Task | Description | Est. |
+|--------|------|-------------|------|
+| **W3.1** | Invite form | Host search + schedule + QR download | 1.5d |
+| **W3.2** | Active invites | List + cancel | 1.0d |
+| **W3.3** | History polish | Link invite ↔ entry in drawer | 0.5d |
+| **Total** | | | **~3.0d** |
+
+---
+
+### Later (explicitly deferred)
+
+| Item | Notes |
+|------|--------|
+| **QR / visit expiry** | Status `expired`, Celery beat job, scan rejection rules |
+| **Host WhatsApp notify** | Optional; reuse incident Twilio pattern (fail-open) |
+| **PDF export** | Excel first; PDF can mirror Roll Call if needed |
+| **Multi-visitor group visit** | Single visitor per entry in v1 |
+
+---
+
+## 7. Permissions & product rules
+
+| Actor | Can |
+|-------|-----|
+| Location staff (page permission) | Manual entry, history, checkout; OCR helpers from Iter 2 |
+| Host / HR (Iter 3) | Create/cancel invitations for own location |
+| Superadmin | All locations via `location_id` |
+| Mobile guard | Same location-scoped APIs |
+
+---
+
+## 8. Definition of done
+
+### Iteration 1
+- [ ] Walk-in check-in with photo + ID + optional vehicle works without invitation (all fields manual)
+- [ ] IC unique **per location**; same IC allowed at another location
+- [ ] History filters + Excel export
+- [ ] Checkout with optional exit photo
+- [ ] Location scoping enforced for non-superuser
+- [ ] Soft delete on visitor/entry
+- [ ] `MOBILE_API_CURL.md` published for Iter 1
+- [ ] QR pass shown after check-in
+
+### Iteration 2
+- [ ] OCR ID + plate APIs return values; UI can edit/override
+- [ ] AI failure does not block manual check-in
+- [ ] Curl docs updated for OCR endpoints
+
+### Iteration 3
+- [ ] Create / list / cancel invitations + printable QR
+- [ ] QR scan routes open → check-in / checked_in → checkout
+
+---
+
+## 9. Out of scope (this plan)
+
+- Face matching visitors to employees  
+- Geofence for visitors  
+- Expired QR / auto-expire jobs  
+- Global IC uniqueness  

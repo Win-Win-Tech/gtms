@@ -29,6 +29,7 @@ urlpatterns = [
     path('payslip/', include('payslip.urls')),
     path('incident/', include('incident.urls')),
     path('rollcall/', include('rollcall.urls')),
+    path('visitors/', include('visitor.urls')),
     path('livetracking/', include('livetracking.urls')),
 ]
 urlpatterns+=static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
