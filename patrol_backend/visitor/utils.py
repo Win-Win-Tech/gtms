@@ -32,8 +32,19 @@ def resolve_location_for_request(request, location_id=None):
     return str(user_loc), None
 
 
+def _date_range_q(start_utc, end_utc):
+    """Match check_in_time when present, else created_on (pending entries)."""
+    from django.db.models import Q
+
+    end = end_utc + timedelta(days=1)
+    return (
+        Q(check_in_time__gte=start_utc, check_in_time__lt=end)
+        | Q(check_in_time__isnull=True, created_on__gte=start_utc, created_on__lt=end)
+    )
+
+
 def apply_checkin_date_filter(queryset, request, location_id, date_filter, start_date=None, end_date=None):
-    """Filter VisitorEntry queryset by check_in_time using location timezone."""
+    """Filter by check_in_time, or created_on when not yet checked in."""
     user_tz = get_user_timezone_from_request(request, location_id=location_id)
     user_today = get_user_today(user_tz)
     date_filter = (date_filter or "today").lower()
@@ -43,13 +54,13 @@ def apply_checkin_date_filter(queryset, request, location_id, date_filter, start
 
     if date_filter == "today":
         start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-        return queryset.filter(check_in_time__gte=start_utc, check_in_time__lt=end_utc + timedelta(days=1))
+        return queryset.filter(_date_range_q(start_utc, end_utc))
 
     if date_filter in ("week", "this_week"):
         start_week = user_today - timedelta(days=user_today.weekday())
         end_week = start_week + timedelta(days=6)
         start_utc, end_utc = convert_date_range_to_utc(start_week, end_week, user_tz)
-        return queryset.filter(check_in_time__gte=start_utc, check_in_time__lt=end_utc + timedelta(days=1))
+        return queryset.filter(_date_range_q(start_utc, end_utc))
 
     if date_filter in ("month", "this_month"):
         start_of_month = user_today.replace(day=1)
@@ -58,19 +69,19 @@ def apply_checkin_date_filter(queryset, request, location_id, date_filter, start
         else:
             end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
         start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
-        return queryset.filter(check_in_time__gte=start_utc, check_in_time__lt=end_utc + timedelta(days=1))
+        return queryset.filter(_date_range_q(start_utc, end_utc))
 
     if date_filter == "custom" and start_date and end_date:
         try:
             start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
             end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
             start_utc, end_utc = convert_date_range_to_utc(start_obj, end_obj, user_tz)
-            return queryset.filter(check_in_time__gte=start_utc, check_in_time__lt=end_utc + timedelta(days=1))
+            return queryset.filter(_date_range_q(start_utc, end_utc))
         except ValueError as exc:
             raise ValueError("Invalid date format. Use YYYY-MM-DD.") from exc
 
     start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-    return queryset.filter(check_in_time__gte=start_utc, check_in_time__lt=end_utc + timedelta(days=1))
+    return queryset.filter(_date_range_q(start_utc, end_utc))
 
 
 def make_qr_token():

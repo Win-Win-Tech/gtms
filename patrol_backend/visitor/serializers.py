@@ -68,13 +68,19 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     host_name = serializers.SerializerMethodField()
     host_employee_code = serializers.SerializerMethodField()
 
+    approved_by_id = serializers.UUIDField(source="approved_by.id", read_only=True, allow_null=True)
+    approved_by_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     qr_image_url = serializers.SerializerMethodField()
+    qr_usable = serializers.SerializerMethodField()
     assets = VisitorAssetSerializer(many=True, read_only=True)
 
     check_in_time = serializers.SerializerMethodField()
     check_out_time = serializers.SerializerMethodField()
+    expected_arrival_time = serializers.SerializerMethodField()
+    expected_out_time = serializers.SerializerMethodField()
     visit_date_time = serializers.SerializerMethodField()
+    approved_on = serializers.SerializerMethodField()
     created_on = serializers.SerializerMethodField()
 
     class Meta:
@@ -82,10 +88,12 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "status",
+            "entry_source",
             "visitor_type",
             "purpose_of_visit",
             "vehicle_number",
             "remarks",
+            "revert_reason",
             "location_id",
             "location_name",
             "visitor_id",
@@ -95,11 +103,19 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
             "host_id",
             "host_name",
             "host_employee_code",
+            "expected_arrival_time",
+            "expected_out_time",
+            "visit_date",
+            "visit_date_time",
             "check_in_time",
             "check_out_time",
-            "visit_date_time",
             "qr_token",
             "qr_image_url",
+            "qr_expired",
+            "qr_usable",
+            "approved_by_id",
+            "approved_by_name",
+            "approved_on",
             "created_by",
             "created_by_name",
             "created_on",
@@ -116,11 +132,17 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     def get_host_employee_code(self, obj):
         return getattr(obj.host, "employee_code", None) if obj.host else None
 
+    def get_approved_by_name(self, obj):
+        return getattr(obj.approved_by, "name", None) if obj.approved_by else None
+
     def get_created_by_name(self, obj):
         return getattr(obj.created_by, "name", None) if obj.created_by else None
 
     def get_qr_image_url(self, obj):
         return _abs_media_url(obj.qr_image, self.context.get("request"))
+
+    def get_qr_usable(self, obj):
+        return obj.is_qr_usable
 
     def get_check_in_time(self, obj):
         return _fmt_dt(obj.check_in_time, self.context.get("request"), self._loc_id(obj))
@@ -128,8 +150,17 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     def get_check_out_time(self, obj):
         return _fmt_dt(obj.check_out_time, self.context.get("request"), self._loc_id(obj))
 
+    def get_expected_arrival_time(self, obj):
+        return _fmt_dt(obj.expected_arrival_time, self.context.get("request"), self._loc_id(obj))
+
+    def get_expected_out_time(self, obj):
+        return _fmt_dt(obj.expected_out_time, self.context.get("request"), self._loc_id(obj))
+
     def get_visit_date_time(self, obj):
         return _fmt_dt(obj.visit_date_time, self.context.get("request"), self._loc_id(obj))
+
+    def get_approved_on(self, obj):
+        return _fmt_dt(obj.approved_on, self.context.get("request"), self._loc_id(obj))
 
     def get_created_on(self, obj):
         return _fmt_dt(obj.created_on, self.context.get("request"), self._loc_id(obj))

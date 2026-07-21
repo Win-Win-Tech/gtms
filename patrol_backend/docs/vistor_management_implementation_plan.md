@@ -3,28 +3,70 @@
 Revised plan for the **Visitor Entry & Visitor Management** module.
 
 **Locked decisions**
-- **Iteration 1 = manual only** (models + APIs + web). AI/OCR is **Iteration 2**.
+- **Iteration 1 = manual entry + host approval workflow** (models + APIs + web). AI/OCR is **Iteration 2**.
+- Invitations (`visit_date`, no host approval) are **Iteration 3**.
 - `ic_passport_number` is **unique per location** (not global).
-- **QR expiry / Expired status** — deferred; revisit later.
-- Walk-in check-in allowed without a prior invitation.
-- When AI lands: OCR/plate results always **editable** (AI pre-fills; never blocks check-in).
+- **No `document_type` field** — AI will detect document type later when OCR lands.
+- Manual entry is **same-day only** — no `visit_date` on manual.
+- `visit_date` is **invitation only** (future visits).
+- **Manual entry requires host approval.** Host approve **= check-in**.
+- **Invitation does not need host approval.** Scanning invite QR **= check-in**.
+- Checkout (QR or manual mark) always requires **checkout image**; then **QR expires**.
+- Push notifications — **deferred** (do later).
+- When AI lands: OCR/plate results always **editable** (AI pre-fills; never blocks flow).
 
 Aligns with GTMS conventions: app prefix `/visitors/`, location scoping, soft delete, JWT auth, Excel export, `MOBILE_API_CURL.md`.
 
 ---
 
-## Why this order (manual → AI)
+## Why this order (manual + approval → AI → invitations)
 
 | Approach | Verdict |
 |----------|---------|
-| **A. Manual first, AI second (this plan)** | **Preferred.** Core product (check-in/out, history, uniqueness, location scoping) ships without ML install risk. AI becomes a thin prefill layer on stable fields. |
-| **B. AI + manual together in Iter 1** | Riskier. YOLO/PaddleOCR setup, timeouts, and CPU deps sit on the critical path and can delay a usable gatehouse flow. |
-
-AI is an accelerator, not the source of truth. Staff must always be able to type IC / plate manually — so build that path first, then bolt OCR on.
+| **A. Manual + approval first, AI second, invite third (this plan)** | **Preferred.** Gatehouse + host workflow ships without ML risk. Invite reuses same entry/QR model. |
+| **B. AI + manual together early** | Riskier. YOLO/PaddleOCR on critical path. |
 
 ---
 
-## 1. Database design (Iteration 1)
+## Core product rules
+
+### Manual entry (same-day walk-in)
+1. Guard fills form (visitor photo + IC copy required; additional images optional multi).
+2. Host is **required**.
+3. Submit creates entry as `pending_approval` + generates QR.
+4. Host reviews:
+   - **Approve** (+ optional `expected_out_time`) → status `checked_in`, `check_in_time=now()` (**approve = check-in**).
+   - **Revert** (+ reason) → status `reverted`; guard corrects and **resubmits**.
+   - **Cancel** → status `cancelled`, `qr_expired=true`.
+5. If QR scanned while still `pending_approval` → response: **“Not approved yet”**.
+
+### Invitation (future visit) — Iteration 3
+1. Create invitation with **`visit_date`** (+ visitor details, host, QR).
+2. Status starts as `scheduled`.
+3. **No host approval step.**
+4. On visit day, scan QR → **check-in** (`checked_in`).
+5. Checkout same as manual.
+
+### Checkout (both methods)
+| Method | Rule |
+|--------|------|
+| Scan QR while `checked_in` | Opens checkout; **checkout image required** |
+| Manual “Mark Exit” | Same; **checkout image required** |
+
+After checkout → `checked_out`, `qr_expired=true`.
+
+### QR lifecycle (single token, status-driven)
+| Status | QR scan result |
+|--------|----------------|
+| `pending_approval` | `awaiting_approval` — not approved yet |
+| `reverted` | `reverted` — guard must resubmit |
+| `scheduled` | Check-in (invitation) |
+| `checked_in` | `checkout` — proceed with image |
+| `checked_out` / `cancelled` / `qr_expired` | Expired / invalid |
+
+---
+
+## 1. Database design
 
 Three tables in Django app `visitor`:
 
@@ -34,12 +76,12 @@ erDiagram
     Visitor ||--o{ VisitorEntry : has
     VisitorEntry ||--o{ VisitorAsset : contains
     User ||--o{ VisitorEntry : hosts
+    User ||--o{ VisitorEntry : approves
 
     Visitor {
         UUID id PK
         UUID location_id FK
         string ic_passport_number "Unique with location"
-        string document_type
         string visitor_name
         string phone_number
         bool is_deleted
@@ -49,18 +91,25 @@ erDiagram
     VisitorEntry {
         UUID id PK
         UUID visitor_id FK
-        UUID host_id FK "User"
+        UUID host_id FK "Required for manual"
         UUID location_id FK
+        string entry_source "manual|invitation"
         string visitor_type "contractor|client|delivery|guest|other"
-        string status "open|checked_in|checked_out|cancelled"
+        string status "pending_approval|reverted|scheduled|checked_in|checked_out|cancelled"
         string purpose_of_visit
         string vehicle_number
         string remarks
+        string revert_reason
+        datetime expected_arrival_time "Manual same-day"
+        datetime expected_out_time "Set/confirmed on approve"
+        date visit_date "Invitation only"
         datetime check_in_time
         datetime check_out_time
-        datetime visit_date_time "Invitations"
         string qr_token UK
         file qr_image
+        bool qr_expired
+        UUID approved_by FK
+        datetime approved_on
         UUID created_by FK
         bool is_deleted
         datetime created_on
@@ -69,21 +118,33 @@ erDiagram
     VisitorAsset {
         UUID id PK
         UUID visitor_entry_id FK
-        string asset_type "visitor_photo|id_proof|exit_photo|vehicle_photo|other"
+        string asset_type "visitor_photo|id_proof|exit_photo|vehicle_photo|additional|other"
         file file
         datetime created_on
     }
 ```
 
+### Assets rules
+| Asset | Cardinality |
+|-------|-------------|
+| `visitor_photo` | **1** (required on manual submit) |
+| `id_proof` | **1** (required on manual submit) |
+| `additional` | **many** (optional) |
+| `exit_photo` | **1** (required on checkout) |
+| `vehicle_photo` | 0–1 (optional; used later for plate OCR) |
+
+Each image is **one row** in `VisitorAsset` linked by `visitor_entry_id`.
+
 ### Constraints & conventions
 | Rule | Detail |
 |------|--------|
-| IC uniqueness | `UniqueConstraint(location, ic_passport_number)` where `is_deleted=False` (or equivalent) |
+| IC uniqueness | `UniqueConstraint(location, ic_passport_number)` where `is_deleted=False` |
 | Location scoping | Non-superuser locked to `request.user.location`; superadmin may pass `location_id` |
 | Soft delete | `is_deleted` on Visitor / VisitorEntry |
-| Status (v1) | `open` (invite), `checked_in`, `checked_out`, `cancelled` — **no `expired` yet** |
-| QR | Generated on invite and/or check-in; reusable until checkout/cancel |
-| Document type | Stored on `Visitor` for later OCR parsers; required or optional in manual form (product choice) |
+| Statuses | `pending_approval`, `reverted`, `scheduled`, `checked_in`, `checked_out`, `cancelled` |
+| Manual vs invite | Manual: no `visit_date`. Invite: has `visit_date`, starts `scheduled` |
+| QR | One token; usable based on status; expired after checkout/cancel |
+| No document_type | Not stored; AI decides document kind later |
 
 ---
 
@@ -91,47 +152,60 @@ erDiagram
 
 Auth: `Authorization: Bearer <token>` on all endpoints.
 
-### Iteration 1 — Manual entry (no AI)
+### Iteration 1 — Manual + approval + checkout (implemented)
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/visitors/search/?ic_number=` | Lookup visitor profile **in current location** |
-| `POST` | `/visitors/entries/checkin/` | Walk-in check-in; multipart assets; IC / plate typed by user |
-| `POST` | `/visitors/entries/<id>/checkout/` | Checkout; optional `exit_photo` |
-| `GET` | `/visitors/entries/` | History: `date_filter`, `status`, `location_id`, `search`, pagination |
+| `GET` | `/visitors/search/?ic_number=` | Lookup visitor profile in current location |
+| `POST` | `/visitors/entries/checkin/` | Manual submit → `pending_approval` + QR; multipart assets; optional `entry_id` to resubmit after revert |
+| `POST` | `/visitors/entries/<id>/approve/` | Host approve = check-in; optional `expected_out_time` |
+| `POST` | `/visitors/entries/<id>/revert/` | Host revert with reason |
+| `POST` | `/visitors/entries/<id>/cancel/` | Cancel; set `qr_expired` |
+| `POST` | `/visitors/entries/<id>/checkout/` | Checkout; **`exit_photo` required**; set `qr_expired` |
+| `POST` | `/visitors/qr-scan/` | Body `{ qr_token }` → action by status |
+| `GET` | `/visitors/entries/` | History filters: `date_filter`, `status`, `location_id`, `search`, `mine` |
 | `GET` | `/visitors/entries/export/` | Excel (same filters) |
 
 ### Iteration 2 — AI extraction (prefill helpers)
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/visitors/ocr-id/` | Multipart: `id_proof`, `document_type` → `{ extracted_id, confidence?, raw_lines? }` |
+| `POST` | `/visitors/ocr-id/` | Multipart: `id_proof` → `{ extracted_id, confidence?, raw_lines? }` (no stored document_type) |
 | `POST` | `/visitors/detect-plate/` | Multipart: `vehicle_image` → `{ plate_number }` |
 
-These endpoints **do not** create entries. Web/Mobile call them, then put results into the same manual check-in form fields (always editable).
+Helpers only; never block submit/approve/checkout.
 
-### Iteration 3 — Invitations & QR scan
+### Iteration 3 — Invitations
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/visitors/invitations/` | Create `open` entry + QR |
-| `GET` | `/visitors/invitations/` | List open/cancelled invites |
-| `POST` | `/visitors/invitations/<id>/cancel/` | Cancel invite |
-| `POST` | `/visitors/qr-scan/` | Token → payload by status (open → check-in form; checked_in → checkout; else error) |
-| `GET` | `/visitors/hosts/` | Host autocomplete for location (or reuse existing user search) |
+| `POST` | `/visitors/invitations/` | Create `scheduled` entry + QR + **`visit_date`** |
+| `GET` | `/visitors/invitations/` | List scheduled / cancelled invites |
+| `POST` | `/visitors/invitations/<id>/cancel/` | Cancel invite; QR expires |
+| `GET` | `/visitors/hosts/` | Host autocomplete (or reuse users API) |
 
-### Check-in logic (v1 — manual)
+QR scan for `scheduled` already defined in Iter 1 `qr-scan`.
+
+### Manual submit logic
 1. Resolve `location` from JWT (or superadmin param).
-2. Upsert `Visitor` on `(location, ic_passport_number)`.
-3. If matching `open` invitation for same visitor/location → set `checked_in`, `check_in_time=now()` (once Iter 3 exists; until then always create new entry).
-4. Else create new `VisitorEntry` (`checked_in`) + QR if not present.
-5. Save `VisitorAsset` rows (photo, id_proof, vehicle_photo as provided).
+2. Require `host_id`.
+3. Upsert `Visitor` on `(location, ic_passport_number)`.
+4. If `entry_id` and status is `reverted` → update and set `pending_approval`.
+5. Else create `VisitorEntry` (`entry_source=manual`, `pending_approval`) + QR.
+6. Save assets (`visitor_photo`, `id_proof`, `additional`…).
 
-### QR scan logic (v3; expiry later)
-- `open` → return invite details for check-in UI  
-- `checked_in` → return entry for checkout UI  
-- `checked_out` / `cancelled` → error  
-- **Expired rules: out of scope for now**
+### Host approve logic (= check-in)
+1. Caller must be host (or superadmin).
+2. Status must be `pending_approval` (or allow from `reverted` if product wants).
+3. Set `checked_in`, `check_in_time=now()`, `approved_by`, `approved_on`.
+4. Optionally set `expected_out_time`.
+
+### QR scan logic
+- `pending_approval` → awaiting_approval  
+- `reverted` → reverted message  
+- `scheduled` → check-in  
+- `checked_in` → checkout payload  
+- `checked_out` / `cancelled` / `qr_expired` → expired  
 
 ---
 
@@ -142,190 +216,105 @@ Modular image pipeline on Django using:
 - **PaddleOCR** — read text from cropped regions / ID cards.
 - **Pillow** — crop / light preprocess.
 
-Models load **lazily** on first request (or app ready signal). On timeout/failure, APIs return `success: false` and the UI keeps manual entry.
+Models load **lazily**. On timeout/failure, APIs return `success: false`; UI keeps manual typing.
 
 ### Pipeline A: Vehicle license plate
+Raw image → YOLOv8 crop → PaddleOCR → regex clean → `plate_number`
 
-```
-[Raw Vehicle Image]
-       │
-       ▼ YOLOv8-nano
-[Plate bounding box]
-       │
-       ▼ Pillow crop
-[Plate crop]
-       │
-       ▼ PaddleOCR
-[Raw text]
-       │
-       ▼ RegEx clean (strip noise, O→0 / I→1 heuristics)
-[plate_number]
-```
+### Pipeline B: ID card
+PaddleOCR → try MyKad / Aadhaar / DL / passport patterns (no stored document_type field; optional client-side hint only for Iter 2 if useful).
 
-### Pipeline B: ID card (document hint + regex)
-
-User selects **Document Type** on Web/Mobile before/with upload:
-- `malaysian_mykad`
-- `indian_aadhaar`
-- `indian_dl`
-- `passport`
-- `other`
-
-Backend runs PaddleOCR, then document-specific parsers. `"other"` tries patterns in confidence order. Always return raw OCR lines for debugging if needed.
-
-```python
-def parse_extracted_text(text_lines, document_type):
-    full_text = " ".join(text_lines).upper().replace(" ", "")
-
-    if document_type == "malaysian_mykad":
-        # YYMMDD-PB-#### (12 digits with optional dashes)
-        match = re.search(r"\b\d{6}-?\d{2}-?\d{4}\b", full_text)
-        return match.group(0) if match else None
-
-    if document_type == "indian_aadhaar":
-        match = re.search(r"\b\d{12}\b", full_text)
-        return match.group(0) if match else None
-
-    if document_type == "indian_dl":
-        # e.g. DL-1320110123456
-        match = re.search(r"\b[A-Z]{2}-?\d{2,4}-?\d{7,11}\b", full_text)
-        return match.group(0) if match else None
-
-    if document_type == "passport":
-        match = re.search(r"\b[A-Z][0-9]{7,8}\b", full_text)
-        return match.group(0) if match else None
-
-    # other / fallback: try patterns in order
-    for pattern in [
-        r"\b\d{6}-?\d{2}-?\d{4}\b",
-        r"\b\d{12}\b",
-        r"\b[A-Z]{2}-?\d{2,4}-?\d{7,11}\b",
-        r"\b[A-Z][0-9]{7,8}\b",
-    ]:
-        match = re.search(pattern, full_text)
-        if match:
-            return match.group(0)
-    return None
-```
-
-**Ops notes (Iteration 2)**
-- Pin versions in `requirements-visitor-ai.txt` (or extend main requirements).
-- Document install CPU vs GPU; model weights path under `media/` or `static_models/`.
-- Soft timeout (~5–8s); never hang check-in.
-- Separate from existing face-attendance (`face_recognition` / FAISS) stack.
-- Check-in/checkout APIs from Iter 1 stay unchanged; only web/mobile widgets call OCR helpers.
+**Ops notes**
+- Pin in `requirements-visitor-ai.txt`.
+- Soft timeout (~5–8s).
+- Separate from face-attendance stack.
 
 ---
 
 ## 4. Web panel
 
-**Top-level module** (like Incident), not only a Dashboard tab:
+**Top-level module** (like Incident):
 - Sidebar: **Visitor** (`Role.pages` + `menuConfig`)
-- Routes: history, manual entry, invitations (Iter 3)
+- Routes: `/visitor/manual-entry`, `/visitor/history`, invitations (Iter 3)
 
-### Iteration 1 screens (manual)
-1. **Manual Entry** — document type, IC/name/phone typed by user, optional ID/visitor/vehicle photo uploads, host, purpose, type → check-in → QR pass modal  
-2. **Visitor History** — filters (date, status, search, location for superadmin), detail drawer, assets, **Mark Exit**, Excel export  
+### Iteration 1 screens
+1. **Manual Entry** — Documents (visitor photo, IC copy, additional multi) → Visitor identity (IC, name, phone, type, **host required**, expected arrival) → Visit details → **Submit for approval** → QR modal (“pending host approval”)
+2. **Visitor History** — filters, details, host actions:
+   - **Approve** (optional expected out) / **Revert** / **Cancel** when `pending_approval`
+   - **Mark Exit** when `checked_in` (checkout image required)
+   - Excel export
 
-### Iteration 2 screens (AI on top of Iter 1 form)
-- Same Manual Entry form: ID upload → OCR autofill (editable IC); optional vehicle photo → plate detect autofill  
-- Failure / skip → user types as in Iter 1  
+### Iteration 2 screens
+- OCR / plate autofill on Manual Entry (editable)
 
 ### Iteration 3 screens
-3. **Create Invitation** — host search, visit datetime, visitor details, printable QR  
+3. **Create Invitation** — `visit_date`, visitor details, printable QR  
 4. **Active Invitations** — list + cancel  
-
-Reuse: `GTMSFilterBar`, export button pattern (Roll Call / Attendance), location org dropdown for superadmin.
 
 ---
 
-## 5. Mobile (document early; implement with each iteration’s APIs)
+## 5. Mobile
 
 | Iteration | Docs / APIs |
 |-----------|-------------|
-| **1** | Search IC, check-in / checkout (multipart), history if needed — `MOBILE_API_CURL.md` |
-| **2** | Add OCR ID / detect plate curl examples; UI can trail web |
-| **3** | QR scan |
+| **1** | Submit, approve, revert, cancel, checkout (+ image), QR scan, history — `MOBILE_API_CURL.md` |
+| **2** | OCR / plate curls |
+| **3** | Invitation create/list/cancel |
 
-Mobile UI can trail web slightly; **API contracts freeze per iteration**.
+Push notification for host pending approval — **later**.
 
 ---
 
 ## 6. Schedules
 
-### Iteration 1 — Models + manual APIs + web
+### Iteration 1 — Manual + approval + QR lifecycle + checkout image
+**Status: largely implemented in code** (migrate + verify remaining).
 
 #### Backend
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **B1.1** | App + models | `visitor` app, models, migration, `INSTALLED_APPS` + `/visitors/` urls, location util | 1.5d |
-| **B1.2** | Search + check-in/out | IC search (location-scoped), checkin, checkout + assets + QR on check-in | 1.5d |
-| **B1.3** | History + Excel | Paginated list + export | 1.0d |
-| **B1.4** | Mobile curl docs | `MOBILE_API_CURL.md` for Iter 1 endpoints | 0.5d |
-| **Total** | | | **~4.5d** |
+| Task ID | Task | Description |
+|--------|------|-------------|
+| **B1.1** | App + models | Statuses, expected times, visit_date, qr_expired, approval fields, assets |
+| **B1.2** | Submit / resubmit | Manual → `pending_approval` + QR |
+| **B1.3** | Approve / revert / cancel | Host approve = check-in |
+| **B1.4** | Checkout + QR scan | Exit image required; QR expire rules |
+| **B1.5** | History + Excel | Filters including pending |
+| **B1.6** | Curl docs | `MOBILE_API_CURL.md` |
 
 #### Web
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **W1.1** | Routing + menu | Routes, sidebar, Role.pages label | 0.5d |
-| **W1.2** | Manual Entry form | Full typed form + photo uploads + QR modal (no OCR yet) | 1.5d |
-| **W1.3** | History grid | Filters, pagination, detail drawer | 2.0d |
-| **W1.4** | Mark Exit + Export | Checkout action + Excel | 1.0d |
-| **Total** | | | **~5.0d** |
-
-**Iteration 1 calendar:** ~5–7 working days with BE/FE overlap. Gatehouse can go live on typed entry.
+| Task ID | Task | Description |
+|--------|------|-------------|
+| **W1.1** | Routing + menu | Visitor module |
+| **W1.2** | Manual Entry UI | Documents + identity + submit for approval |
+| **W1.3** | History + host actions | Approve / revert / cancel / exit |
 
 ---
 
-### Iteration 2 — AI service + wire into Manual Entry
+### Iteration 2 — AI service
 
-#### Backend
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **B2.1** | AI env + loader | YOLOv8-nano + PaddleOCR install, lazy model load, health/fallback | 1.5d |
-| **B2.2** | OCR ID API | `/visitors/ocr-id/` + document_type parsers | 1.0d |
-| **B2.3** | Plate API | `/visitors/detect-plate/` YOLO crop + OCR + clean | 1.0d |
-| **B2.4** | Docs + smoke | Curl examples; failure does not block check-in | 0.5d |
-| **Total** | | | **~4.0d** |
-
-#### Web
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **W2.1** | OCR + plate widgets | Call AI APIs; autofill editable fields; graceful fallback | 1.5d |
-| **Total** | | | **~1.5d** |
-
-**Iteration 2 calendar:** ~4–5 working days. No schema rewrite if Iter 1 fields already match (`document_type`, `ic_passport_number`, `vehicle_number`, assets).
+| Task ID | Task |
+|--------|------|
+| **B2.1–B2.4** | YOLO + PaddleOCR env, OCR ID, plate API, docs |
+| **W2.1** | Autofill widgets on Manual Entry |
 
 ---
 
-### Iteration 3 — Invitations & QR scan
+### Iteration 3 — Invitations
 
-#### Backend
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **B3.1** | Invitation APIs | Create / list / cancel + QR badge | 1.5d |
-| **B3.2** | QR scan API | Stateful scan (open / checked_in / reject) — **no expiry** | 1.0d |
-| **B3.3** | Host lookup | Autocomplete by location (or wire existing users API) | 0.5d |
-| **B3.4** | Tests | Check-in linking to invite, OCR smoke, QR path | 0.5d |
-| **Total** | | | **~3.5d** |
-
-#### Web
-| Task ID | Task | Description | Est. |
-|--------|------|-------------|------|
-| **W3.1** | Invite form | Host search + schedule + QR download | 1.5d |
-| **W3.2** | Active invites | List + cancel | 1.0d |
-| **W3.3** | History polish | Link invite ↔ entry in drawer | 0.5d |
-| **Total** | | | **~3.0d** |
+| Task ID | Task |
+|--------|------|
+| **B3.1** | Invitation APIs with `visit_date` → `scheduled` |
+| **B3.2** | Wire invite QR into existing `qr-scan` (already supports `scheduled`) |
+| **W3.1–W3.2** | Invite form + active list |
 
 ---
 
-### Later (explicitly deferred)
+### Later (deferred)
 
 | Item | Notes |
 |------|--------|
-| **QR / visit expiry** | Status `expired`, Celery beat job, scan rejection rules |
-| **Host WhatsApp notify** | Optional; reuse incident Twilio pattern (fail-open) |
-| **PDF export** | Excel first; PDF can mirror Roll Call if needed |
+| **Push / WhatsApp to host** | Notify on pending approval / revert / cancel |
+| **Time-based QR auto-expire job** | Optional Celery; today expiry is status/`qr_expired` based |
+| **PDF export** | Excel first |
 | **Multi-visitor group visit** | Single visitor per entry in v1 |
 
 ---
@@ -334,9 +323,9 @@ Mobile UI can trail web slightly; **API contracts freeze per iteration**.
 
 | Actor | Can |
 |-------|-----|
-| Location staff (page permission) | Manual entry, history, checkout; OCR helpers from Iter 2 |
-| Host / HR (Iter 3) | Create/cancel invitations for own location |
-| Superadmin | All locations via `location_id` |
+| Guard / location staff | Manual submit, resubmit after revert, history, checkout with image, QR scan |
+| Host | Approve (= check-in), revert, cancel for entries where they are `host` |
+| Superadmin | All locations + all host actions via `location_id` |
 | Mobile guard | Same location-scoped APIs |
 
 ---
@@ -344,23 +333,25 @@ Mobile UI can trail web slightly; **API contracts freeze per iteration**.
 ## 8. Definition of done
 
 ### Iteration 1
-- [ ] Walk-in check-in with photo + ID + optional vehicle works without invitation (all fields manual)
-- [ ] IC unique **per location**; same IC allowed at another location
-- [ ] History filters + Excel export
-- [ ] Checkout with optional exit photo
-- [ ] Location scoping enforced for non-superuser
-- [ ] Soft delete on visitor/entry
-- [ ] `MOBILE_API_CURL.md` published for Iter 1
-- [ ] QR pass shown after check-in
+- [x] Manual submit creates `pending_approval` + QR (same-day; no visit_date)
+- [x] Host required; approve = check-in (optional expected out)
+- [x] Revert + resubmit path
+- [x] Cancel expires QR
+- [x] Checkout requires image; expires QR
+- [x] QR scan returns not-approved / checkout / expired correctly
+- [x] IC unique per location
+- [x] Multiple additional images as separate asset rows
+- [x] History + Excel + host actions on web
+- [x] `MOBILE_API_CURL.md` updated
+- [ ] Push notifications — **out of this iteration**
 
 ### Iteration 2
-- [ ] OCR ID + plate APIs return values; UI can edit/override
-- [ ] AI failure does not block manual check-in
-- [ ] Curl docs updated for OCR endpoints
+- [ ] OCR ID + plate APIs; UI editable override
+- [ ] AI failure does not block flow
 
 ### Iteration 3
-- [ ] Create / list / cancel invitations + printable QR
-- [ ] QR scan routes open → check-in / checked_in → checkout
+- [ ] Invitation with `visit_date` → `scheduled`
+- [ ] Invite QR scan = check-in (no approval)
 
 ---
 
@@ -368,5 +359,6 @@ Mobile UI can trail web slightly; **API contracts freeze per iteration**.
 
 - Face matching visitors to employees  
 - Geofence for visitors  
-- Expired QR / auto-expire jobs  
 - Global IC uniqueness  
+- Storing `document_type` on Visitor  
+- Push notifications (planned later)  
