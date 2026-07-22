@@ -142,6 +142,12 @@ class VisitorEntry(models.Model):
 
     qr_token = models.CharField(max_length=64, unique=True, db_index=True)
     qr_image = models.ImageField(upload_to="visitor_qr/", null=True, blank=True)
+    pass_image = models.ImageField(
+        upload_to="visitor_pass/",
+        null=True,
+        blank=True,
+        help_text="Visitor ID-card pass (org, name, visit date, host, QR)",
+    )
     qr_expired = models.BooleanField(default=False)
 
     approved_by = models.ForeignKey(

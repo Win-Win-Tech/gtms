@@ -7,13 +7,17 @@ from .views import (
     VisitorCheckOutView,
     VisitorEntryExportView,
     VisitorEntryListView,
+    VisitorPassDownloadView,
     VisitorQrScanView,
+    VisitorRescheduleView,
     VisitorRevertView,
     VisitorSearchView,
 )
+from .views_ai import VisitorAiExtractView
 
 urlpatterns = [
     path("search/", VisitorSearchView.as_view(), name="visitor-search"),
+    path("ai/extract/", VisitorAiExtractView.as_view(), name="visitor-ai-extract"),
     path("qr-scan/", VisitorQrScanView.as_view(), name="visitor-qr-scan"),
     path("entries/", VisitorEntryListView.as_view(), name="visitor-entries-list"),
     path("entries/export/", VisitorEntryExportView.as_view(), name="visitor-entries-export"),
@@ -32,6 +36,16 @@ urlpatterns = [
         "entries/<uuid:entry_id>/cancel/",
         VisitorCancelView.as_view(),
         name="visitor-entries-cancel",
+    ),
+    path(
+        "entries/<uuid:entry_id>/pass/",
+        VisitorPassDownloadView.as_view(),
+        name="visitor-entries-pass",
+    ),
+    path(
+        "entries/<uuid:entry_id>/reschedule/",
+        VisitorRescheduleView.as_view(),
+        name="visitor-entries-reschedule",
     ),
     path(
         "entries/<uuid:entry_id>/checkout/",

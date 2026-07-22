@@ -2,13 +2,17 @@ from datetime import datetime
 
 from django.db import transaction
 from django.db.models import Q
+from django.http import FileResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from django.utils.timezone import is_naive
 from rest_framework import status
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+import pytz
 
 from authapp.models import User
 from scheduler.models import Location
@@ -18,13 +22,14 @@ from .models import Visitor, VisitorAsset, VisitorEntry
 from .serializers import VisitorEntrySerializer, VisitorSerializer
 from .utils import (
     apply_checkin_date_filter,
-    generate_qr_image_file,
     make_qr_token,
+    refresh_entry_qr_and_pass,
     resolve_location_for_request,
 )
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
     get_user_today,
+    to_user_timezone,
 )
 
 
@@ -54,18 +59,52 @@ def _save_assets_many(entry, asset_type, uploaded_files):
     return created
 
 
-def _parse_dt(value):
+def _parse_dt(value, user_tz=None):
+    """
+    Parse client datetime.
+    Naive values (e.g. 2026-07-22T19:00 from the web form) are wall-clock in user_tz,
+    then stored as UTC. Aware values are converted to UTC.
+    """
     if not value:
         return None
     if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = parse_datetime(text)
+        if not dt:
+            try:
+                dt = datetime.strptime(text[:16], "%Y-%m-%dT%H:%M")
+            except ValueError:
+                return None
+
+    if is_naive(dt):
+        tz = user_tz or pytz.UTC
+        # pytz: prefer localize for zone transitions
+        if hasattr(tz, "localize"):
+            dt = tz.localize(dt)
+        else:
+            dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(pytz.UTC)
+
+
+def _parse_date(value):
+    if not value:
+        return None
+    if hasattr(value, "year") and not isinstance(value, datetime):
         return value
-    dt = parse_datetime(str(value).replace("Z", "+00:00"))
-    if dt:
-        return dt
+    text = str(value).strip()[:10]
     try:
-        return datetime.strptime(str(value)[:16], "%Y-%m-%dT%H:%M")
+        return datetime.strptime(text, "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def _local_date_for_dt(dt, user_tz):
+    if not dt:
+        return None
+    local = to_user_timezone(dt, user_tz)
+    return local.date() if local else None
 
 
 def _upsert_visitor(location, ic_number, visitor_name, phone_number):
@@ -197,11 +236,35 @@ class VisitorSearchView(APIView):
             .first()
         )
         if not visitor:
-            return Response({"found": False, "visitor": None})
+            return Response({"found": False, "visitor": None, "last_entry": None})
+
+        last_entry = (
+            VisitorEntry.objects.filter(is_deleted=False, visitor=visitor)
+            .select_related("host")
+            .order_by("-created_on")
+            .first()
+        )
+        last_entry_data = None
+        if last_entry:
+            # Prefill helpers for manual entry — exclude images and times.
+            last_entry_data = {
+                "id": str(last_entry.id),
+                "visitor_type": last_entry.visitor_type,
+                "purpose_of_visit": last_entry.purpose_of_visit or "",
+                "vehicle_number": last_entry.vehicle_number or "",
+                "remarks": last_entry.remarks or "",
+                "host_id": str(last_entry.host_id) if last_entry.host_id else None,
+                "host_name": getattr(last_entry.host, "name", None) if last_entry.host else None,
+                "host_employee_code": (
+                    getattr(last_entry.host, "employee_code", None) if last_entry.host else None
+                ),
+            }
+
         return Response(
             {
                 "found": True,
                 "visitor": VisitorSerializer(visitor, context={"request": request}).data,
+                "last_entry": last_entry_data,
             }
         )
 
@@ -256,11 +319,42 @@ class VisitorCheckInView(APIView):
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
         remarks = (data.get("remarks") or "").strip()
-        expected_arrival = _parse_dt(data.get("expected_arrival_time"))
-        expected_out = _parse_dt(data.get("expected_out_time"))
 
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         visit_date_today = get_user_today(user_tz)
+        expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
+        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
+
+        if expected_arrival and expected_out and expected_out <= expected_arrival:
+            return Response(
+                {"error": "expected_out_time must be after expected_arrival_time"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if expected_arrival:
+            arrival_day = _local_date_for_dt(expected_arrival, user_tz)
+            if arrival_day and arrival_day != visit_date_today:
+                return Response(
+                    {
+                        "error": (
+                            "expected_arrival_time must be today for manual entry "
+                            f"(got {arrival_day}, today is {visit_date_today})"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        if expected_out:
+            out_day = _local_date_for_dt(expected_out, user_tz)
+            # Multi-day stay: out can be later days, but not before visit_date (today)
+            if out_day and out_day < visit_date_today:
+                return Response(
+                    {
+                        "error": (
+                            "expected_out_time cannot be before visit_date "
+                            f"(out={out_day}, visit_date={visit_date_today})"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         visitor = _upsert_visitor(location, ic_number, visitor_name, phone_number)
 
@@ -297,8 +391,9 @@ class VisitorCheckInView(APIView):
                 entry.revert_reason = ""
                 entry.qr_expired = False
                 entry.save()
+                # Info on the ID card changed — regenerate QR + pass, delete old files
+                refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
             else:
-                token = make_qr_token()
                 entry = VisitorEntry(
                     visitor=visitor,
                     host=host,
@@ -312,16 +407,12 @@ class VisitorCheckInView(APIView):
                     expected_arrival_time=expected_arrival,
                     expected_out_time=expected_out,
                     visit_date=visit_date_today,
-                    qr_token=token,
+                    qr_token=make_qr_token(),
                     qr_expired=False,
                     created_by=request.user,
                 )
-                entry.qr_image.save(
-                    f"visitor_qr_{token[:12]}.png",
-                    generate_qr_image_file(token),
-                    save=False,
-                )
                 entry.save()
+                refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
         except ImportError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -363,16 +454,14 @@ class VisitorApproveView(APIView):
                 {"error": "Only the host can approve this entry"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-        if entry.status not in (
-            VisitorEntry.STATUS_PENDING_APPROVAL,
-            VisitorEntry.STATUS_REVERTED,
-        ):
+        if entry.status != VisitorEntry.STATUS_PENDING_APPROVAL:
             return Response(
                 {"error": f"Cannot approve entry with status={entry.status}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        expected_out = _parse_dt(request.data.get("expected_out_time"))
+        user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
+        expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
         now = timezone.now()
         entry.status = VisitorEntry.STATUS_CHECKED_IN
         entry.check_in_time = now
@@ -421,7 +510,7 @@ class VisitorRevertView(APIView):
 
 
 class VisitorCancelView(APIView):
-    """POST /visitors/entries/<id>/cancel/ — host/guard cancel; QR expires."""
+    """POST /visitors/entries/<id>/cancel/ — Reject/Cancel; QR expires."""
 
     permission_classes = [IsAuthenticated]
     parser_classes = [JSONParser, FormParser, MultiPartParser]
@@ -448,6 +537,171 @@ class VisitorCancelView(APIView):
         entry.status = VisitorEntry.STATUS_CANCELLED
         entry.qr_expired = True
         entry.save(update_fields=["status", "qr_expired", "modified_on"])
+
+        entry = _base_entry_qs().get(id=entry.id)
+        return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
+
+
+class VisitorPassDownloadView(APIView):
+    """
+    GET /visitors/entries/<id>/pass/
+    Authenticated download of the visitor ID-card pass (falls back to raw QR).
+    Avoids browser CORS issues with direct /media/ fetch.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, entry_id):
+        try:
+            entry = _base_entry_qs().get(id=entry_id)
+        except VisitorEntry.DoesNotExist:
+            return Response({"error": "Visitor entry not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_access_entry(request, entry):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        if entry.qr_expired:
+            return Response({"error": "QR is expired"}, status=status.HTTP_400_BAD_REQUEST)
+
+        image_field = entry.pass_image or entry.qr_image
+        if not image_field:
+            # Generate on demand if missing (e.g. older entries)
+            try:
+                refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+                entry = _base_entry_qs().get(id=entry.id)
+                image_field = entry.pass_image or entry.qr_image
+            except Exception as exc:
+                return Response(
+                    {"error": f"Pass image not available: {exc}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+        if not image_field:
+            return Response({"error": "Pass image not available"}, status=status.HTTP_404_NOT_FOUND)
+
+        visitor_name = getattr(entry.visitor, "visitor_name", None) or "visitor"
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in visitor_name)[:40]
+        filename = f"visitor-pass-{safe or entry.id}.png"
+        return FileResponse(
+            image_field.open("rb"),
+            as_attachment=True,
+            filename=filename,
+            content_type="image/png",
+        )
+
+
+class VisitorRescheduleView(APIView):
+    """
+    POST /visitors/entries/<id>/reschedule/
+    Body: expected_arrival_time, expected_out_time (required), visit_date (optional).
+    Same day → pending_approval; future day → scheduled. Never checks in.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+
+    @transaction.atomic
+    def post(self, request, entry_id):
+        try:
+            entry = _base_entry_qs().select_for_update().get(id=entry_id)
+        except VisitorEntry.DoesNotExist:
+            return Response({"error": "Visitor entry not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_access_entry(request, entry):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+        if not _is_host_or_super(request, entry):
+            return Response(
+                {"error": "Only the host can reschedule this entry"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if entry.status not in (
+            VisitorEntry.STATUS_PENDING_APPROVAL,
+            VisitorEntry.STATUS_SCHEDULED,
+        ):
+            return Response(
+                {"error": f"Cannot reschedule entry with status={entry.status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
+        expected_arrival = _parse_dt(request.data.get("expected_arrival_time"), user_tz)
+        expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
+        if not expected_arrival:
+            return Response(
+                {"error": "expected_arrival_time is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not expected_out:
+            return Response(
+                {"error": "expected_out_time is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if expected_out <= expected_arrival:
+            return Response(
+                {"error": "expected_out_time must be after expected_arrival_time"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today = get_user_today(user_tz)
+        visit_date = _parse_date(request.data.get("visit_date"))
+        if not visit_date:
+            visit_date = _local_date_for_dt(expected_arrival, user_tz) or today
+
+        if visit_date < today:
+            return Response(
+                {"error": "visit_date cannot be in the past"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        arrival_day = _local_date_for_dt(expected_arrival, user_tz)
+        out_day = _local_date_for_dt(expected_out, user_tz)
+        # Visit may span multiple days (arrive today, leave later). ETA/ETO must be on/after visit_date.
+        if arrival_day and arrival_day < visit_date:
+            return Response(
+                {
+                    "error": (
+                        "expected_arrival_time cannot be before visit_date "
+                        f"(arrival={arrival_day}, visit_date={visit_date})"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if out_day and out_day < visit_date:
+            return Response(
+                {
+                    "error": (
+                        "expected_out_time cannot be before visit_date "
+                        f"(out={out_day}, visit_date={visit_date})"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if visit_date == today:
+            new_status = VisitorEntry.STATUS_PENDING_APPROVAL
+        else:
+            new_status = VisitorEntry.STATUS_SCHEDULED
+
+        entry.expected_arrival_time = expected_arrival
+        entry.expected_out_time = expected_out
+        entry.visit_date = visit_date
+        entry.status = new_status
+        entry.qr_expired = False
+        entry.save(
+            update_fields=[
+                "expected_arrival_time",
+                "expected_out_time",
+                "visit_date",
+                "status",
+                "qr_expired",
+                "modified_on",
+            ]
+        )
+        # Visit date / times on the ID card changed — regenerate pass (keep same token)
+        try:
+            refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+        except ImportError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         entry = _base_entry_qs().get(id=entry.id)
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
@@ -495,10 +749,10 @@ class VisitorCheckOutView(APIView):
 class VisitorQrScanView(APIView):
     """
     POST /visitors/qr-scan/  body: { qr_token }
-    - pending_approval → not approved yet
-    - scheduled (invite) → check-in
-    - checked_in → return entry for checkout UI
-    - checked_out / cancelled / expired → error
+    - pending_approval → awaiting_approval
+    - scheduled on visit day → pending_approval + awaiting_approval
+    - scheduled future day → too_early
+    - checked_in → checkout
     """
 
     permission_classes = [IsAuthenticated]
@@ -549,19 +803,30 @@ class VisitorQrScanView(APIView):
                 }
             )
 
-        # Invitation: QR scan = check-in (no host approval)
+        # Scheduled (invite or rescheduled): arrival scan starts host approval — no auto check-in
         if entry.status == VisitorEntry.STATUS_SCHEDULED:
-            now = timezone.now()
-            entry.status = VisitorEntry.STATUS_CHECKED_IN
-            entry.check_in_time = now
-            entry.approved_by = request.user
-            entry.approved_on = now
-            entry.save()
+            user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
+            today = get_user_today(user_tz)
+            visit_day = entry.visit_date or _local_date_for_dt(entry.expected_arrival_time, user_tz)
+
+            if visit_day and visit_day > today:
+                return Response(
+                    {
+                        "action": "too_early",
+                        "message": f"Visit is scheduled for {visit_day.isoformat()}. Too early to check in.",
+                        "entry": VisitorEntrySerializer(entry, context={"request": request}).data,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
+            entry.qr_expired = False
+            entry.save(update_fields=["status", "qr_expired", "modified_on"])
             entry = _base_entry_qs().get(id=entry.id)
             return Response(
                 {
-                    "action": "checked_in",
-                    "message": "Visitor checked in via invitation QR",
+                    "action": "awaiting_approval",
+                    "message": "Arrival recorded. Waiting for host approval.",
                     "entry": VisitorEntrySerializer(entry, context={"request": request}).data,
                 }
             )

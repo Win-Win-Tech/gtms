@@ -72,6 +72,7 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     approved_by_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     qr_image_url = serializers.SerializerMethodField()
+    pass_image_url = serializers.SerializerMethodField()
     qr_usable = serializers.SerializerMethodField()
     assets = VisitorAssetSerializer(many=True, read_only=True)
 
@@ -111,6 +112,7 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
             "check_out_time",
             "qr_token",
             "qr_image_url",
+            "pass_image_url",
             "qr_expired",
             "qr_usable",
             "approved_by_id",
@@ -140,6 +142,9 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
 
     def get_qr_image_url(self, obj):
         return _abs_media_url(obj.qr_image, self.context.get("request"))
+
+    def get_pass_image_url(self, obj):
+        return _abs_media_url(obj.pass_image, self.context.get("request"))
 
     def get_qr_usable(self, obj):
         return obj.is_qr_usable

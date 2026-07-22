@@ -8,14 +8,17 @@ Base: `http://localhost:8000/visitors/`
 
 `pending_approval` | `reverted` | `scheduled` | `checked_in` | `checked_out` | `cancelled`
 
+**Reject = Cancel** (`cancelled`, QR expired).
+
 ## Flows
 
 | Flow | Steps |
 |------|--------|
-| **Manual entry** | Submit → `pending_approval` + QR → host **approve** (= check-in) or **revert** / **cancel** |
-| **Resubmit** | After `reverted`, POST checkin again with `entry_id` → back to `pending_approval` |
-| **Invitation** (later) | `scheduled` → QR scan (= check-in, no host approval) |
-| **Checkout** | QR scan while `checked_in`, or manual checkout — **`exit_photo` required** → `checked_out`, `qr_expired=true` |
+| **Manual entry** | Submit → `pending_approval` + QR → host **Approve** / **Reject(Cancel)** / **Revert** / **Reschedule** |
+| **Resubmit** | After `reverted`, POST checkin with `entry_id` → `pending_approval` |
+| **Reschedule** | Update arrival + out (+ visit_date). Same day → `pending_approval`. Other day → `scheduled`. Never auto check-in. |
+| **Invitation** (Iter 3) | Create → `scheduled`. Visit-day QR scan → `pending_approval` + host approval (not direct check-in). |
+| **Checkout** | While `checked_in` — **`exit_photo` required** → `checked_out`, `qr_expired=true` |
 
 ### QR scan actions
 
@@ -23,13 +26,17 @@ Base: `http://localhost:8000/visitors/`
 |--------------|-------------------|
 | `pending_approval` | `awaiting_approval` |
 | `reverted` | `reverted` |
-| `scheduled` | check-in → `checked_in` |
-| `checked_in` | `checkout` (then call checkout with image) |
+| `scheduled` + visit day | → `pending_approval` then `awaiting_approval` |
+| `scheduled` + future day | `too_early` |
+| `checked_in` | `checkout` |
 | `checked_out` / `cancelled` / `qr_expired` | `expired` |
 
 ---
 
 ## Search visitor by IC
+
+Returns visitor profile + `last_entry` (type, host, purpose, vehicle, remarks) for form prefill.
+Images and expected times are **not** included — capture fresh on each visit.
 
 ```bash
 curl -X GET "http://localhost:8000/visitors/search/?ic_number=900101145678&location_id=<LOCATION_UUID>" \
@@ -40,11 +47,9 @@ curl -X GET "http://localhost:8000/visitors/search/?ic_number=900101145678&locat
 
 ## Manual entry submit (→ `pending_approval` + QR)
 
-- `host_id` required  
-- `visitor_photo` + `id_proof` required  
-- `visit_date` is set automatically to **today** (location timezone)  
-- `expected_out_time` optional (guard can set; host can change on approve)  
-- Superuser: pass `location_id`. Non-superuser: uses own location.
+`visit_date` is set automatically to **today**. Expected arrival/out (if sent) must also be **today**.
+
+Response includes `qr_image_url` (raw QR) and `pass_image_url` (ID-card pass: org, name, visit date, host, QR). Pass/QR regenerate on create, resubmit, and reschedule; old files are deleted.
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
@@ -58,21 +63,16 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -F "purpose_of_visit=Meeting" \
   -F "vehicle_number=TN58B8050" \
   -F "remarks=Just for testing" \
-  -F "expected_arrival_time=2026-07-21T10:00" \
-  -F "expected_out_time=2026-07-21T18:00" \
+  -F "expected_arrival_time=2026-07-22T10:00" \
+  -F "expected_out_time=2026-07-22T18:00" \
   -F "visitor_photo=@/path/to/photo.jpg" \
   -F "id_proof=@/path/to/id.jpg" \
-  -F "additional_images=@/path/to/extra1.jpg" \
-  -F "additional_images=@/path/to/extra2.jpg"
+  -F "additional_images=@/path/to/extra1.jpg"
 ```
-
-`visitor_type`: `guest` | `contractor` | `client` | `delivery` | `other`
 
 ---
 
 ## Resubmit after revert
-
-Same checkin endpoint. Only works when entry status is `reverted`. Photos optional if keeping existing assets.
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
@@ -81,12 +81,10 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -F "location_id=<LOCATION_UUID>" \
   -F "ic_passport_number=900101145678" \
   -F "visitor_name=Ahmad Bin Ali" \
-  -F "phone_number=0123456789" \
   -F "host_id=<HOST_USER_UUID>" \
   -F "visitor_type=guest" \
-  -F "purpose_of_visit=Meeting (corrected)" \
-  -F "expected_arrival_time=2026-07-21T10:00" \
-  -F "expected_out_time=2026-07-21T18:00" \
+  -F "expected_arrival_time=2026-07-22T11:00" \
+  -F "expected_out_time=2026-07-22T18:00" \
   -F "visitor_photo=@/path/to/photo.jpg" \
   -F "id_proof=@/path/to/id.jpg"
 ```
@@ -95,30 +93,18 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
 
 ## Host approve (= check-in)
 
-Only host (or superuser). Entry must be `pending_approval` (or `reverted` in API — prefer resubmit first).  
-`expected_out_time` optional — if sent, overwrites entry value; if omitted, keeps existing.
+Only from `pending_approval`.
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/approve/" \
   -H "Authorization: Bearer <TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{"expected_out_time":"2026-07-21T18:00"}'
-```
-
-Without changing out time:
-
-```bash
-curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/approve/" \
-  -H "Authorization: Bearer <TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{}'
+  -d '{"expected_out_time":"2026-07-22T18:00"}'
 ```
 
 ---
 
 ## Host revert
-
-Only from `pending_approval`. Guard must resubmit with `entry_id`.
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/revert/" \
@@ -129,11 +115,41 @@ curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/revert/" \
 
 ---
 
-## Cancel (QR expires)
+## Reject / Cancel (same status)
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/cancel/" \
   -H "Authorization: Bearer <TOKEN>"
+```
+
+---
+
+## Host reschedule
+
+Requires `expected_arrival_time` + `expected_out_time`. Optional `visit_date` (else derived from arrival local date).
+
+Same day → stays/moves to `pending_approval`. Future day → `scheduled`.
+
+```bash
+# Same day, different time
+curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/reschedule/" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_arrival_time":"2026-07-22T15:00",
+    "expected_out_time":"2026-07-22T19:00",
+    "visit_date":"2026-07-22"
+  }'
+
+# Another day
+curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/reschedule/" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_arrival_time":"2026-07-25T10:00",
+    "expected_out_time":"2026-07-25T17:00",
+    "visit_date":"2026-07-25"
+  }'
 ```
 
 ---
@@ -147,17 +163,43 @@ curl -X POST "http://localhost:8000/visitors/qr-scan/" \
   -d '{"qr_token":"<QR_TOKEN>"}'
 ```
 
-Example responses:
+---
 
-- `{"action":"awaiting_approval","message":"...","entry":{...}}`
-- `{"action":"reverted","message":"...","entry":{...}}`
-- `{"action":"checked_in","entry":{...}}` (invite scan)
-- `{"action":"checkout","entry":{...}}` (then call checkout)
-- `{"action":"expired",...}` (HTTP 400)
+## Download visitor pass
+
+```bash
+curl -X GET "http://localhost:8000/visitors/entries/<ENTRY_UUID>/pass/" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -o visitor-pass.png
+```
+
+Authenticated pass download (ID-card PNG). Prefer this over fetching `pass_image_url` directly from `/media/` (avoids CORS).
 
 ---
 
-## Checkout (image required, QR expires)
+## AI extract (ID / vehicle) — Iteration 2
+
+Full setup (Windows / Ubuntu), package list, and code explanation:
+
+→ **`visitor/docs/VISITOR_AI_OCR.md`**
+
+```bash
+# type=id — extract IC / passport / Aadhaar-like number
+curl -X POST "http://localhost:8000/visitors/ai/extract/" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -F "type=id" \
+  -F "image=@/path/to/id.jpg"
+
+# type=vehicle — detect vehicle + extract plate
+curl -X POST "http://localhost:8000/visitors/ai/extract/" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -F "type=vehicle" \
+  -F "image=@/path/to/car.jpg"
+```
+
+---
+
+## Checkout
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/checkout/" \
@@ -165,41 +207,22 @@ curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/checkout/" \
   -F "exit_photo=@/path/to/exit.jpg"
 ```
 
-Alias field name also accepted: `checkout_image`.
-
 ---
 
-## List entries (history)
+## List / export
+
+`date_filter` matches **`visit_date`** (day the visit is for). If `visit_date` is null, falls back to `check_in_time`, then `created_on`.
+
+Values: `today` | `upcoming` (visit_date after today) | `this_week` | `this_month` | `custom` | `all`
 
 ```bash
-curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&status=pending_approval" \
+curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&status=pending_approval&mine=true" \
   -H "Authorization: Bearer <TOKEN>"
-```
 
-Query params:
-
-| Param | Values / notes |
-|-------|----------------|
-| `date_filter` | `today` (default), `this_week`, `this_month`, `custom`, `all` |
-| `start_date` / `end_date` | `YYYY-MM-DD` when `date_filter=custom` |
-| `status` | e.g. `pending_approval`, `reverted`, `checked_in`, `checked_out`, `cancelled` |
-| `location_id` | filter org (superuser) |
-| `search` | name / IC / phone |
-| `mine` | `true` — host inbox only |
-
-```bash
-curl -X GET "http://localhost:8000/visitors/entries/?date_filter=custom&start_date=2026-07-01&end_date=2026-07-21&search=Ahmad&mine=true" \
+curl -X GET "http://localhost:8000/visitors/entries/?date_filter=upcoming&status=scheduled" \
   -H "Authorization: Bearer <TOKEN>"
-```
 
----
-
-## Excel export
-
-Same filters as list:
-
-```bash
-curl -X GET "http://localhost:8000/visitors/entries/export/?date_filter=today&status=all" \
+curl -X GET "http://localhost:8000/visitors/entries/export/?date_filter=today" \
   -H "Authorization: Bearer <TOKEN>" \
   -o visitor_entries.xlsx
 ```

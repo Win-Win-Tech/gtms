@@ -1,0 +1,24 @@
+# Extra deps for Visitor AI (ID + vehicle OCR) — CPU ONLY
+# Install INTO the Django venv, AFTER main requirements.txt
+#
+# DO NOT run only:  pip install -r requirements-visitor-ai.txt
+# Ultralytics will pull multi-GB NVIDIA CUDA wheels and can fill the disk
+# (Errno 28). Always install CPU torch FIRST.
+#
+# Ubuntu OS packages (see docs/VISITOR_AI_OCR.md):
+#   sudo apt install -y libgl1 libglib2.0-0 libgomp1
+#
+# From backendnew/gtms (venv active):
+#
+#   # 1) CPU torch FIRST (required)
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+#
+#   # 2) Then AI packages
+#   pip install -r patrol_backend/visitor/requirements-visitor-ai.txt
+#
+# PaddlePaddle CPU: if pin fails, see https://www.paddlepaddle.org.cn
+
+paddlepaddle==3.0.0
+paddleocr==2.9.1
+ultralytics==8.3.70
+opencv-python-headless==4.10.0.84
