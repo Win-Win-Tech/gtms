@@ -189,12 +189,14 @@ curl -X POST "http://localhost:8000/visitors/ai/extract/" \
   -H "Authorization: Bearer <TOKEN>" \
   -F "type=id" \
   -F "image=@/path/to/id.jpg"
+# → { "type":"id", "found":true, "number":"...", "confidence":0.99 }
 
 # type=vehicle — detect vehicle + extract plate
 curl -X POST "http://localhost:8000/visitors/ai/extract/" \
   -H "Authorization: Bearer <TOKEN>" \
   -F "type=vehicle" \
   -F "image=@/path/to/car.jpg"
+# → { "type":"vehicle", "found":true, "number":"...", "confidence":0.89 }
 ```
 
 ---

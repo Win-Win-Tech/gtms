@@ -48,21 +48,18 @@ curl -X POST "http://localhost:8000/visitors/ai/extract/" \
 {
   "type": "id",
   "found": true,
-  "id_number": "900101145678",
-  "confidence": 0.91,
-  "document_hint": "mykad",
-  "detect": { "detector": "document_region", "confidence": 0.5, "box": [12, 40, 900, 600] },
-  "elapsed_ms": 1200
+  "number": "900101145678",
+  "confidence": 0.91
 }
 ```
 
-**Not an ID**
+**Not found**
 ```json
 {
   "type": "id",
   "found": false,
-  "reason": "no_id_document",
-  "elapsed_ms": 800
+  "number": null,
+  "confidence": null
 }
 ```
 
@@ -80,41 +77,22 @@ curl -X POST "http://localhost:8000/visitors/ai/extract/" \
 {
   "type": "vehicle",
   "found": true,
-  "vehicle_number": "TN58B8050",
-  "confidence": 0.88,
-  "detect": {
-    "detector": "yolov8n",
-    "label": "car",
-    "confidence": 0.87,
-    "box": [40, 80, 900, 700],
-    "vehicle_count": 1
-  },
-  "elapsed_ms": 1400
+  "number": "TN58B8050",
+  "confidence": 0.88
 }
 ```
 
-**No vehicle**
+**Not found**
 ```json
 {
   "type": "vehicle",
   "found": false,
-  "reason": "no_vehicle",
-  "elapsed_ms": 600
+  "number": null,
+  "confidence": null
 }
 ```
 
-### `reason` values
-| reason | Meaning |
-|--------|---------|
-| `no_id_document` | No ID-like text/number found |
-| `no_vehicle` | No vehicle / no plate text |
-| `low_confidence` | OCR match below threshold |
-| `timeout` | Pipeline exceeded time budget |
-| `busy` | Another AI job running (concurrency limit) |
-| `bad_image` | Unreadable / too large |
-| `invalid_type` | `type` not id/vehicle |
-| `missing_image` | No file in request |
-| `dependency_missing` | Packages not installed (503) |
+Public response fields are only: `type`, `found`, `number`, `confidence` (same `number` key for ID and vehicle).
 
 ---
 
@@ -130,7 +108,7 @@ curl -X POST "http://localhost:8000/visitors/ai/extract/" \
 5. PaddleOCR       → text lines + scores (CPU)
 6. Parse           → regex: MyKad / Aadhaar / passport OR plate patterns
 7. Gate            → confidence / timeout / busy
-8. JSON response   → found + id_number | vehicle_number
+8. JSON response   → { type, found, number, confidence }
 ```
 
 ---
@@ -305,7 +283,7 @@ Expected warm latency: roughly **1–2+ seconds** on CPU (varies by image).
 ## Frontend (later)
 
 Wire Manual Entry:
-- After ID proof upload → `type=id` → fill `ic_passport_number` if `found`
-- After vehicle photo → `type=vehicle` → fill `vehicle_number` if `found`
+- After ID proof upload → `type=id` → fill `ic_passport_number` from `number` if `found`
+- After vehicle photo → `type=vehicle` → fill `vehicle_number` from `number` if `found`
 
 Not required to test this API in Postman.

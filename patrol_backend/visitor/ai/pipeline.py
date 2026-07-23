@@ -104,21 +104,36 @@ def _pipeline_id(bgr, t0: float) -> Dict[str, Any]:
     """
     type=id:
       detect document region → crop (or full frame) → OCR → parse ID number
+      If crop OCR fails to parse, retry full frame (common with phone + watermarks).
     """
     box = detect_id_region(bgr)
     if box is not None:
-        roi = crop_with_padding(bgr, box, pad_ratio=0.06)
+        roi = crop_with_padding(bgr, box, pad_ratio=0.08)
         detect_meta = {
             "detector": box.label,
             "confidence": round(box.confidence, 3),
             "box": [box.x1, box.y1, box.x2, box.y2],
         }
     else:
-        # No clear card contour — still try full resized frame
         roi = bgr
         detect_meta = {"detector": "full_frame", "confidence": None, "box": None}
 
     lines = run_ocr(roi)
+    parsed = extract_id_number(lines) if lines else None
+
+    # Crop can miss the IC line (glare / watermark / tight box) — try full frame
+    if not parsed and box is not None:
+        lines_full = run_ocr(bgr)
+        parsed_full = extract_id_number(lines_full) if lines_full else None
+        if parsed_full:
+            lines = lines_full
+            parsed = parsed_full
+            detect_meta = {
+                "detector": "full_frame_fallback",
+                "confidence": None,
+                "box": detect_meta.get("box"),
+            }
+
     if not lines:
         return {
             "type": "id",
@@ -128,7 +143,6 @@ def _pipeline_id(bgr, t0: float) -> Dict[str, Any]:
             "elapsed_ms": _elapsed_ms(t0),
         }
 
-    parsed = extract_id_number(lines)
     if not parsed:
         return {
             "type": "id",
