@@ -224,6 +224,10 @@ curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&status=pe
 curl -X GET "http://localhost:8000/visitors/entries/?date_filter=upcoming&status=scheduled" \
   -H "Authorization: Bearer <TOKEN>"
 
+# Only entries with a vehicle number
+curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&has_vehicle=true" \
+  -H "Authorization: Bearer <TOKEN>"
+
 curl -X GET "http://localhost:8000/visitors/entries/export/?date_filter=today" \
   -H "Authorization: Bearer <TOKEN>" \
   -o visitor_entries.xlsx

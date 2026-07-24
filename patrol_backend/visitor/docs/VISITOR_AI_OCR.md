@@ -280,10 +280,11 @@ Expected warm latency: roughly **1–2+ seconds** on CPU (varies by image).
 
 ---
 
-## Frontend (later)
+## Frontend (Manual Entry)
 
-Wire Manual Entry:
-- After ID proof upload → `type=id` → fill `ic_passport_number` from `number` if `found`
-- After vehicle photo → `type=vehicle` → fill `vehicle_number` from `number` if `found`
-
-Not required to test this API in Postman.
+Wired in `GTMS_NEw/src/pages/visitor/VisitorManualEntry.jsx`:
+- **IC / ID copy** upload → background `type=id` → silently fill `ic_passport_number` if empty + found
+- **Additional images** → background `type=vehicle` → silently fill `vehicle_number` if empty + found
+- Once vehicle number is set, further additional images skip AI
+- No loading overlay / no toast for OCR — failures and not-found are ignored silently
+- User can keep filling the form while OCR runs

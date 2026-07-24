@@ -175,6 +175,11 @@ def _filtered_entries(request):
             | Q(host__name__icontains=search)
         )
 
+    # Vehicle filter: only entries with a non-empty vehicle_number
+    has_vehicle = (request.query_params.get("has_vehicle") or "").strip().lower()
+    if has_vehicle in ("1", "true", "yes"):
+        qs = qs.exclude(vehicle_number__isnull=True).exclude(vehicle_number__exact="")
+
     date_filter = request.query_params.get("date_filter", "today")
     start_date = request.query_params.get("start_date")
     end_date = request.query_params.get("end_date")
