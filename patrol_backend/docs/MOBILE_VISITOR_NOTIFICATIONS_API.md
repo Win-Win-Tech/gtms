@@ -15,8 +15,36 @@ Related shorter notes:
 
 ---
 
+## API index
+
+All endpoints documented in this file:
+
+| Method | Endpoint | Use |
+|--------|----------|-----|
+| `POST` | `/notifications/device-token/` | Register or refresh FCM device token (login / token refresh) |
+| `DELETE` | `/notifications/device-token/` | Deactivate FCM device token (logout) |
+| `GET` | `/notifications/` | List notification inbox (paginated; unread + history) |
+| `POST` | `/notifications/<id>/read/` | Mark one notification as read |
+| `POST` | `/notifications/read-all/` | Mark all notifications as read |
+| `GET` | `/visitors/search/` | Search prior visitor by IC / passport (prefill manual entry) |
+| `POST` | `/visitors/entries/checkin/` | Create manual walk-in or resubmit reverted entry (`multipart`) |
+| `GET` | `/visitors/entries/` | List visitor entries (filters / pagination) |
+| `GET` | `/visitors/entries/<ENTRY_UUID>/` | Entry detail (deep-link from FCM / inbox) |
+| `GET` | `/visitors/entries/<ENTRY_UUID>/pass/` | Download visitor pass (PDF/image) |
+| `GET` | `/visitors/entries/export/` | Export entries to Excel |
+| `POST` | `/visitors/entries/<id>/approve/` | Host approve (= check-in) |
+| `POST` | `/visitors/entries/<id>/revert/` | Host revert for guard correction |
+| `POST` | `/visitors/entries/<id>/cancel/` | Host reject / cancel visit |
+| `POST` | `/visitors/entries/<id>/reschedule/` | Host reschedule visit date / times |
+| `POST` | `/visitors/qr-scan/` | Scan QR on visit day (`scheduled` → `pending_approval`) |
+| `POST` | `/visitors/entries/<id>/checkout/` | Check out visitor (`multipart` + exit photo) |
+| `POST` | `/visitors/ai/extract/` | Optional AI OCR — extract ID or vehicle number from image |
+
+---
+
 ## Table of contents
 
+0. [API index](#api-index)
 1. [Statuses & rules](#1-statuses--rules)
 2. [End-to-end flows](#2-end-to-end-flows)
 3. [Notification types (FCM + inbox)](#3-notification-types-fcm--inbox)
