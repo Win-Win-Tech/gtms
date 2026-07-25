@@ -15,11 +15,13 @@ from rest_framework.views import APIView
 import pytz
 
 from authapp.models import User
+from notifications.models import NotificationLog
+from notifications.services import notify_visitor_host_action, notify_visitor_pending
 from scheduler.models import Location
 
 from .exports import generate_visitor_excel
 from .models import Visitor, VisitorAsset, VisitorEntry
-from .serializers import VisitorEntrySerializer, VisitorSerializer
+from .serializers import VisitorAssetSerializer, VisitorEntrySerializer, VisitorSerializer
 from .utils import (
     apply_checkin_date_filter,
     make_qr_token,
@@ -36,7 +38,9 @@ from patrol_backend.utils.timezone_utils import (
 def _base_entry_qs():
     return (
         VisitorEntry.objects.filter(is_deleted=False)
-        .select_related("visitor", "host", "location", "created_by", "approved_by")
+        .select_related(
+            "visitor", "host", "location", "created_by", "approved_by", "scanned_by"
+        )
         .prefetch_related("assets")
     )
 
@@ -246,12 +250,24 @@ class VisitorSearchView(APIView):
         last_entry = (
             VisitorEntry.objects.filter(is_deleted=False, visitor=visitor)
             .select_related("host")
+            .prefetch_related("assets")
             .order_by("-created_on")
             .first()
         )
         last_entry_data = None
         if last_entry:
-            # Prefill helpers for manual entry — exclude images and times.
+            # Prefill helpers — include prior photos; times still captured fresh.
+            pref_types = {
+                VisitorAsset.ASSET_VISITOR_PHOTO,
+                VisitorAsset.ASSET_ID_PROOF,
+                VisitorAsset.ASSET_ADDITIONAL,
+                VisitorAsset.ASSET_VEHICLE_PHOTO,
+            }
+            photo_assets = [
+                a
+                for a in last_entry.assets.all()
+                if a.asset_type in pref_types and a.file
+            ]
             last_entry_data = {
                 "id": str(last_entry.id),
                 "visitor_type": last_entry.visitor_type,
@@ -263,6 +279,9 @@ class VisitorSearchView(APIView):
                 "host_employee_code": (
                     getattr(last_entry.host, "employee_code", None) if last_entry.host else None
                 ),
+                "assets": VisitorAssetSerializer(
+                    photo_assets, many=True, context={"request": request}
+                ).data,
             }
 
         return Response(
@@ -327,26 +346,15 @@ class VisitorCheckInView(APIView):
 
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         visit_date_today = get_user_today(user_tz)
-        expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
+        # Walk-in: visit_date + expected_arrival = create time (now). Ignore client arrival.
+        expected_arrival = timezone.now()
         expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
 
-        if expected_arrival and expected_out and expected_out <= expected_arrival:
+        if expected_out and expected_out <= expected_arrival:
             return Response(
                 {"error": "expected_out_time must be after expected_arrival_time"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if expected_arrival:
-            arrival_day = _local_date_for_dt(expected_arrival, user_tz)
-            if arrival_day and arrival_day != visit_date_today:
-                return Response(
-                    {
-                        "error": (
-                            "expected_arrival_time must be today for manual entry "
-                            f"(got {arrival_day}, today is {visit_date_today})"
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
         if expected_out:
             out_day = _local_date_for_dt(expected_out, user_tz)
             # Multi-day stay: out can be later days, but not before visit_date (today)
@@ -430,6 +438,7 @@ class VisitorCheckInView(APIView):
         _save_assets_many(entry, VisitorAsset.ASSET_ADDITIONAL, additional)
 
         entry = _base_entry_qs().get(id=entry.id)
+        notify_visitor_pending(entry)
         return Response(
             VisitorEntrySerializer(entry, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
@@ -478,6 +487,13 @@ class VisitorApproveView(APIView):
         entry.save()
 
         entry = _base_entry_qs().get(id=entry.id)
+        visitor_name = getattr(entry.visitor, "visitor_name", "Visitor")
+        notify_visitor_host_action(
+            entry,
+            NotificationLog.TYPE_VISITOR_APPROVED,
+            "Visitor approved",
+            f"{visitor_name} was approved and checked in.",
+        )
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
 
 
@@ -511,6 +527,15 @@ class VisitorRevertView(APIView):
         entry.save(update_fields=["status", "revert_reason", "modified_on"])
 
         entry = _base_entry_qs().get(id=entry.id)
+        visitor_name = getattr(entry.visitor, "visitor_name", "Visitor")
+        notify_visitor_host_action(
+            entry,
+            NotificationLog.TYPE_VISITOR_REVERTED,
+            "Visitor entry reverted",
+            f"{visitor_name} needs correction."
+            + (f" Reason: {reason}" if reason else ""),
+            extra={"revert_reason": reason},
+        )
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
 
 
@@ -544,6 +569,13 @@ class VisitorCancelView(APIView):
         entry.save(update_fields=["status", "qr_expired", "modified_on"])
 
         entry = _base_entry_qs().get(id=entry.id)
+        visitor_name = getattr(entry.visitor, "visitor_name", "Visitor")
+        notify_visitor_host_action(
+            entry,
+            NotificationLog.TYPE_VISITOR_CANCELLED,
+            "Visitor entry cancelled",
+            f"{visitor_name} was cancelled / rejected.",
+        )
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
 
 
@@ -709,6 +741,18 @@ class VisitorRescheduleView(APIView):
             return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         entry = _base_entry_qs().get(id=entry.id)
+        visitor_name = getattr(entry.visitor, "visitor_name", "Visitor")
+        notify_visitor_host_action(
+            entry,
+            NotificationLog.TYPE_VISITOR_RESCHEDULED,
+            "Visitor rescheduled",
+            f"{visitor_name} was rescheduled"
+            + (f" to {visit_date.isoformat()}." if visit_date else "."),
+            extra={
+                "visit_date": visit_date.isoformat() if visit_date else "",
+                "status": new_status,
+            },
+        )
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
 
 
@@ -808,7 +852,7 @@ class VisitorQrScanView(APIView):
                 }
             )
 
-        # Scheduled (invite or rescheduled): arrival scan starts host approval — no auto check-in
+        # Scheduled (reschedule to future day): visit-day scan starts host approval — no auto check-in
         if entry.status == VisitorEntry.STATUS_SCHEDULED:
             user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
             today = get_user_today(user_tz)
@@ -826,8 +870,10 @@ class VisitorQrScanView(APIView):
 
             entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
             entry.qr_expired = False
-            entry.save(update_fields=["status", "qr_expired", "modified_on"])
+            entry.scanned_by = request.user
+            entry.save(update_fields=["status", "qr_expired", "scanned_by", "modified_on"])
             entry = _base_entry_qs().get(id=entry.id)
+            notify_visitor_pending(entry)
             return Response(
                 {
                     "action": "awaiting_approval",
@@ -860,6 +906,19 @@ class VisitorEntryListView(APIView):
             return error_response
         return Response(
             VisitorEntrySerializer(qs, many=True, context={"request": request}).data
+        )
+
+
+class VisitorEntryDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, entry_id):
+        try:
+            entry = _base_entry_qs().get(id=entry_id)
+        except VisitorEntry.DoesNotExist:
+            return Response({"error": "Entry not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            VisitorEntrySerializer(entry, context={"request": request}).data
         )
 
 

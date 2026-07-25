@@ -5,6 +5,7 @@ from .views import (
     VisitorCancelView,
     VisitorCheckInView,
     VisitorCheckOutView,
+    VisitorEntryDetailView,
     VisitorEntryExportView,
     VisitorEntryListView,
     VisitorPassDownloadView,
@@ -22,6 +23,11 @@ urlpatterns = [
     path("entries/", VisitorEntryListView.as_view(), name="visitor-entries-list"),
     path("entries/export/", VisitorEntryExportView.as_view(), name="visitor-entries-export"),
     path("entries/checkin/", VisitorCheckInView.as_view(), name="visitor-entries-checkin"),
+    path(
+        "entries/<uuid:entry_id>/",
+        VisitorEntryDetailView.as_view(),
+        name="visitor-entries-detail",
+    ),
     path(
         "entries/<uuid:entry_id>/approve/",
         VisitorApproveView.as_view(),

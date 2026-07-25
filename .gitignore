@@ -60,3 +60,10 @@ htmlcov/
 *.bak
 *.tmp
 *~
+
+# YOLO / Ultralytics model weights (auto-downloaded)
+*.pt
+yolov8*.pt
+runs/
+
+patrol_backend/certificate/*.json

@@ -166,6 +166,14 @@ class VisitorEntry(models.Model):
         blank=True,
         related_name="visitor_entries_created",
     )
+    scanned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="visitor_entries_scanned",
+        help_text="Guard who scanned invite/scheduled QR into pending_approval",
+    )
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)
     is_deleted = models.BooleanField(default=False)

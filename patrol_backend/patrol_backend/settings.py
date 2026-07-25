@@ -33,7 +33,6 @@ ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '147.93.27.224', 'unmentholated-konne
 INSTALLED_APPS = [
     'daphne',  # for socket
     'channels', # for socket channel
-    'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
@@ -52,6 +51,7 @@ INSTALLED_APPS = [
     'incident',
     'rollcall',
     'visitor',
+    'notifications',
     'django_celery_beat',
     'livetracking',  # Sokcet app
     ]
@@ -439,3 +439,10 @@ LOGGING = {
 LOGS_DIR = os.path.join(BASE_DIR, 'logs')
 if not os.path.exists(LOGS_DIR):
     os.makedirs(LOGS_DIR)
+
+# Firebase Cloud Messaging (push notifications)
+# Default: certificate JSON already in repo under patrol_backend/certificate/
+FCM_CREDENTIALS_PATH = os.environ.get(
+    "FCM_CREDENTIALS_PATH",
+    str(BASE_DIR / "certificate" / "gtms-e10e8-firebase-adminsdk-fbsvc-8f0b4f378e.json"),
+)
