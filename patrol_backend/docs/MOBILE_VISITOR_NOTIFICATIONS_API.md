@@ -26,8 +26,9 @@ All endpoints documented in this file:
 | `GET` | `/notifications/` | List notification inbox (paginated; unread + history) |
 | `POST` | `/notifications/<id>/read/` | Mark one notification as read |
 | `POST` | `/notifications/read-all/` | Mark all notifications as read |
-| `GET` | `/visitors/search/` | Search prior visitor by IC / passport (prefill manual entry) |
-| `POST` | `/visitors/entries/checkin/` | Create manual walk-in or resubmit reverted entry (`multipart`) |
+| `GET` | `/auth/users/list/` | List users for **host (approver) dropdown** |
+| `GET` | `/visitors/search/` | Search prior visitor by IC — **prefill** form + last-entry assets |
+| `POST` | `/visitors/entries/checkin/` | Create manual walk-in or resubmit; **auto-reuse** missing photos from last visit |
 | `GET` | `/visitors/entries/` | List visitor entries (filters / pagination) |
 | `GET` | `/visitors/entries/<ENTRY_UUID>/` | Entry detail (deep-link from FCM / inbox) |
 | `GET` | `/visitors/entries/<ENTRY_UUID>/pass/` | Download visitor pass (PDF/image) |
@@ -50,15 +51,16 @@ All endpoints documented in this file:
 3. [Notification types (FCM + inbox)](#3-notification-types-fcm--inbox)
 4. [Device token APIs](#4-device-token-apis)
 5. [Notification inbox APIs](#5-notification-inbox-apis)
-6. [Visitor search](#6-visitor-search)
-7. [Manual entry / resubmit](#7-manual-entry--resubmit)
-8. [List / detail / pass](#8-list--detail--pass)
-9. [Host actions](#9-host-actions-approve-revert-reject-reschedule)
-10. [QR scan](#10-qr-scan)
-11. [Checkout](#11-checkout)
-12. [AI extract (optional)](#12-ai-extract-optional)
-13. [Entry object (shared shape)](#13-entry-object-shared-shape)
-14. [Auth / common exceptions](#14-auth--common-exceptions)
+6. [Host dropdown — list users](#6-host-dropdown--list-users)
+7. [Visitor search (prefill)](#7-visitor-search-prefill)
+8. [Manual entry / resubmit / asset auto-reuse](#8-manual-entry--resubmit--asset-auto-reuse)
+9. [List / detail / pass](#9-list--detail--pass)
+10. [Host actions](#10-host-actions-approve-revert-reject-reschedule)
+11. [QR scan](#11-qr-scan)
+12. [Checkout](#12-checkout)
+13. [AI extract (optional)](#13-ai-extract-optional)
+14. [Entry object (shared shape)](#14-entry-object-shared-shape)
+15. [Auth / common exceptions](#15-auth--common-exceptions)
 
 ---
 
@@ -102,12 +104,14 @@ If host == actor, host-action push is skipped (no self-notify).
 
 ```text
 1. App login → POST /notifications/device-token/  (host + guard)
-2. Guard: optional GET /visitors/search/?ic_number=...
-3. Guard: POST /visitors/entries/checkin/  (multipart)
+2. Guard: GET /auth/users/list/?location_id=...  → host dropdown
+3. Guard: optional GET /visitors/search/?ic_number=...  → prefill form + prior assets
+4. Guard: POST /visitors/entries/checkin/  (multipart)
+      → missing visitor_photo / id_proof / additional auto-filled from last visit when IC matches
       → status=pending_approval, visit_date=today, arrival=now, QR+pass
       → Notify HOST: visitor_pending_approval
-4. Host: GET /notifications/  OR FCM tap → open entry
-5. Host chooses:
+5. Host: GET /notifications/  OR FCM tap → open entry
+6. Host chooses:
    a) POST .../approve/     → checked_in
         → Notify GUARD: visitor_approved
    b) POST .../cancel/      → cancelled
@@ -116,9 +120,9 @@ If host == actor, host-action push is skipped (no self-notify).
         → Notify GUARD: visitor_reverted
    d) POST .../reschedule/  → pending_approval (same day) OR scheduled (other day)
         → Notify GUARD: visitor_rescheduled
-6. If reverted: Guard POST checkin again with entry_id → pending_approval
+7. If reverted: Guard POST checkin again with entry_id → pending_approval
         → Notify HOST: visitor_pending_approval
-7. When checked_in: Guard/host POST .../checkout/ + exit_photo → checked_out
+8. When checked_in: Guard/host POST .../checkout/ + exit_photo → checked_out
 ```
 
 ### B) Reschedule → scheduled → visit-day QR
@@ -352,11 +356,89 @@ curl -X POST "http://localhost:8000/notifications/read-all/" \
 
 ---
 
-## 6. Visitor search
+## 6. Host dropdown — list users
+
+### `GET /auth/users/list/`
+
+Use this to populate the **Host (approver)** dropdown on manual entry. Filter by the same `location_id` as the visit.
+
+| Query | Required | Notes |
+|-------|----------|--------|
+| `location_id` | recommended | Users at that site |
+| `role` | no | Filter by role name (omit or `all` = any role) |
+| `search` | no | Matches `name`, `email`, `employee_code` |
+
+Non-superusers never see users with role `admin`.
+
+```bash
+# Hosts for a location (manual entry dropdown)
+curl -X GET "http://localhost:8000/auth/users/list/?location_id=<LOCATION_UUID>" \
+  -H "Authorization: Bearer <TOKEN>"
+```
+
+```bash
+# Optional: narrow by role + search
+curl -X GET "http://localhost:8000/auth/users/list/?location_id=<LOCATION_UUID>&role=admin&search=Ravi" \
+  -H "Authorization: Bearer <TOKEN>"
+```
+
+**Success `200` (envelope):**
+
+```json
+{
+  "status": "success",
+  "message": "Users fetched",
+  "data": [
+    {
+      "id": "h1h2h3h4-aaaa-bbbb-cccc-ddddeeeeffff",
+      "email": "ravi@example.com",
+      "role": "admin",
+      "is_active": true,
+      "name": "Ravi",
+      "phone_no": "0123456789",
+      "employee_code": "EMP001",
+      "timezone": "Asia/Kuala_Lumpur",
+      "location": {
+        "id": "l1l2l3l4-aaaa-bbbb-cccc-ddddeeeeffff",
+        "name": "HQ Site"
+      },
+      "created_on": "2026-01-01T00:00:00Z",
+      "modified_on": "2026-07-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+Web/mobile: use each item’s `id` as `host_id` on check-in. Display label: `name` + optional `employee_code`.
+
+**Exceptions:**
+
+```json
+HTTP 401  { "detail": "Authentication credentials were not provided." }
+```
+
+---
+
+## 7. Visitor search (prefill)
 
 ### `GET /visitors/search/`
 
-Prefill for manual entry. Returns visitor profile + last entry fields + **prior photos** (`visitor_photo`, `id_proof`, `additional`, `vehicle_photo`). Expected times are **not** returned — capture fresh on each visit.
+**Purpose:** Returning-visitor **prefill** for manual entry.
+
+Call after the user enters / searches an IC. Response drives the form (name, phone, host, type, purpose, vehicle, remarks) and shows prior photos. Expected arrival / visit date are **not** returned — always capture fresh on submit.
+
+| Query | Required | Notes |
+|-------|----------|--------|
+| `ic_number` | yes | Also accepts `ic_passport_number` |
+| `location_id` | yes* | Required for superadmin; else from user location |
+
+### Scenario — search found (prefill UI)
+
+1. Guard opens search → enters IC  
+2. `GET /visitors/search/?ic_number=...&location_id=...`  
+3. `found: true` → fill form fields from `visitor` + `last_entry`  
+4. Show preview images from `last_entry.assets` (`visitor_photo`, `id_proof`, `additional`)  
+5. User may keep or replace photos, then submit check-in (see §8 — server auto-reuses missing files)
 
 ```bash
 curl -X GET "http://localhost:8000/visitors/search/?ic_number=900101145678&location_id=<LOCATION_UUID>" \
@@ -409,11 +491,25 @@ curl -X GET "http://localhost:8000/visitors/search/?ic_number=900101145678&locat
 }
 ```
 
+**Prefill field map (client):**
+
+| UI field | Source |
+|----------|--------|
+| IC / Passport | request IC / `visitor.ic_passport_number` |
+| Visitor name | `visitor.visitor_name` |
+| Phone | `visitor.phone_number` |
+| Visitor type | `last_entry.visitor_type` |
+| Purpose / vehicle / remarks | `last_entry.*` |
+| Host dropdown | `last_entry.host_id` (+ name/code) |
+| Photo previews | `last_entry.assets[]` by `asset_type` |
+
 **Success — not found `200`:**
 
 ```json
 { "found": false, "visitor": null, "last_entry": null }
 ```
+
+**Scenario — not found:** treat as first-time visitor → require new `visitor_photo` + `id_proof` on check-in.
 
 **Exceptions:**
 
@@ -424,7 +520,7 @@ HTTP 400  { "error": "location_id is required for superadmin" }
 
 ---
 
-## 7. Manual entry / resubmit
+## 8. Manual entry / resubmit / asset auto-reuse
 
 ### `POST /visitors/entries/checkin/`
 
@@ -435,22 +531,38 @@ HTTP 400  { "error": "location_id is required for superadmin" }
 | `location_id` | yes* | Required for superadmin; else from user location |
 | `ic_passport_number` | yes | |
 | `visitor_name` | yes | |
-| `host_id` | yes | Approver |
+| `host_id` | yes | From `/auth/users/list/` |
 | `visitor_type` | yes | `guest` \| `contractor` \| `client` \| `delivery` \| `other` |
-| `visitor_photo` | recommended | File |
-| `id_proof` | recommended | File |
+| `visitor_photo` | conditional | File — **required** first visit; optional if prior photo exists for this IC |
+| `id_proof` | conditional | File — **required** first visit; optional if prior ID exists |
 | `phone_number` | no | |
 | `purpose_of_visit` | no | |
-| `vehicle_number` | no | |
+| `vehicle_number` | no | Text plate only (photos go in `additional_images`) |
 | `remarks` | no | |
 | `expected_out_time` | no | e.g. `2026-07-25T18:00` — must be after create time |
-| `additional_images` | no | Repeat field for multiple files |
+| `additional_images` | no | Repeat field. If sent → only those stored. If omitted → prior additional auto-copied (unless `clear_additional`) |
+| `clear_additional` | no | `true` / `1` — do not auto-attach prior additional |
 | `entry_id` | resubmit only | Must be status `reverted` |
+
+### Asset auto-reuse (server-side — no client keys)
+
+After saving any uploaded files, for the same visitor (IC + location):
+
+1. Missing **`visitor_photo`** → clone latest prior `visitor_photo` (new `VisitorAsset` row, **same file path**)  
+2. Missing **`id_proof`** → same for ID  
+3. No **`additional_images`** uploaded and not `clear_additional` → clone prior visit’s `additional` rows  
+4. Still missing photo or ID → **`400`**
+
+Do **not** send `reuse_*_asset_id`, `vehicle_photo`, or `is_existed_visitor`.  
+Response includes **`returning_visitor`: true|false**.
 
 **Do not send `expected_arrival_time` or `visit_date`** — server sets them.
 
+---
+
+### Curl A — first-time visitor (all photos required)
+
 ```bash
-# New walk-in
 curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -H "Authorization: Bearer <GUARD_TOKEN>" \
   -F "location_id=<LOCATION_UUID>" \
@@ -468,8 +580,88 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -F "additional_images=@/path/to/extra1.jpg"
 ```
 
+---
+
+### Curl B — returning visitor, **prefilled assets** (no photo re-upload)
+
+**Scenario:** Search found prior visit. Guard keeps old visitor photo + ID (+ optional additional). Uploads nothing for those slots (or only new text fields).
+
 ```bash
-# Resubmit after revert
+# After GET /visitors/search/ found prior assets — omit photo/id files
+curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
+  -H "Authorization: Bearer <GUARD_TOKEN>" \
+  -F "location_id=<LOCATION_UUID>" \
+  -F "ic_passport_number=900101145678" \
+  -F "visitor_name=Ahmad Bin Ali" \
+  -F "phone_number=0123456789" \
+  -F "host_id=<HOST_USER_UUID>" \
+  -F "visitor_type=guest" \
+  -F "purpose_of_visit=Meeting" \
+  -F "vehicle_number=TN58B8050"
+```
+
+Server attaches last `visitor_photo`, `id_proof`, and prior `additional` (if any). New entry `assets` point at the **same media paths**.
+
+---
+
+### Curl C — returning visitor, only new additional (keep photo + ID from last visit)
+
+**Scenario:** Guard uploads a new vehicle/extra image only. Photo + ID omitted → auto-filled from history.
+
+```bash
+curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
+  -H "Authorization: Bearer <GUARD_TOKEN>" \
+  -F "location_id=<LOCATION_UUID>" \
+  -F "ic_passport_number=900101145678" \
+  -F "visitor_name=Ahmad Bin Ali" \
+  -F "host_id=<HOST_USER_UUID>" \
+  -F "visitor_type=guest" \
+  -F "vehicle_number=TN58B8050" \
+  -F "additional_images=@/path/to/new_car.jpg" \
+  -F "additional_images=@/path/to/new_extra.jpg"
+```
+
+Result: new `additional` rows from upload; `visitor_photo` + `id_proof` cloned from last entry.
+
+---
+
+### Curl D — returning visitor, replace ID only
+
+```bash
+curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
+  -H "Authorization: Bearer <GUARD_TOKEN>" \
+  -F "location_id=<LOCATION_UUID>" \
+  -F "ic_passport_number=900101145678" \
+  -F "visitor_name=Ahmad Bin Ali" \
+  -F "host_id=<HOST_USER_UUID>" \
+  -F "visitor_type=guest" \
+  -F "id_proof=@/path/to/new_id.jpg"
+```
+
+Result: new `id_proof` file; `visitor_photo` (and additional if not cleared) from last visit.
+
+---
+
+### Curl E — clear prior additional (do not auto-copy)
+
+```bash
+curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
+  -H "Authorization: Bearer <GUARD_TOKEN>" \
+  -F "location_id=<LOCATION_UUID>" \
+  -F "ic_passport_number=900101145678" \
+  -F "visitor_name=Ahmad Bin Ali" \
+  -F "host_id=<HOST_USER_UUID>" \
+  -F "visitor_type=guest" \
+  -F "clear_additional=true"
+```
+
+Photo/ID still auto-filled if missing; **no** prior additional attached.
+
+---
+
+### Curl F — resubmit after revert
+
+```bash
 curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -H "Authorization: Bearer <GUARD_TOKEN>" \
   -F "entry_id=<REVERTED_ENTRY_UUID>" \
@@ -482,6 +674,19 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   -F "visitor_photo=@/path/to/photo.jpg" \
   -F "id_proof=@/path/to/id.jpg"
 ```
+
+---
+
+### Scenario summary
+
+| Scenario | Client sends | Server does |
+|----------|--------------|-------------|
+| First visit | photo + id (+ optional additional) | Store uploads; `returning_visitor: false` |
+| Prefill keep all | text only, no files | Clone photo + id + additional from last visit |
+| Prefill + new additional only | `additional_images` only | Save new additional; clone photo + id |
+| Prefill + replace one slot | that file only | Save upload; clone other missing types |
+| Drop old additional | `clear_additional=true` | No additional clone |
+| First visit missing photo/id | no file & no history | `400` |
 
 **Success `201` (create and resubmit) example:**
 
@@ -522,35 +727,36 @@ curl -X POST "http://localhost:8000/visitors/entries/checkin/" \
   "created_by_name": "Guard Name",
   "scanned_by": null,
   "scanned_by_name": null,
-  "created_on": "2026-07-25T14:05:00+08:00",
+  "returning_visitor": true,
   "assets": [
     {
       "id": "....",
       "asset_type": "visitor_photo",
-      "file_url": "http://localhost:8000/media/....jpg",
-      "created_on": "2026-07-25T14:05:01.000000Z"
+      "file_url": "http://localhost:8000/media/visitor/assets/photo.jpg",
+      "created_on": "...."
     },
     {
       "id": "....",
       "asset_type": "id_proof",
-      "file_url": "http://localhost:8000/media/....jpg",
-      "created_on": "2026-07-25T14:05:02.000000Z"
-    },
-    {
-      "id": "....",
-      "asset_type": "additional",
-      "file_url": "http://localhost:8000/media/....jpg",
-      "created_on": "2026-07-25T14:05:03.000000Z"
+      "file_url": "http://localhost:8000/media/visitor/assets/id.jpg",
+      "created_on": "...."
     }
   ]
 }
+```
+
+**Exceptions (assets):**
+
+```json
+HTTP 400  { "error": "visitor_photo is required (upload a file, or use a returning visitor who has a prior photo)" }
+HTTP 400  { "error": "id_proof is required (upload IC/ID copy, or use a returning visitor who has a prior ID image)" }
 ```
 
 **Success `201` (resubmit note):** same shape as create; `status` is again `"pending_approval"`, `revert_reason` cleared, QR/pass regenerated.
 
 Side effect: host receives `visitor_pending_approval`.
 
-**Exceptions:**
+**Other exceptions:**
 
 ```json
 HTTP 400  { "error": "ic_passport_number is required" }
@@ -566,9 +772,9 @@ HTTP 400  { "error": "<host resolution message>" }
 
 ---
 
-## 8. List / detail / pass
+## 9. List / detail / pass
 
-### 8.1 List — `GET /visitors/entries/`
+### 9.1 List — `GET /visitors/entries/`
 
 `date_filter` matches **`visit_date`** (fallback: check-in, then created).
 
@@ -614,7 +820,7 @@ curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&has_vehic
 
 ---
 
-### 8.2 Detail — `GET /visitors/entries/<ENTRY_UUID>/`
+### 9.2 Detail — `GET /visitors/entries/<ENTRY_UUID>/`
 
 Use after FCM / notification tap.
 
@@ -633,7 +839,7 @@ HTTP 404  { "error": "Entry not found" }
 
 ---
 
-### 8.3 Download pass — `GET /visitors/entries/<ENTRY_UUID>/pass/`
+### 9.3 Download pass — `GET /visitors/entries/<ENTRY_UUID>/pass/`
 
 Returns PNG bytes (prefer over raw `/media/` URL for CORS).
 
@@ -656,7 +862,7 @@ HTTP 404  { "error": "Pass image not available" }
 
 ---
 
-### 8.4 Export Excel — `GET /visitors/entries/export/`
+### 9.4 Export Excel — `GET /visitors/entries/export/`
 
 Same filters as list. Response: `.xlsx` file.
 
@@ -670,11 +876,11 @@ curl -X GET "http://localhost:8000/visitors/entries/export/?date_filter=today" \
 
 ---
 
-## 9. Host actions (approve / revert / reject / reschedule)
+## 10. Host actions (approve / revert / reject / reschedule)
 
 All require host (or superadmin where allowed). Body JSON unless noted.
 
-### 9.1 Approve (= check-in) — `POST /visitors/entries/<id>/approve/`
+### 10.1 Approve (= check-in) — `POST /visitors/entries/<id>/approve/`
 
 Only from `pending_approval`.
 
@@ -718,7 +924,7 @@ HTTP 400  { "error": "Cannot approve entry with status=checked_in" }
 
 ---
 
-### 9.2 Revert — `POST /visitors/entries/<id>/revert/`
+### 10.2 Revert — `POST /visitors/entries/<id>/revert/`
 
 Only from `pending_approval`.
 
@@ -753,7 +959,7 @@ HTTP 400  { "error": "Cannot revert entry with status=scheduled" }
 
 ---
 
-### 9.3 Reject / Cancel — `POST /visitors/entries/<id>/cancel/`
+### 10.3 Reject / Cancel — `POST /visitors/entries/<id>/cancel/`
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/entries/<ENTRY_UUID>/cancel/" \
@@ -785,7 +991,7 @@ HTTP 400  { "error": "Cannot cancel entry with status=checked_out" }
 
 ---
 
-### 9.4 Reschedule — `POST /visitors/entries/<id>/reschedule/`
+### 10.4 Reschedule — `POST /visitors/entries/<id>/reschedule/`
 
 Allowed from `pending_approval` or `scheduled`.  
 Requires `expected_arrival_time` + `expected_out_time`. Optional `visit_date`.
@@ -865,7 +1071,7 @@ HTTP 400  { "error": "expected_out_time cannot be before visit_date (...)" }
 
 ---
 
-## 10. QR scan
+## 11. QR scan
 
 ### `POST /visitors/qr-scan/`
 
@@ -964,7 +1170,7 @@ HTTP 400  {
 
 ---
 
-## 11. Checkout
+## 12. Checkout
 
 ### `POST /visitors/entries/<id>/checkout/`
 
@@ -1009,11 +1215,13 @@ HTTP 400  { "error": "Checkout image (exit_photo) is required" }
 
 ---
 
-## 12. AI extract (optional)
+## 13. AI extract (optional)
 
 ### `POST /visitors/ai/extract/`
 
 Soft-assist OCR. See [`VISITOR_AI_OCR.md`](../visitor/docs/VISITOR_AI_OCR.md).
+
+**Production tip:** call this on the **Daphne** host (e.g. `:7999`), not multi-worker Gunicorn — each worker would load torch/Paddle into RAM.
 
 ```bash
 curl -X POST "http://localhost:8000/visitors/ai/extract/" \
@@ -1043,7 +1251,7 @@ When not found: `"found": false`, `"number": null`.
 
 ---
 
-## 13. Entry object (shared shape)
+## 14. Entry object (shared shape)
 
 Typical success body for create / approve / list item / detail:
 
@@ -1104,11 +1312,13 @@ Typical success body for create / approve / list item / detail:
 
 `asset_type`: `visitor_photo` | `id_proof` | `additional` | `exit_photo`
 
+Check-in responses also include **`returning_visitor`**: `true` if this visitor already had a prior entry at the location.
+
 Datetime display fields are location-TZ formatted strings from the API (not always raw ISO).
 
 ---
 
-## 14. Auth / common exceptions
+## 15. Auth / common exceptions
 
 ```json
 HTTP 401
@@ -1125,9 +1335,11 @@ Use a fresh access token; register FCM after login; deactivate on logout.
 ## Quick smoke checklist (mobile)
 
 1. Guard + host: login → `POST /notifications/device-token/` (`android`/`ios`).
-2. Guard: `POST /visitors/entries/checkin/` → `pending_approval`.
-3. Host: FCM / `GET /notifications/` → `visitor_pending_approval`.
-4. Host: `POST .../approve/` → entry `checked_in`.
-5. Guard: FCM / inbox → `visitor_approved`.
-6. Guard: `POST .../checkout/` + `exit_photo` → `checked_out`.
-7. Logout: `DELETE /notifications/device-token/`.
+2. Guard: `GET /auth/users/list/?location_id=...` → pick `host_id`.
+3. Guard (returning): `GET /visitors/search/?ic_number=...` → prefill form + asset previews.
+4. Guard: `POST /visitors/entries/checkin/` (with or without photo files) → `pending_approval` (+ `returning_visitor` when applicable).
+5. Host: FCM / `GET /notifications/` → `visitor_pending_approval`.
+6. Host: `POST .../approve/` → entry `checked_in`.
+7. Guard: FCM / inbox → `visitor_approved`.
+8. Guard: `POST .../checkout/` + `exit_photo` → `checked_out`.
+9. Logout: `DELETE /notifications/device-token/`.

@@ -63,6 +63,80 @@ def _save_assets_many(entry, asset_type, uploaded_files):
     return created
 
 
+def _latest_prior_asset(visitor, asset_type, exclude_entry_id=None):
+    """Most recent asset of this type from earlier visits of the same visitor."""
+    qs = (
+        VisitorAsset.objects.filter(
+            visitor_entry__visitor_id=visitor.id,
+            visitor_entry__is_deleted=False,
+            asset_type=asset_type,
+        )
+        .exclude(file="")
+        .exclude(file__isnull=True)
+        .order_by("-created_on")
+    )
+    if exclude_entry_id:
+        qs = qs.exclude(visitor_entry_id=exclude_entry_id)
+    return qs.first()
+
+
+def _clone_asset_onto_entry(entry, source):
+    if not source or not source.file:
+        return None
+    return VisitorAsset.objects.create(
+        visitor_entry=entry,
+        asset_type=source.asset_type,
+        file=source.file.name,
+    )
+
+
+def _auto_fill_missing_assets_from_history(entry, types):
+    """
+    For each asset type not already on this entry, clone the latest prior
+    visit's file path (new row, same storage object — no re-upload).
+    """
+    filled = []
+    for asset_type in types:
+        if entry.assets.filter(asset_type=asset_type).exists():
+            continue
+        src = _latest_prior_asset(
+            entry.visitor, asset_type, exclude_entry_id=entry.id
+        )
+        row = _clone_asset_onto_entry(entry, src)
+        if row:
+            filled.append(asset_type)
+    return filled
+
+
+def _entry_has_asset(entry, asset_type):
+    return entry.assets.filter(asset_type=asset_type).exists()
+
+
+def _truthy_form_flag(data, key):
+    raw = data.get(key)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clone_all_prior_additional(entry):
+    """Attach every additional image from the latest prior visit that had any."""
+    if entry.assets.filter(asset_type=VisitorAsset.ASSET_ADDITIONAL).exists():
+        return
+    prior_entry = (
+        VisitorEntry.objects.filter(is_deleted=False, visitor_id=entry.visitor_id)
+        .exclude(id=entry.id)
+        .filter(assets__asset_type=VisitorAsset.ASSET_ADDITIONAL)
+        .order_by("-created_on")
+        .distinct()
+        .first()
+    )
+    if not prior_entry:
+        return
+    for src in prior_entry.assets.filter(asset_type=VisitorAsset.ASSET_ADDITIONAL):
+        _clone_asset_onto_entry(entry, src)
+
+
 def _parse_dt(value, user_tz=None):
     """
     Parse client datetime.
@@ -261,7 +335,6 @@ class VisitorSearchView(APIView):
                 VisitorAsset.ASSET_VISITOR_PHOTO,
                 VisitorAsset.ASSET_ID_PROOF,
                 VisitorAsset.ASSET_ADDITIONAL,
-                VisitorAsset.ASSET_VEHICLE_PHOTO,
             }
             photo_assets = [
                 a
@@ -431,16 +504,60 @@ class VisitorCheckInView(APIView):
 
         _save_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO, request.FILES.get("visitor_photo"))
         _save_asset(entry, VisitorAsset.ASSET_ID_PROOF, request.FILES.get("id_proof"))
-        _save_asset(entry, VisitorAsset.ASSET_VEHICLE_PHOTO, request.FILES.get("vehicle_photo"))
         additional = request.FILES.getlist("additional_images") or request.FILES.getlist(
             "additional_image"
         )
         _save_assets_many(entry, VisitorAsset.ASSET_ADDITIONAL, additional)
 
+        # Client only uploads what changed. Missing visitor_photo / id_proof are
+        # filled from the visitor's last entry (same file path, new asset rows).
+        # Vehicle / extra shots use additional_images only (no vehicle_photo field).
+        _auto_fill_missing_assets_from_history(
+            entry,
+            (
+                VisitorAsset.ASSET_VISITOR_PHOTO,
+                VisitorAsset.ASSET_ID_PROOF,
+            ),
+        )
+
+        # Additional: if none uploaded and not explicitly cleared, copy prior visit's.
+        if not additional and not _truthy_form_flag(data, "clear_additional"):
+            _clone_all_prior_additional(entry)
+
+        if not _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO):
+            transaction.set_rollback(True)
+            return Response(
+                {
+                    "error": (
+                        "visitor_photo is required "
+                        "(upload a file, or use a returning visitor who has a prior photo)"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF):
+            transaction.set_rollback(True)
+            return Response(
+                {
+                    "error": (
+                        "id_proof is required "
+                        "(upload IC/ID copy, or use a returning visitor who has a prior ID image)"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         entry = _base_entry_qs().get(id=entry.id)
+        returning_visitor = (
+            VisitorEntry.objects.filter(is_deleted=False, visitor=visitor)
+            .exclude(id=entry.id)
+            .exists()
+        )
         notify_visitor_pending(entry)
+        payload = VisitorEntrySerializer(entry, context={"request": request}).data
+        payload["returning_visitor"] = returning_visitor
         return Response(
-            VisitorEntrySerializer(entry, context={"request": request}).data,
+            payload,
             status=status.HTTP_201_CREATED,
         )
 
