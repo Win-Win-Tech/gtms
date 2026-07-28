@@ -204,6 +204,84 @@ def _opencv_document_box(bgr_image) -> Optional[Box]:
     return best
 
 
+def warp_document_if_possible(bgr_image):
+    """
+    Perspective-correct the largest document-like quadrilateral.
+    Returns a warped BGR crop or None.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    h, w = bgr_image.shape[:2]
+    gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=1)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_quad = None
+    best_area = 0.0
+    img_area = float(max(1, h * w))
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < img_area * 0.05:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4:
+            continue
+        x, y, bw, bh = cv2.boundingRect(approx)
+        if bw < 40 or bh < 40:
+            continue
+        ratio = bw / float(max(1, bh))
+        if ratio < 0.4 or ratio > 3.5:
+            continue
+        if area > best_area:
+            best_area = area
+            best_quad = approx.reshape(4, 2).astype("float32")
+
+    if best_quad is None:
+        return None
+
+    def _order_points(pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
+    rect = _order_points(best_quad)
+    (tl, tr, br, bl) = rect
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_width = int(max(width_a, width_b))
+    max_height = int(max(height_a, height_b))
+
+    if max_width < 40 or max_height < 40:
+        return None
+
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
+    )
+    matrix = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(bgr_image, matrix, (max_width, max_height))
+
+
 def crop_with_padding(bgr_image, box: Box, pad_ratio: float = 0.08):
     """Crop ROI with padding; returns BGR ndarray."""
     h, w = bgr_image.shape[:2]

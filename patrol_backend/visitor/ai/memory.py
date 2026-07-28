@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # After this many idle seconds, drop PaddleOCR / YOLO from RAM.
 # Set VISITOR_AI_IDLE_UNLOAD_SEC=0 to keep models warm forever.
-IDLE_UNLOAD_SEC = float(os.environ.get("VISITOR_AI_IDLE_UNLOAD_SEC", "90"))
+IDLE_UNLOAD_SEC = float(os.environ.get("VISITOR_AI_IDLE_UNLOAD_SEC", "300"))
 
 _lock = threading.Lock()
 _last_used = 0.0

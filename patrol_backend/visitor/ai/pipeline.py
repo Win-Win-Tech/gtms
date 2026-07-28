@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any, Dict
 
-from .detect import crop_with_padding, detect_id_region, detect_vehicles
+from .detect import crop_with_padding, detect_id_region, detect_vehicles, warp_document_if_possible
 from .ocr_engine import run_ocr
 from .parse import extract_id_number, extract_vehicle_number
 from .preprocess import load_and_resize_image, pil_to_bgr_ndarray
@@ -100,6 +100,142 @@ def _elapsed_ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
 
 
+def _crop_inset(bgr, inset_ratio: float = 0.06):
+    """Trim frame edges; useful when the photo contains a phone screen border/UI."""
+    h, w = bgr.shape[:2]
+    dx = int(w * inset_ratio)
+    dy = int(h * inset_ratio)
+    if w - (2 * dx) < 40 or h - (2 * dy) < 40:
+        return bgr
+    return bgr[dy : h - dy, dx : w - dx].copy()
+
+
+def _enhance_for_ocr(bgr):
+    """Cheap contrast boost for hard OCR cases; only used on fallback passes."""
+    try:
+        import cv2
+    except ImportError:
+        return bgr
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    boosted = clahe.apply(gray)
+    return cv2.cvtColor(boosted, cv2.COLOR_GRAY2BGR)
+
+
+def _box_fill_ratio(box, bgr) -> float:
+    h, w = bgr.shape[:2]
+    frame_area = float(max(1, h * w))
+    return max(0.0, min(1.0, box.area / frame_area))
+
+
+def _should_reject_ambiguous_id(hint: str, conf: float, detect_meta: Dict[str, Any]) -> bool:
+    """
+    Be conservative for phone-screen/full-frame OCR. A missed autofill is better than
+    silently filling the wrong ID from UI text, timestamps, or unrelated labels.
+    """
+    detector = detect_meta.get("detector")
+    fill_ratio = float(detect_meta.get("frame_fill_ratio") or 0.0)
+    low_trust_hint = hint in {"labeled", "unknown"}
+
+    if not low_trust_hint:
+        return False
+
+    if detector in {"full_frame", "full_frame_fallback", "full_frame_inset"} and conf < 0.78:
+        return True
+
+    if fill_ratio >= 0.88 and conf < 0.82:
+        return True
+
+    return False
+
+
+def _id_attempt_rank(parsed, detect_meta: Dict[str, Any]) -> float:
+    id_number, conf, hint = parsed
+    detector = detect_meta.get("detector")
+    trust_bonus = {
+        "mykad": 18.0,
+        "aadhaar": 16.0,
+        "indian_dl": 14.0,
+        "passport": 8.0,
+        "labeled": -4.0,
+        "unknown": -12.0,
+    }
+    detector_bonus = {
+        "warped_document": 6.0,
+        "document_region": 4.0,
+        "id_document": 4.0,
+        "full_frame_inset": 1.5,
+        "full_frame_fallback": 0.0,
+        "full_frame": -1.0,
+        "enhanced_roi": 2.0,
+        "enhanced_warped_document": 3.0,
+    }
+    score = (float(conf) * 100.0) + trust_bonus.get(hint, 0.0) + detector_bonus.get(detector, 0.0)
+    if _should_reject_ambiguous_id(hint, conf, detect_meta):
+        score -= 100.0
+    if len(id_number) < 8:
+        score -= 12.0
+    return score
+
+
+def _prepare_inset_variant(bgr):
+    inset = _crop_inset(bgr, inset_ratio=0.06)
+    if inset is bgr:
+        return []
+    return [
+        (
+            inset,
+            {
+                "detector": "full_frame_inset",
+                "confidence": None,
+                "box": None,
+                "frame_fill_ratio": 0.88,
+            },
+        )
+    ]
+
+
+def _prepare_warp_variants(bgr, detect_meta: Dict[str, Any]):
+    warped = warp_document_if_possible(bgr)
+    if warped is None:
+        return []
+    return [
+        (
+            warped,
+            {
+                "detector": "warped_document",
+                "confidence": None,
+                "box": detect_meta.get("box"),
+                "frame_fill_ratio": 0.72,
+            },
+        ),
+        (
+            _enhance_for_ocr(warped),
+            {
+                "detector": "enhanced_warped_document",
+                "confidence": None,
+                "box": detect_meta.get("box"),
+                "frame_fill_ratio": 0.72,
+            },
+        ),
+    ]
+
+
+def _prepare_enhanced_roi_variant(roi, detect_meta: Dict[str, Any]):
+    return [
+        (
+            _enhance_for_ocr(roi),
+            {
+                "detector": "enhanced_roi",
+                "confidence": detect_meta.get("confidence"),
+                "box": detect_meta.get("box"),
+                "frame_fill_ratio": detect_meta.get("frame_fill_ratio"),
+            },
+        )
+    ]
+
+
 def _pipeline_id(bgr, t0: float) -> Dict[str, Any]:
     """
     type=id:
@@ -113,26 +249,80 @@ def _pipeline_id(bgr, t0: float) -> Dict[str, Any]:
             "detector": box.label,
             "confidence": round(box.confidence, 3),
             "box": [box.x1, box.y1, box.x2, box.y2],
+            "frame_fill_ratio": round(_box_fill_ratio(box, bgr), 3),
         }
     else:
         roi = bgr
-        detect_meta = {"detector": "full_frame", "confidence": None, "box": None}
+        detect_meta = {
+            "detector": "full_frame",
+            "confidence": None,
+            "box": None,
+            "frame_fill_ratio": 1.0,
+        }
 
-    lines = run_ocr(roi)
-    parsed = extract_id_number(lines) if lines else None
+    attempts = []
+    prep_pool = ThreadPoolExecutor(max_workers=2)
+    prep_futures = [prep_pool.submit(_prepare_inset_variant, bgr)]
+    prep_futures.append(prep_pool.submit(_prepare_warp_variants, bgr, detect_meta))
+    if box is not None:
+        prep_futures.append(prep_pool.submit(_prepare_enhanced_roi_variant, roi, detect_meta))
 
-    # Crop can miss the IC line (glare / watermark / tight box) — try full frame
-    if not parsed and box is not None:
-        lines_full = run_ocr(bgr)
-        parsed_full = extract_id_number(lines_full) if lines_full else None
-        if parsed_full:
-            lines = lines_full
-            parsed = parsed_full
-            detect_meta = {
-                "detector": "full_frame_fallback",
-                "confidence": None,
-                "box": detect_meta.get("box"),
-            }
+    def _add_attempt(image, meta):
+        lines_local = run_ocr(image)
+        parsed_local = extract_id_number(lines_local) if lines_local else None
+        attempts.append((lines_local, parsed_local, meta))
+
+    need_fallback_passes = False
+    try:
+        _add_attempt(roi, detect_meta)
+        _first_lines, first_parsed, first_meta = attempts[0]
+        need_fallback_passes = (
+            not first_parsed
+            or _should_reject_ambiguous_id(first_parsed[2], first_parsed[1], first_meta)
+            or first_parsed[1] < max(MIN_OCR_CONF + 0.1, 0.6)
+        )
+
+        # Crop can miss the IC line (glare / watermark / tight box) — try fallback passes
+        # only when the primary result is missing or looks weak/ambiguous.
+        if need_fallback_passes and box is not None:
+            _add_attempt(
+                bgr,
+                {
+                    "detector": "full_frame_fallback",
+                    "confidence": None,
+                    "box": detect_meta.get("box"),
+                    "frame_fill_ratio": 1.0,
+                },
+            )
+
+        if need_fallback_passes:
+            for fut in prep_futures:
+                for image, meta in fut.result():
+                    _add_attempt(image, meta)
+        else:
+            for fut in prep_futures:
+                fut.cancel()
+
+        lines = next((lines_local for lines_local, _, _ in attempts if lines_local), [])
+        parsed = None
+        best_meta = detect_meta
+        best_score = float("-inf")
+        for lines_local, parsed_local, meta_local in attempts:
+            if not lines_local:
+                continue
+            if parsed_local:
+                score = _id_attempt_rank(parsed_local, meta_local)
+                if score > best_score:
+                    best_score = score
+                    lines = lines_local
+                    parsed = parsed_local
+                    best_meta = meta_local
+            elif not lines:
+                lines = lines_local
+
+        detect_meta = best_meta
+    finally:
+        prep_pool.shutdown(wait=need_fallback_passes, cancel_futures=not need_fallback_passes)
 
     if not lines:
         return {
@@ -154,6 +344,14 @@ def _pipeline_id(bgr, t0: float) -> Dict[str, Any]:
         }
 
     id_number, conf, hint = parsed
+    if _should_reject_ambiguous_id(hint, conf, detect_meta):
+        return {
+            "type": "id",
+            "found": False,
+            "reason": "low_confidence",
+            "detect": detect_meta,
+            "elapsed_ms": _elapsed_ms(t0),
+        }
     if conf < MIN_OCR_CONF:
         return {
             "type": "id",

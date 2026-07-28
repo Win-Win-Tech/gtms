@@ -6,6 +6,7 @@ from .views import (
     VisitorCheckInView,
     VisitorCheckOutView,
     VisitorEntryDetailView,
+    VisitorEntryExportPdfView,
     VisitorEntryExportView,
     VisitorEntryListView,
     VisitorPassDownloadView,
@@ -22,6 +23,11 @@ urlpatterns = [
     path("qr-scan/", VisitorQrScanView.as_view(), name="visitor-qr-scan"),
     path("entries/", VisitorEntryListView.as_view(), name="visitor-entries-list"),
     path("entries/export/", VisitorEntryExportView.as_view(), name="visitor-entries-export"),
+    path(
+        "entries/export-pdf/",
+        VisitorEntryExportPdfView.as_view(),
+        name="visitor-entries-export-pdf",
+    ),
     path("entries/checkin/", VisitorCheckInView.as_view(), name="visitor-entries-checkin"),
     path(
         "entries/<uuid:entry_id>/",

@@ -106,6 +106,7 @@ Public response fields are only: `type`, `found`, `number`, `confidence` (same `
      vehicle → YOLOv8n COCO (car/truck/bus/motorcycle)
 4. Crop ROI        → pad around box (or full frame if no box for id)
 5. PaddleOCR       → text lines + scores (CPU)
+   - ID fallback only when needed: full-frame / inset / perspective-warp / contrast boost
 6. Parse           → regex: MyKad / Aadhaar / passport OR plate patterns
 7. Gate            → confidence / timeout / busy
 8. JSON response   → { type, found, number, confidence }
@@ -131,7 +132,7 @@ Public response fields are only: `type`, `found`, `number`, `confidence` (same `
 - Models load **once** (lazy singleton) and stay warm.
 - Default **1 concurrent** AI job (`VISITOR_AI_MAX_CONCURRENT`) for 4 vCPU / 8 GB.
 - Soft timeout default **45s** (`VISITOR_AI_TIMEOUT_SEC`).
-- Light RAM defaults: angle-cls **off**, **2** CPU threads, idle unload after **90s**.
+- Light RAM defaults: angle-cls **off**, **2** CPU threads, idle unload after **300s**.
 
 ---
 
@@ -146,7 +147,7 @@ Public response fields are only: `type`, `found`, `number`, `confidence` (same `
 | `VISITOR_AI_ENABLE_MKLDNN` | `false` | Keep off under Django — MKLDNN causes `could not execute a primitive` |
 | `VISITOR_AI_USE_ANGLE_CLS` | `false` | Extra Paddle angle model (~+RAM); leave off on 8 GB |
 | `VISITOR_AI_CPU_THREADS` | `2` | Paddle / BLAS thread cap |
-| `VISITOR_AI_IDLE_UNLOAD_SEC` | `90` | Unload OCR/YOLO after idle seconds (`0` = keep warm) |
+| `VISITOR_AI_IDLE_UNLOAD_SEC` | `300` | Unload OCR/YOLO after idle seconds (`0` = keep warm) |
 | `VISITOR_AI_VEHICLE_SKIP_YOLO` | `false` | OCR full frame for plates (never load torch/YOLO) |
 | `VISITOR_AI_TIMEOUT_SEC` | `45` | Soft timeout seconds (CPU OCR often needs >8s) |
 | `VISITOR_AI_MIN_OCR_CONF` | `0.45` | Min OCR score to accept |
@@ -275,8 +276,14 @@ Expected warm latency: roughly **1–2+ seconds** on CPU (varies by image).
 | `busy` | Wait; only 1 job by default |
 | Always `no_vehicle` | Use a clear car+plate photo; check YOLO loaded |
 | Always `no_id_document` | Clearer ID photo; number must match MyKad/Aadhaar/passport patterns |
-| OOM / killed | Lower workers; ensure only one AI concurrent; set `VISITOR_AI_VEHICLE_SKIP_YOLO=1`; wait for idle unload (~90s) |
-| RAM stays high after AI | Wait `VISITOR_AI_IDLE_UNLOAD_SEC` (default 90); check logs for “Unloading PaddleOCR”; note Python may not return all RSS to OS |
+| OOM / killed | Lower workers; ensure only one AI concurrent; set `VISITOR_AI_VEHICLE_SKIP_YOLO=1`; wait for idle unload (~300s) |
+| RAM stays high after AI | Wait `VISITOR_AI_IDLE_UNLOAD_SEC` (default 300); check logs for “Unloading PaddleOCR”; note Python may not return all RSS to OS |
+
+### Phone-screen captures
+
+If someone photographs an ID shown on another phone, OCR can pick up status-bar/UI text around the edges. The ID pipeline now trims outer frame edges and is more conservative with weak full-frame matches, so it prefers `found: false` instead of silently filling the wrong number.
+
+The heavier OCR fallback passes only run when the first ID result is missing, ambiguous, or weak, so clean images should not slow down much. Cheap fallback preprocessing (inset / warp / enhance) is prepared in parallel while the primary OCR pass is running; the pipeline still keeps PaddleOCR itself single-lane on the 8 GB host.
 
 ---
 

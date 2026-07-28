@@ -2,7 +2,7 @@ from datetime import datetime
 
 from django.db import transaction
 from django.db.models import Q
-from django.http import FileResponse
+from django.http import FileResponse, HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.utils.timezone import is_naive
@@ -19,7 +19,7 @@ from notifications.models import NotificationLog
 from notifications.services import notify_visitor_host_action, notify_visitor_pending
 from scheduler.models import Location
 
-from .exports import generate_visitor_excel
+from .exports import generate_visitor_excel, generate_visitor_pdf
 from .models import Visitor, VisitorAsset, VisitorEntry
 from .serializers import VisitorAssetSerializer, VisitorEntrySerializer, VisitorSerializer
 from .utils import (
@@ -241,6 +241,25 @@ def _filtered_entries(request):
     status_filter = (request.query_params.get("status") or "").strip().lower()
     if status_filter and status_filter != "all":
         qs = qs.filter(status=status_filter)
+
+    visitor_type = (
+        request.query_params.get("visitor_type")
+        or request.query_params.get("visitorType")
+        or ""
+    ).strip().lower()
+    if visitor_type and visitor_type != "all":
+        valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
+        if visitor_type not in valid_types:
+            return None, Response(
+                {
+                    "error": (
+                        "Invalid visitor_type. Choose from: "
+                        f"{', '.join(sorted(valid_types))}"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qs = qs.filter(visitor_type=visitor_type)
 
     search = (request.query_params.get("search") or "").strip()
     if search:
@@ -1047,3 +1066,24 @@ class VisitorEntryExportView(APIView):
         if error_response:
             return error_response
         return generate_visitor_excel(qs, request)
+
+
+class VisitorEntryExportPdfView(APIView):
+    """GET /visitors/entries/export-pdf/ — PDF download (same filters as list/Excel)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs, error_response = _filtered_entries(request)
+        if error_response:
+            return error_response
+        try:
+            content, filename = generate_visitor_pdf(qs, request)
+        except ImportError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response

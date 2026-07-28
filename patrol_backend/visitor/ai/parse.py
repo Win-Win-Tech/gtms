@@ -378,15 +378,30 @@ def extract_id_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str, flo
     if not candidates:
         return None
 
+    trust_bonus = {
+        "mykad": 0.18,
+        "aadhaar": 0.16,
+        "indian_dl": 0.14,
+        "passport": 0.08,
+        "labeled": -0.04,
+        "unknown": -0.12,
+    }
     priority = {
-        "mykad": 4,
-        "aadhaar": 4,
+        "mykad": 5,
+        "aadhaar": 5,
         "indian_dl": 4,
-        "labeled": 3,
-        "passport": 2,
+        "passport": 3,
+        "labeled": 2,
         "unknown": 1,
     }
-    candidates.sort(key=lambda c: (c[1], priority.get(c[2], 0)), reverse=True)
+    candidates.sort(
+        key=lambda c: (
+            c[1] + trust_bonus.get(c[2], 0.0),
+            priority.get(c[2], 0),
+            c[1],
+        ),
+        reverse=True,
+    )
     return candidates[0]
 
 

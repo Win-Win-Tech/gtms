@@ -33,6 +33,7 @@ All endpoints documented in this file:
 | `GET` | `/visitors/entries/<ENTRY_UUID>/` | Entry detail (deep-link from FCM / inbox) |
 | `GET` | `/visitors/entries/<ENTRY_UUID>/pass/` | Download visitor pass (PDF/image) |
 | `GET` | `/visitors/entries/export/` | Export entries to Excel |
+| `GET` | `/visitors/entries/export-pdf/` | Export entries to PDF (same filters) |
 | `POST` | `/visitors/entries/<id>/approve/` | Host approve (= check-in) |
 | `POST` | `/visitors/entries/<id>/revert/` | Host revert for guard correction |
 | `POST` | `/visitors/entries/<id>/cancel/` | Host reject / cancel visit |
@@ -783,6 +784,7 @@ HTTP 400  { "error": "<host resolution message>" }
 | `date_filter` | `today` (default) \| `upcoming` \| `this_week` \| `this_month` \| `custom` \| `all` |
 | `start_date` / `end_date` | With `custom` — `YYYY-MM-DD` |
 | `status` | One status or omit for all |
+| `visitor_type` | `guest` \| `contractor` \| `client` \| `delivery` \| `other` (omit / `all` = any) |
 | `location_id` | Filter org |
 | `search` | Name / IC / phone |
 | `mine` | `true` — entries where user is host or created_by |
@@ -796,6 +798,9 @@ curl -X GET "http://localhost:8000/visitors/entries/?date_filter=upcoming&status
   -H "Authorization: Bearer <TOKEN>"
 
 curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&has_vehicle=true" \
+  -H "Authorization: Bearer <TOKEN>"
+
+curl -X GET "http://localhost:8000/visitors/entries/?date_filter=today&visitor_type=guest" \
   -H "Authorization: Bearer <TOKEN>"
 ```
 
@@ -871,6 +876,18 @@ curl -X GET "http://localhost:8000/visitors/entries/export/?date_filter=today" \
   -H "Authorization: Bearer <TOKEN>" \
   -o visitor_entries.xlsx
 ```
+
+### 9.5 Export PDF — `GET /visitors/entries/export-pdf/`
+
+Same filters as list / Excel. Landscape PDF with company header, date range, status/type summary, and page footer (same style as roll call / dashboard PDF exports).
+
+```bash
+curl -X GET "http://localhost:8000/visitors/entries/export-pdf/?date_filter=today&visitor_type=guest" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -o visitor_entries.pdf
+```
+
+**Success `200`:** binary `application/pdf` body.
 
 **Success `200`:** binary Excel file (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`).
 
