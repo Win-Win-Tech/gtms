@@ -736,19 +736,18 @@ class VisitorPassDownloadView(APIView):
         if entry.qr_expired:
             return Response({"error": "QR is expired"}, status=status.HTTP_400_BAD_REQUEST)
 
-        image_field = entry.pass_image or entry.qr_image
-        if not image_field:
-            # Generate on demand if missing (e.g. older entries)
-            try:
-                refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
-                entry = _base_entry_qs().get(id=entry.id)
-                image_field = entry.pass_image or entry.qr_image
-            except Exception as exc:
+        # Always rebuild pass image so layout/theme updates apply (same QR token).
+        try:
+            refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+            entry = _base_entry_qs().get(id=entry.id)
+        except Exception as exc:
+            if not (entry.pass_image or entry.qr_image):
                 return Response(
                     {"error": f"Pass image not available: {exc}"},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
+        image_field = entry.pass_image or entry.qr_image
         if not image_field:
             return Response({"error": "Pass image not available"}, status=status.HTTP_404_NOT_FOUND)
 
