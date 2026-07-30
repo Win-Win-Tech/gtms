@@ -59,6 +59,10 @@ class VisitorAiExtractView(APIView):
             or request.FILES.get("id_image")
             or request.FILES.get("vehicle_image")
         )
+        return Response(
+                _slim_response(extract_type, found=False),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not uploaded:
             return Response(
                 _slim_response(extract_type, found=False),
