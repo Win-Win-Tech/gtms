@@ -272,14 +272,19 @@ def generate_qr_image_file(token):
 
 
 def _load_script_font(size):
-    """Elegant italic for Hello — Noto Serif (cleaner than decorative script)."""
+    """Thin cursive for Hello — Great Vibes (QMIS-like), then Playball fallback."""
+    from pathlib import Path
+
     from PIL import ImageFont
 
+    fonts_dir = Path(__file__).resolve().parent / "fonts"
     candidates = [
+        str(fonts_dir / "GreatVibes-Regular.ttf"),
+        str(fonts_dir / "Playball-Regular.ttf"),
+        "/usr/share/fonts/opentype/urw-base35/Z003-MediumItalic.otf",
+        "/usr/share/fonts/type1/urw-base35/Z003-MediumItalic.t1",
         "/usr/share/fonts/truetype/noto/NotoSerif-Italic.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Italic.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
     ]
     for path in candidates:
         try:
@@ -436,45 +441,31 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
     invite_line1 = f"{' '.join(invite_bits)} has invited you to"
     invite_line2 = f"{org_name}, {address}" if address else org_name
 
-    # 2× HTML 400×500 reference
-    width, height = 800, 1000
-    canvas = Image.new("RGBA", (width, height), BG)
-    draw = ImageDraw.Draw(canvas)
-
-    # Layered background circles (reference SVG)
-    draw.ellipse((-340, -370, 460, 430), fill=ACCENT)
-    draw.ellipse((380, 260, 1160, 1040), fill=LAVENDER)
-    draw.ellipse((-60, 40, 860, 960), fill=WHITE)
-
-    # White card
-    margin_x, margin_y = 48, 76
-    card = (margin_x, margin_y, width - margin_x, height - margin_y)
-    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle(
-        (margin_x + 4, margin_y + 8, width - margin_x + 4, height - margin_y + 8),
-        radius=44,
-        fill=(0, 0, 0, 55),
-    )
-    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(12)))
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(card, radius=44, fill=WHITE)
-
-    pad = 44
+    # Content-sized canvas (avoid empty white foot)
+    width = 800
+    margin_x, margin_y = 48, 40
+    pad = 36
     left = margin_x + pad
     right = width - margin_x - pad
     content_w = right - left
+    cx = width / 2
     top = margin_y + pad
 
-    brand_font = _load_font(22, bold=True)
-    seal_font = _load_font(11, bold=True)
-    hello_font = _load_script_font(54)
-    name_font = _load_font(48, bold=True)
-    body_font = _load_font(23)
-    pill_font = _load_font(23, bold=True)
+    brand_font = _load_font(24, bold=True)
+    seal_font = _load_font(12, bold=True)
+    hello_font = _load_script_font(64)
+    name_font = _load_font(52, bold=True)
+    body_font = _load_font(26)
+    pill_font = _load_font(26, bold=True)
 
-    # --- Header: logo + CloudGen Technologies | VISITOR PASS seal ---
     logo_h = 72
+    qr_outer = 310
+    qr_pad = 24
+
+    # Draw content on a tall transparent layer first, then size the card to it
+    layer = Image.new("RGBA", (width, 1200), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+
     logo_path = _resolve_pass_logo_path()
     logo_img = None
     if logo_path:
@@ -489,7 +480,6 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
                     (raw.height + side) // 2,
                 )
             ).resize((logo_h, logo_h), Image.Resampling.LANCZOS)
-            # Rounded square mask
             mask = Image.new("L", (logo_h, logo_h), 0)
             ImageDraw.Draw(mask).rounded_rectangle(
                 (0, 0, logo_h - 1, logo_h - 1), radius=14, fill=255
@@ -507,19 +497,16 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
         tw, th = _text_wh(ld, "G", gfont)
         ld.text(((logo_h - tw) / 2, (logo_h - th) / 2 - 2), "G", font=gfont, fill=WHITE)
 
-    canvas.paste(logo_img, (left, top), logo_img)
-    draw = ImageDraw.Draw(canvas)
+    layer.paste(logo_img, (left, top), logo_img)
+    draw = ImageDraw.Draw(layer)
 
-    # Company name — two lines like reference ("CloudGen" / "Technologies")
     name_x = left + logo_h + 14
     draw.text((name_x, top + 8), "CloudGen", font=brand_font, fill=INK)
-    draw.text((name_x, top + 34), "Technologies", font=brand_font, fill=INK)
+    draw.text((name_x, top + 36), "Technologies", font=brand_font, fill=INK)
 
-    # Right seal
     seal_r = 52
     seal_cx = right - seal_r
     seal_cy = top + logo_h // 2
-    # Outer ring (approx conic with layered ellipses)
     draw.ellipse(
         (seal_cx - seal_r, seal_cy - seal_r, seal_cx + seal_r, seal_cy + seal_r),
         fill=ACCENT,
@@ -542,9 +529,6 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
             fill=ACCENT_HEX,
         )
 
-    # Thick purple QR frame — sized down so text block has more room
-    qr_outer = 280
-    qr_pad = 22
     qr_inner = qr_outer - qr_pad * 2
     qr_x = (width - qr_outer) // 2
     qr_y = top + logo_h + 28
@@ -559,42 +543,78 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
         fill=WHITE,
     )
     qr_resized = qr_pil.resize((qr_inner - 6, qr_inner - 6), Image.Resampling.NEAREST)
-    paste_x = qr_x + qr_pad + 3
-    paste_y = qr_y + qr_pad + 3
-    canvas.paste(qr_resized.convert("RGBA"), (paste_x, paste_y))
-    draw = ImageDraw.Draw(canvas)
+    layer.paste(
+        qr_resized.convert("RGBA"),
+        (qr_x + qr_pad + 3, qr_y + qr_pad + 3),
+    )
+    draw = ImageDraw.Draw(layer)
 
-    # --- Left-aligned text block (matches HTML) ---
-    y = qr_y + qr_outer + 28
-    draw.text((left, y), "Hello", font=hello_font, fill=INK)
-    y += 56
+    # Hello (QMIS ref): thin script above-left of centered name —
+    # end of "Hello" sits over the start of the name.
+    y = qr_y + qr_outer + 44
     name_fit = _fit_text(draw, visitor_name, name_font, content_w)
-    draw.text((left, y), name_fit, font=name_font, fill=ACCENT_HEX)
-    y += 58
+    name_tw, name_th = _text_wh(draw, name_fit, name_font)
+    name_left = cx - name_tw / 2
+    name_y = y
+    hello_tw, hello_th = _text_wh(draw, "Hello", hello_font)
+    hello_x = int(name_left - hello_tw * 0.72)
+    hello_x = max(int(left - 12), hello_x)
+    hello_y = int(name_y - hello_th * 0.70)
+    draw.text((hello_x, hello_y), "Hello", font=hello_font, fill=INK)
 
-    line1 = _fit_text(draw, invite_line1, body_font, content_w)
-    draw.text((left, y), line1, font=body_font, fill=INK)
-    y += 30
-    line2 = _fit_text(draw, invite_line2, body_font, content_w)
-    draw.text((left, y), line2, font=body_font, fill=INK)
-    y += 40
+    _center_text(draw, name_fit, cx, name_y, name_font, ACCENT_HEX)
+    y = name_y + max(name_th, 48) + 14
+
+    invite_full = f"{invite_line1} {invite_line2}"
+    invite_lines = _wrap_text(draw, invite_full, body_font, int(content_w * 0.92))[:4]
+    for line in invite_lines:
+        _center_text(draw, line, cx, y, body_font, INK)
+        y += 32
+    y += 14
 
     if time_pill:
         pill_text = _fit_text(draw, time_pill, pill_font, content_w - 40)
         tw, th = _text_wh(draw, pill_text, pill_font)
         pill_pad_x, pill_pad_y = 36, 16
         pill_h = th + pill_pad_y * 2
+        pill_w = tw + pill_pad_x * 2
+        pill_x0 = cx - pill_w / 2
         draw.rounded_rectangle(
-            (left, y, left + tw + pill_pad_x * 2, y + pill_h),
+            (pill_x0, y, pill_x0 + pill_w, y + pill_h),
             radius=pill_h / 2,
             fill=ACCENT,
         )
         draw.text(
-            (left + pill_pad_x, y + pill_pad_y),
+            (pill_x0 + pill_pad_x, y + pill_pad_y),
             pill_text,
             font=pill_font,
             fill="#FFFFFF",
         )
+        y += pill_h
+
+    card_bottom = int(y + 28)
+    final_h = int(card_bottom + margin_y)
+
+    canvas = Image.new("RGBA", (width, final_h), BG)
+    bg = ImageDraw.Draw(canvas)
+    bg.ellipse((-340, -370, 460, 430), fill=ACCENT)
+    bg.ellipse((380, final_h - 200, 1160, final_h + 420), fill=LAVENDER)
+    bg.ellipse((-60, 40, 860, final_h + 40), fill=WHITE)
+
+    shadow = Image.new("RGBA", (width, final_h), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle(
+        (margin_x + 4, margin_y + 6, width - margin_x + 4, card_bottom + 6),
+        radius=44,
+        fill=(0, 0, 0, 55),
+    )
+    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(10)))
+    ImageDraw.Draw(canvas).rounded_rectangle(
+        (margin_x, margin_y, width - margin_x, card_bottom),
+        radius=44,
+        fill=WHITE,
+    )
+    canvas = Image.alpha_composite(canvas, layer.crop((0, 0, width, final_h)))
 
     buf = BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
