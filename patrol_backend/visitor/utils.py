@@ -229,6 +229,39 @@ def generate_qr_pil(token):
     return img.convert("RGB")
 
 
+def generate_rounded_qr_pil(token, *, fill_rgb=(24, 21, 65)):
+    """
+    Scannable QR with rounded modules / eyes (pass visual style).
+    Same token payload as generate_qr_pil — only the drawing style changes.
+    """
+    try:
+        import qrcode
+        from qrcode.image.styledpil import StyledPilImage
+        from qrcode.image.styles.colormasks import SolidFillColorMask
+        from qrcode.image.styles.moduledrawers.pil import RoundedModuleDrawer
+    except ImportError:
+        return generate_qr_pil(token)
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=12,
+        border=1,
+    )
+    qr.add_data(token)
+    qr.make(fit=True)
+    img = qr.make_image(
+        image_factory=StyledPilImage,
+        module_drawer=RoundedModuleDrawer(),
+        eye_drawer=RoundedModuleDrawer(),
+        color_mask=SolidFillColorMask(
+            back_color=(255, 255, 255),
+            front_color=fill_rgb,
+        ),
+    )
+    return img.convert("RGB")
+
+
 def generate_qr_image_file(token):
     """Return ContentFile PNG for the given QR token."""
     img = generate_qr_pil(token)
@@ -324,29 +357,29 @@ def _center_tracked(draw, text, cx, y, font, fill, tracking=2.5):
 
 def generate_visitor_pass_image_file(entry, qr_pil=None):
     """
-    Invite-card layout with comfortable spacing (not over-tight):
-    circular logo + centered title → QR → Hello/name → invite → pill → map.
-    Noto Sans / Noto Serif typography, GTMS theme.
+    Visitor pass matching shared HTML reference:
+    logo + CloudGen Technologies | VISITOR PASS seal → thick purple QR frame →
+    Hello / name → invite + address lines → time chip. No map link.
+    Same qr_token / qrcode generation as before.
     """
     from PIL import Image, ImageDraw, ImageFilter
 
-    GTMS = "#7C3AED"
-    GTMS_RGB = (124, 58, 237, 255)
-    INK = "#111827"
-    BODY = "#4B5563"
-    SOFT = "#9CA3AF"
+    # Reference palette (visitor_pass_exact_reference_match.html)
+    BG = (38, 33, 92, 255)          # #26215C
+    ACCENT = (75, 67, 168, 255)     # #4B43A8
+    ACCENT_HEX = "#4B43A8"
+    LAVENDER = (138, 130, 224, 255) # #8A82E0
+    INK = "#181541"
+    WHITE = (255, 255, 255, 255)
+    COMPANY = "CloudGen Technologies"
 
     token = entry.qr_token
-    if qr_pil is None:
-        try:
-            import qrcode
-
-            qr = qrcode.QRCode(version=1, box_size=8, border=1)
-            qr.add_data(token)
-            qr.make(fit=True)
-            qr_pil = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-        except Exception:
-            qr_pil = generate_qr_pil(token)
+    # Always render rounded-style QR on the pass (scannable; same token).
+    # Ignore square qr_pil used for the standalone qr_image field.
+    try:
+        qr_pil = generate_rounded_qr_pil(token, fill_rgb=(24, 21, 65))
+    except Exception:
+        qr_pil = generate_qr_pil(token) if qr_pil is None else qr_pil
     if not isinstance(qr_pil, Image.Image):
         qr_pil = generate_qr_pil(token)
 
@@ -354,6 +387,7 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
     location = getattr(entry, "location", None)
     host = getattr(entry, "host", None)
 
+    # Dynamic fields from the visitor entry (not hardcoded)
     org_name = (getattr(location, "name", None) or "Organisation").strip()
     address = (getattr(location, "address", None) or "").strip()
     visitor_name = _pretty_name(getattr(visitor, "visitor_name", None))
@@ -381,7 +415,9 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
                 local_dt = arrival.astimezone(tz)
             else:
                 local_dt = tz.localize(arrival)
-            time_pill = f"Time : {local_dt.strftime('%-I:%M %p')} | {local_dt.strftime('%d-%m-%Y')}"
+            time_pill = (
+                f"Time : {local_dt.strftime('%-I:%M %p')} | {local_dt.strftime('%d-%m-%Y')}"
+            )
         except Exception:
             try:
                 time_pill = (
@@ -392,154 +428,173 @@ def generate_visitor_pass_image_file(entry, qr_pil=None):
     if not time_pill and getattr(entry, "visit_date", None):
         time_pill = f"Date : {entry.visit_date.strftime('%d-%m-%Y')}"
 
-    words = [w for w in org_name.split() if w and w[0].isalnum()]
-    org_tag = "".join(w[0] for w in words).upper()[:6] if len(words) >= 2 else org_name
     invite_bits = [host_name]
     if host_role:
         invite_bits.append(host_role)
-    invite_bits.append(f"at {org_tag}")
-    # Line 1: invite to org; line 2: address (if any)
-    invite_text = f"{' '.join(invite_bits)} has invited you to {org_name}."
-    address_text = address or ""
+    invite_bits.append(f"at {org_name}")
+    # Line 1: host + org; line 2: destination org + address (all from entry)
+    invite_line1 = f"{' '.join(invite_bits)} has invited you to"
+    invite_line2 = f"{org_name}, {address}" if address else org_name
 
-    # Comfortable sizes (previous spacing, new fonts)
-    title_font = _load_font(26, bold=True)
-    subtitle_font = _load_font(11, bold=True)
-    hello_font = _load_script_font(44)
-    name_font = _load_font(38, bold=True)
-    body_font = _load_font(15)
-    address_font = _load_font(14)
-    pill_font = _load_font(15, bold=True)
-    badge_font = _load_font(11, bold=True)
+    # 2× HTML 400×500 reference
+    width, height = 800, 1000
+    canvas = Image.new("RGBA", (width, height), BG)
+    draw = ImageDraw.Draw(canvas)
 
-    width = 720
-    outer = 28
-    pad_x = 28
-    left = outer + pad_x
-    content_w = width - 2 * (outer + pad_x)
-    cx = width / 2
-    top = outer + 18
-    logo_size = 52
-    qr_size = 260
-    frame_pad = 8
-    frame_w = 6
+    # Layered background circles (reference SVG)
+    draw.ellipse((-340, -370, 460, 430), fill=ACCENT)
+    draw.ellipse((380, 260, 1160, 1040), fill=LAVENDER)
+    draw.ellipse((-60, 40, 860, 960), fill=WHITE)
 
-    probe = ImageDraw.Draw(Image.new("RGB", (width, 10)))
-    invite_lines = _wrap_text(probe, invite_text, body_font, int(content_w * 0.92))[:3]
-    address_lines = (
-        _wrap_text(probe, address_text, address_font, int(content_w * 0.92))[:2]
-        if address_text
-        else []
+    # White card
+    margin_x, margin_y = 48, 76
+    card = (margin_x, margin_y, width - margin_x, height - margin_y)
+    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle(
+        (margin_x + 4, margin_y + 8, width - margin_x + 4, height - margin_y + 8),
+        radius=44,
+        fill=(0, 0, 0, 55),
     )
+    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(12)))
+    draw = ImageDraw.Draw(canvas)
+    draw.rounded_rectangle(card, radius=44, fill=WHITE)
 
+    pad = 44
+    left = margin_x + pad
+    right = width - margin_x - pad
+    content_w = right - left
+    top = margin_y + pad
+
+    brand_font = _load_font(22, bold=True)
+    seal_font = _load_font(11, bold=True)
+    hello_font = _load_script_font(54)
+    name_font = _load_font(48, bold=True)
+    body_font = _load_font(23)
+    pill_font = _load_font(23, bold=True)
+
+    # --- Header: logo + CloudGen Technologies | VISITOR PASS seal ---
+    logo_h = 72
     logo_path = _resolve_pass_logo_path()
     logo_img = None
     if logo_path:
         try:
-            logo_img = _circular_image(
-                Image.open(logo_path), logo_size, ring_color=GTMS_RGB, ring_width=2
+            raw = Image.open(logo_path).convert("RGBA")
+            side = min(raw.width, raw.height)
+            raw = raw.crop(
+                (
+                    (raw.width - side) // 2,
+                    (raw.height - side) // 2,
+                    (raw.width + side) // 2,
+                    (raw.height + side) // 2,
+                )
+            ).resize((logo_h, logo_h), Image.Resampling.LANCZOS)
+            # Rounded square mask
+            mask = Image.new("L", (logo_h, logo_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, logo_h - 1, logo_h - 1), radius=14, fill=255
             )
+            logo_img = Image.new("RGBA", (logo_h, logo_h), (0, 0, 0, 0))
+            logo_img.paste(raw, (0, 0))
+            logo_img.putalpha(mask)
         except Exception:
             logo_img = None
     if logo_img is None:
-        logo_img = Image.new("RGBA", (logo_size, logo_size), (0, 0, 0, 0))
+        logo_img = Image.new("RGBA", (logo_h, logo_h), (0, 0, 0, 0))
         ld = ImageDraw.Draw(logo_img)
-        ld.ellipse((1, 1, logo_size - 2, logo_size - 2), fill=GTMS_RGB)
-        ld.text(
-            (logo_size / 2 - 4, logo_size / 2 - 7),
-            "G",
-            font=badge_font,
-            fill=(255, 255, 255, 255),
+        ld.rounded_rectangle((0, 0, logo_h - 1, logo_h - 1), radius=14, fill=ACCENT)
+        gfont = _load_font(28, bold=True)
+        tw, th = _text_wh(ld, "G", gfont)
+        ld.text(((logo_h - tw) / 2, (logo_h - th) / 2 - 2), "G", font=gfont, fill=WHITE)
+
+    canvas.paste(logo_img, (left, top), logo_img)
+    draw = ImageDraw.Draw(canvas)
+
+    # Company name — two lines like reference ("CloudGen" / "Technologies")
+    name_x = left + logo_h + 14
+    draw.text((name_x, top + 8), "CloudGen", font=brand_font, fill=INK)
+    draw.text((name_x, top + 34), "Technologies", font=brand_font, fill=INK)
+
+    # Right seal
+    seal_r = 52
+    seal_cx = right - seal_r
+    seal_cy = top + logo_h // 2
+    # Outer ring (approx conic with layered ellipses)
+    draw.ellipse(
+        (seal_cx - seal_r, seal_cy - seal_r, seal_cx + seal_r, seal_cy + seal_r),
+        fill=ACCENT,
+    )
+    draw.ellipse(
+        (
+            seal_cx - seal_r + 6,
+            seal_cy - seal_r + 6,
+            seal_cx + seal_r - 6,
+            seal_cy + seal_r - 6,
+        ),
+        fill=WHITE,
+    )
+    for i, line in enumerate(("VISITOR", "PASS")):
+        tw, _ = _text_wh(draw, line, seal_font)
+        draw.text(
+            (seal_cx - tw / 2, seal_cy - 14 + i * 16),
+            line,
+            font=seal_font,
+            fill=ACCENT_HEX,
         )
 
-    layer = Image.new("RGBA", (width, 1100), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-
-    y = top
-    layer.paste(logo_img, (left, int(y)), logo_img)
-
-    title_y = y + 4
-    org_fit = _fit_text(draw, org_name, title_font, content_w - logo_size)
-    _center_text(draw, org_fit, cx, title_y, title_font, INK)
-    _center_tracked(draw, "VISITOR PASS", cx, title_y + 30, subtitle_font, SOFT, tracking=2.4)
-
-    qr_y = int(y + logo_size + 16)
-    qr_x = int((width - qr_size) // 2)
-    frame = (
-        qr_x - frame_pad,
-        qr_y - frame_pad,
-        qr_x + qr_size + frame_pad,
-        qr_y + qr_size + frame_pad,
+    # Thick purple QR frame — sized down so text block has more room
+    qr_outer = 280
+    qr_pad = 22
+    qr_inner = qr_outer - qr_pad * 2
+    qr_x = (width - qr_outer) // 2
+    qr_y = top + logo_h + 28
+    draw.rounded_rectangle(
+        (qr_x, qr_y, qr_x + qr_outer, qr_y + qr_outer),
+        radius=32,
+        fill=ACCENT,
     )
-    draw.rounded_rectangle(frame, radius=14, outline=GTMS, width=frame_w)
-    layer.paste(
-        qr_pil.resize((qr_size, qr_size), Image.Resampling.NEAREST).convert("RGBA"),
-        (qr_x, qr_y),
+    draw.rounded_rectangle(
+        (qr_x + qr_pad, qr_y + qr_pad, qr_x + qr_outer - qr_pad, qr_y + qr_outer - qr_pad),
+        radius=16,
+        fill=WHITE,
     )
+    qr_resized = qr_pil.resize((qr_inner - 6, qr_inner - 6), Image.Resampling.NEAREST)
+    paste_x = qr_x + qr_pad + 3
+    paste_y = qr_y + qr_pad + 3
+    canvas.paste(qr_resized.convert("RGBA"), (paste_x, paste_y))
+    draw = ImageDraw.Draw(canvas)
 
-    # Comfortable rhythm (reverted from over-tight)
-    y = qr_y + qr_size + frame_pad + 16
-    _center_text(draw, "Hello", cx, y, hello_font, INK)
-    y += 48
+    # --- Left-aligned text block (matches HTML) ---
+    y = qr_y + qr_outer + 28
+    draw.text((left, y), "Hello", font=hello_font, fill=INK)
+    y += 56
     name_fit = _fit_text(draw, visitor_name, name_font, content_w)
-    _center_text(draw, name_fit, cx, y, name_font, GTMS)
-    y += 50
+    draw.text((left, y), name_fit, font=name_font, fill=ACCENT_HEX)
+    y += 58
 
-    for line in invite_lines:
-        _center_text(draw, line, cx, y, body_font, BODY)
-        y += 20
-    for line in address_lines:
-        _center_text(draw, line, cx, y, address_font, SOFT)
-        y += 18
-    y += 14
+    line1 = _fit_text(draw, invite_line1, body_font, content_w)
+    draw.text((left, y), line1, font=body_font, fill=INK)
+    y += 30
+    line2 = _fit_text(draw, invite_line2, body_font, content_w)
+    draw.text((left, y), line2, font=body_font, fill=INK)
+    y += 40
 
     if time_pill:
-        pill_text = _fit_text(draw, time_pill, pill_font, content_w - 36)
-        tw, _ = _text_wh(draw, pill_text, pill_font)
-        pill_pad_x, pill_pad_y = 22, 11
-        pill_w = tw + pill_pad_x * 2
-        pill_h = 22 + pill_pad_y * 2
-        pill_x0 = cx - pill_w / 2
+        pill_text = _fit_text(draw, time_pill, pill_font, content_w - 40)
+        tw, th = _text_wh(draw, pill_text, pill_font)
+        pill_pad_x, pill_pad_y = 36, 16
+        pill_h = th + pill_pad_y * 2
         draw.rounded_rectangle(
-            (pill_x0, y, pill_x0 + pill_w, y + pill_h),
+            (left, y, left + tw + pill_pad_x * 2, y + pill_h),
             radius=pill_h / 2,
-            fill=GTMS,
+            fill=ACCENT,
         )
         draw.text(
-            (pill_x0 + pill_pad_x, y + pill_pad_y),
+            (left + pill_pad_x, y + pill_pad_y),
             pill_text,
             font=pill_font,
             fill="#FFFFFF",
         )
-        y += pill_h + 18
-
-    card_bottom = y + 14
-    final_h = int(card_bottom + outer)
-
-    canvas = Image.new("RGBA", (width, final_h), (91, 33, 182, 255))
-    bg = ImageDraw.Draw(canvas)
-    for bx, by, r, fill in (
-        (-60, 90, 220, (109, 40, 217, 255)),
-        (width + 70, -20, 250, GTMS_RGB),
-        (width - 10, final_h + 20, 220, GTMS_RGB),
-        (-40, final_h - 30, 160, (139, 92, 246, 255)),
-    ):
-        bg.ellipse((bx - r, by - r, bx + r, by + r), fill=fill)
-
-    shadow = Image.new("RGBA", (width, final_h), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    sd.rounded_rectangle(
-        (outer + 4, outer + 6, width - outer + 4, card_bottom + 6),
-        radius=28,
-        fill=(0, 0, 0, 45),
-    )
-    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(8)))
-    ImageDraw.Draw(canvas).rounded_rectangle(
-        (outer, outer, width - outer, card_bottom),
-        radius=28,
-        fill=(255, 255, 255, 255),
-    )
-    canvas = Image.alpha_composite(canvas, layer.crop((0, 0, width, final_h)))
 
     buf = BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
