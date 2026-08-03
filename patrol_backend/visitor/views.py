@@ -610,6 +610,25 @@ class VisitorApproveView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        _auto_fill_missing_assets_from_history(
+            entry,
+            (
+                VisitorAsset.ASSET_VISITOR_PHOTO,
+                VisitorAsset.ASSET_ID_PROOF,
+            ),
+        )
+        if not _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO) or not _entry_has_asset(
+            entry, VisitorAsset.ASSET_ID_PROOF
+        ):
+            return Response(
+                {
+                    "error": (
+                        "Cannot approve entry. Mandatory visitor photo or ID proof is missing."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
         expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
         now = timezone.now()
@@ -1003,6 +1022,26 @@ class VisitorQrScanView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            _auto_fill_missing_assets_from_history(
+                entry,
+                (
+                    VisitorAsset.ASSET_VISITOR_PHOTO,
+                    VisitorAsset.ASSET_ID_PROOF,
+                ),
+            )
+            has_photo = _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO)
+            has_id = _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF)
+
+            if not (has_photo and has_id):
+                return Response(
+                    {
+                        "action": "missing_document",
+                        "type": "missing_document",
+                        "message": "Visitor photo or ID proof is missing. Redirect to capture form.",
+                        "entry": VisitorEntrySerializer(entry, context={"request": request}).data,
+                    }
+                )
+
             entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
             entry.qr_expired = False
             entry.scanned_by = request.user
@@ -1086,3 +1125,231 @@ class VisitorEntryExportPdfView(APIView):
         response = HttpResponse(content, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
         return response
+
+
+class VisitorInviteCreateView(APIView):
+    """
+    POST /visitors/entries/invite/
+    Pre-registration (Invite) creation:
+    Mandatory: ic_passport_number, visitor_name, host_id, location_id, visit_date.
+    Optional: visitor_type, purpose_of_visit, vehicle_number, remarks, expected_arrival_time, expected_out_time, phone_number.
+    Assets (visitor_photo, id_proof, additional_images) are NOT mandatory.
+    Creates entry with status=scheduled, entry_source=invitation, generates QR + pass.
+    No host notification sent on creation.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    @transaction.atomic
+    def post(self, request):
+        data = request.data
+        location_id, err = resolve_location_for_request(request, data.get("location_id"))
+        if err:
+            return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+        if not location_id:
+            return Response({"error": "location_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            location = Location.objects.get(id=location_id, is_deleted=False)
+        except Location.DoesNotExist:
+            return Response({"error": "Location not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        ic_number = (data.get("ic_passport_number") or data.get("ic_number") or "").strip()
+        visitor_name = (data.get("visitor_name") or "").strip()
+        if not ic_number:
+            return Response(
+                {"error": "ic_passport_number is required"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if not visitor_name:
+            return Response(
+                {"error": "visitor_name is required"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        host, host_err = _resolve_host(request, data.get("host_id"), location_id)
+        if host_err:
+            return Response({"error": host_err}, status=status.HTTP_400_BAD_REQUEST)
+
+        visit_date_raw = data.get("visit_date")
+        visit_date = _parse_date(visit_date_raw)
+        if not visit_date:
+            return Response(
+                {"error": "visit_date is required for invitation"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_tz = get_user_timezone_from_request(request, location_id=location_id)
+        today = get_user_today(user_tz)
+        if visit_date < today:
+            return Response(
+                {"error": "visit_date cannot be in the past"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        visitor_type = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
+        valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
+        if visitor_type not in valid_types:
+            return Response(
+                {"error": f"Invalid visitor_type. Choose from: {', '.join(sorted(valid_types))}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        phone_number = (data.get("phone_number") or "").strip()
+        purpose = (data.get("purpose_of_visit") or "").strip()
+        vehicle_number = (data.get("vehicle_number") or "").strip()
+        remarks = (data.get("remarks") or "").strip()
+
+        expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
+        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
+
+        if expected_arrival and expected_out and expected_out <= expected_arrival:
+            return Response(
+                {"error": "expected_out_time must be after expected_arrival_time"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        visitor = _upsert_visitor(location, ic_number, visitor_name, phone_number)
+
+        entry = VisitorEntry(
+            visitor=visitor,
+            host=host,
+            location=location,
+            entry_source=VisitorEntry.ENTRY_INVITATION,
+            visitor_type=visitor_type,
+            status=VisitorEntry.STATUS_SCHEDULED,
+            purpose_of_visit=purpose,
+            vehicle_number=vehicle_number,
+            remarks=remarks,
+            expected_arrival_time=expected_arrival,
+            expected_out_time=expected_out,
+            visit_date=visit_date,
+            qr_token=make_qr_token(),
+            qr_expired=False,
+            created_by=request.user,
+        )
+        entry.save()
+        refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+
+        _save_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO, request.FILES.get("visitor_photo"))
+        _save_asset(entry, VisitorAsset.ASSET_ID_PROOF, request.FILES.get("id_proof"))
+        additional = request.FILES.getlist("additional_images") or request.FILES.getlist(
+            "additional_image"
+        )
+        _save_assets_many(entry, VisitorAsset.ASSET_ADDITIONAL, additional)
+
+        entry = _base_entry_qs().get(id=entry.id)
+        return Response(
+            VisitorEntrySerializer(entry, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class VisitorCompleteInviteView(APIView):
+    """
+    POST /visitors/entries/<id>/complete-invite/
+    Guard/User captures missing photos or assets for an invited visitor entry.
+    Field Edit Protection: Users other than host or entry creator CANNOT modify fields filled during invite creation.
+    Saves assets, validates mandatory assets (visitor_photo + id_proof), transitions status to pending_approval, and notifies host.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    @transaction.atomic
+    def post(self, request, entry_id):
+        try:
+            entry = _base_entry_qs().select_for_update().get(id=entry_id)
+        except VisitorEntry.DoesNotExist:
+            return Response({"error": "Visitor entry not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_access_entry(request, entry):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        if entry.status not in (
+            VisitorEntry.STATUS_SCHEDULED,
+            VisitorEntry.STATUS_PENDING_APPROVAL,
+            VisitorEntry.STATUS_REVERTED,
+        ):
+            return Response(
+                {"error": f"Cannot complete invite for entry with status={entry.status}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data
+        is_creator_or_host = _is_host_or_super(request, entry) or (
+            entry.created_by_id and str(entry.created_by_id) == str(request.user.id)
+        )
+
+        if is_creator_or_host:
+            ic_number = (data.get("ic_passport_number") or data.get("ic_number") or "").strip()
+            visitor_name = (data.get("visitor_name") or "").strip()
+            phone_number = (data.get("phone_number") or "").strip()
+            if ic_number and visitor_name:
+                visitor = _upsert_visitor(entry.location, ic_number, visitor_name, phone_number)
+                entry.visitor = visitor
+
+            if data.get("host_id"):
+                host, host_err = _resolve_host(request, data.get("host_id"), entry.location_id)
+                if not host_err and host:
+                    entry.host = host
+
+            if data.get("purpose_of_visit") is not None:
+                entry.purpose_of_visit = data.get("purpose_of_visit").strip()
+            if data.get("visitor_type"):
+                vtype = data.get("visitor_type").strip()
+                if vtype in {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}:
+                    entry.visitor_type = vtype
+            if data.get("remarks") is not None:
+                entry.remarks = data.get("remarks").strip()
+        else:
+            phone_number = (data.get("phone_number") or "").strip()
+            if phone_number and not entry.visitor.phone_number:
+                entry.visitor.phone_number = phone_number
+                entry.visitor.save(update_fields=["phone_number", "modified_on"])
+
+        vehicle_num = (data.get("vehicle_number") or "").strip()
+        if vehicle_num:
+            entry.vehicle_number = vehicle_num
+
+        _save_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO, request.FILES.get("visitor_photo"))
+        _save_asset(entry, VisitorAsset.ASSET_ID_PROOF, request.FILES.get("id_proof"))
+        additional = request.FILES.getlist("additional_images") or request.FILES.getlist(
+            "additional_image"
+        )
+        _save_assets_many(entry, VisitorAsset.ASSET_ADDITIONAL, additional)
+
+        _auto_fill_missing_assets_from_history(
+            entry,
+            (
+                VisitorAsset.ASSET_VISITOR_PHOTO,
+                VisitorAsset.ASSET_ID_PROOF,
+            ),
+        )
+
+        if not _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO):
+            transaction.set_rollback(True)
+            return Response(
+                {"error": "visitor_photo is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF):
+            transaction.set_rollback(True)
+            return Response(
+                {"error": "id_proof is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
+        entry.scanned_by = request.user
+        entry.qr_expired = False
+        entry.save()
+
+        try:
+            refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+        except ImportError:
+            pass
+
+        entry = _base_entry_qs().get(id=entry.id)
+        notify_visitor_pending(entry)
+        return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
+

@@ -29,16 +29,18 @@ All endpoints documented in this file:
 | `GET` | `/auth/users/list/` | List users for **host (approver) dropdown** |
 | `GET` | `/visitors/search/` | Search prior visitor by IC — **prefill** form + last-entry assets |
 | `POST` | `/visitors/entries/checkin/` | Create manual walk-in or resubmit; **auto-reuse** missing photos from last visit |
+| `POST` | `/visitors/entries/invite/` | Create Pre-Reg (Invite) entry (`visit_date` mandatory, assets optional) |
+| `POST` | `/visitors/entries/<id>/complete-invite/` | Guard complete missing assets for invite (`visitor_photo` + `id_proof`) |
 | `GET` | `/visitors/entries/` | List visitor entries (filters / pagination) |
 | `GET` | `/visitors/entries/<ENTRY_UUID>/` | Entry detail (deep-link from FCM / inbox) |
 | `GET` | `/visitors/entries/<ENTRY_UUID>/pass/` | Download visitor pass (PDF/image) |
 | `GET` | `/visitors/entries/export/` | Export entries to Excel |
 | `GET` | `/visitors/entries/export-pdf/` | Export entries to PDF (same filters) |
-| `POST` | `/visitors/entries/<id>/approve/` | Host approve (= check-in) |
+| `POST` | `/visitors/entries/<id>/approve/` | Host approve (= check-in; requires mandatory assets) |
 | `POST` | `/visitors/entries/<id>/revert/` | Host revert for guard correction |
 | `POST` | `/visitors/entries/<id>/cancel/` | Host reject / cancel visit |
 | `POST` | `/visitors/entries/<id>/reschedule/` | Host reschedule visit date / times |
-| `POST` | `/visitors/qr-scan/` | Scan QR on visit day (`scheduled` → `pending_approval`) |
+| `POST` | `/visitors/qr-scan/` | Scan QR on visit day (`scheduled` → `pending_approval` or `missing_document`) |
 | `POST` | `/visitors/entries/<id>/checkout/` | Check out visitor (`multipart` + exit photo) |
 | `POST` | `/visitors/ai/extract/` | Optional AI OCR — extract ID or vehicle number from image |
 

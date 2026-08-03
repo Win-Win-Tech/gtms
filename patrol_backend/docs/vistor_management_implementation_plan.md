@@ -74,11 +74,20 @@ CHECKOUT
      - Later calendar day → `visit_date` = that day, status `scheduled`.
 5. QR while `pending_approval` → **“Not approved yet”**.
 
-### Invitation / preregister — Iteration 3 (same approval rules)
-1. Create invitation with **`visit_date`** (+ visitor details, host, QR) → status **`scheduled`**.
-2. On visit day, mobile scans QR → status **`pending_approval`**, host notified → **not** auto check-in.
-3. Host uses the **same** Approve / Reject / Revert / Reschedule actions.
-4. After reschedule to another day → back to **`scheduled`**; next arrival scan again enters approval.
+### Invitation / preregister — Completed
+1. Create invitation with **`visit_date`** (+ visitor details, host, QR, optional assets) via `POST /visitors/entries/invite/` → status **`scheduled`**. **No host notification** on creation.
+2. Form UI uses a single form with an **"Invitation / Pre-Reg" toggle switch** to show `visit_date`, ETA, and ETO fields.
+3. On visit day, mobile scans QR (`POST /visitors/qr-scan/`):
+   - If `visitor_photo` or `id_proof` is missing: returns `action: "missing_document"`, `type: "missing_document"` redirecting guard to capture form.
+   - If assets exist: status → `pending_approval`, host notified (`action: "awaiting_approval"`).
+4. Guard capture form (`POST /visitors/entries/<id>/complete-invite/`):
+   - Attach missing assets (`visitor_photo`, `id_proof`).
+   - Fields created by host (`visitor_name`, `ic_passport_number`, `host_id`, `visit_date`, ETA, ETO) are **read-only / immutable** for non-host guards.
+   - Upon completion → status `pending_approval` + **host notified**.
+5. Host Approval (`POST /visitors/entries/<id>/approve/`):
+   - Strictly verifies mandatory assets (`visitor_photo` and `id_proof`). Blocks approval with HTTP 400 if assets are missing.
+6. Host Reschedule (`POST /visitors/entries/<id>/reschedule/`):
+   - Updates ETA, ETO, and `visit_date` without requiring assets.
 
 ### Checkout (both methods)
 | Method | Rule |
@@ -93,7 +102,8 @@ After checkout → `checked_out`, `qr_expired=true`.
 |--------|----------------|
 | `pending_approval` | `awaiting_approval` — not approved yet |
 | `reverted` | `reverted` — guard must resubmit |
-| `scheduled` + visit day | → `pending_approval` + `awaiting_approval` (start host approval) |
+| `scheduled` + visit day (missing assets) | `missing_document` — redirect guard to asset capture form |
+| `scheduled` + visit day (assets present) | → `pending_approval` + `awaiting_approval` (start host approval) |
 | `scheduled` + future day | `too_early` |
 | `checked_in` | `checkout` — proceed with image |
 | `checked_out` / `cancelled` / `qr_expired` | Expired / invalid |
@@ -114,13 +124,15 @@ Three tables in Django app `visitor` (existing). Key fields on `VisitorEntry`:
 
 ## 2. API surface (`/visitors/`)
 
-### Iteration 1 — Manual + approval + reschedule + checkout
+### Iteration 1 & 3 — Manual + Pre-Reg (Invite) + approval + reschedule + checkout
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/visitors/search/` | Lookup by IC |
 | `POST` | `/visitors/entries/checkin/` | Manual submit / resubmit |
-| `POST` | `/visitors/entries/<id>/approve/` | Host approve = check-in |
+| `POST` | `/visitors/entries/invite/` | Create Pre-Reg (Invite) entry |
+| `POST` | `/visitors/entries/<id>/complete-invite/` | Guard complete missing assets for invite |
+| `POST` | `/visitors/entries/<id>/approve/` | Host approve = check-in (validates mandatory assets) |
 | `POST` | `/visitors/entries/<id>/revert/` | Host revert |
 | `POST` | `/visitors/entries/<id>/cancel/` | Reject/Cancel |
 | `POST` | `/visitors/entries/<id>/reschedule/` | Host reschedule arrival + out (+ date) |
