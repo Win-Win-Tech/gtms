@@ -1,181 +1,39 @@
-# GTMS Visitor Management — Implementation Plan
+# Visitor Management Implementation Plan & Rules
 
-Revised plan for the **Visitor Entry & Visitor Management** module.
+## Summary of Workflow Rules (Updated)
 
-**Locked decisions (updated)**
-- **Iteration 1 = manual entry + host approval + reschedule** (models + APIs + web). AI/OCR is **Iteration 2**.
-- **Invitations / preregister** are **Iteration 3**, but follow the **same host-approval model** (not direct QR check-in).
-- `ic_passport_number` is **unique per location** (not global).
-- **No `document_type` field** — AI will detect document type later when OCR lands.
-- Manual submit sets **`visit_date` = today** (location timezone). Guard may also set `expected_arrival_time` / `expected_out_time`.
-- **`visit_date`** is also used when an entry is **rescheduled to another day** (manual or invite).
-- **Host approve = check-in** (never auto check-in on QR for pending/scheduled arrival).
-- **Reject = Cancel** — same status `cancelled`, `qr_expired=true` (UI may say Reject).
-- Host actions on `pending_approval`: **Approve** | **Reject/Cancel** | **Revert** | **Reschedule**.
-- **Reschedule** always updates **`expected_arrival_time` + `expected_out_time`** (and `visit_date` when date changes):
-  - **Same day, different time** → keep **`pending_approval`**
-  - **Another day** → set new `visit_date` → status **`scheduled`**
-- **Reschedule never checks anyone in.** Only **Approve** does.
-- Checkout (QR or manual mark) always requires **checkout image**; then **QR expires**.
-- Push notifications — **deferred** (wire later; APIs should still be host-action ready).
-- When AI lands: OCR/plate results always **editable**.
+### 1. Unified Form with Toggle
+- Single registration form with **"Invite (Pre-Reg)"** toggle.
+- **Manual Walk-in**: Photos & ID copy required at creation.
+- **Pre-Reg (Invite)**: Visit date mandatory ($\ge$ today). Photos & ID copy optional at creation. No host notification on creation. Status: `scheduled`.
 
-Aligns with GTMS conventions: app prefix `/visitors/`, location scoping, soft delete, JWT auth, Excel export, `MOBILE_API_CURL.md`.
+### 2. QR Scan on Visit Date (Invited Entry)
+- In **BOTH cases (whether fields/assets are filled or missing)**, scanning an invited visitor's QR code on visit date ALWAYS redirects/navigates the guard to the verification form.
+- QR scan response:
+  ```json
+  {
+    "action": "verify_entry",
+    "type": "verify_entry",
+    "message": "Redirect to verification form. Guard must verify details and capture required photos.",
+    "entry": { ... }
+  }
+  ```
+- **No notification is sent to the host upon QR scan alone**.
 
----
+### 3. Guard Verification & Field Editing
+- On the verification form, **guards ARE ALLOWED to edit/verify all fields** (visitor name, IC/Passport, phone, host, visitor type, purpose, vehicle number, remarks, visit date, ETA, ETO).
+- Guard uploads mandatory assets (`visitor_photo`, `id_proof`).
+- Guard clicks **"Verify & Submit for Host Approval"**.
 
-## Why this order
+### 4. Complete Invite Submit (`POST /visitors/entries/<entry_id>/complete-invite/`)
+- Backend updates any edited metadata fields and attaches uploaded assets.
+- Enforces mandatory assets (`visitor_photo`, `id_proof`).
+- Sets status to `pending_approval`, sets `scanned_by = guard`.
+- **Sends push & inbox notification to the host** (`notify_visitor_pending(entry)`).
 
-| Approach | Verdict |
-|----------|---------|
-| **A. Manual + approval + reschedule first, AI second, invite third** | **Preferred.** Gatehouse + host workflow ships first; invite reuses the same approval/reschedule rules. |
-| **B. AI + manual together early** | Riskier. YOLO/PaddleOCR on critical path. |
+### 5. Host Approval Asset Verification
+- Host approval (`POST /visitors/entries/<entry_id>/approve/`) checks that mandatory assets (`visitor_photo` and `id_proof`) exist on entry.
+- If missing, blocks approval with HTTP 400 error.
 
----
-
-## Core product rules
-
-### Mental model
-
-```text
-CREATE
-  manual  → pending_approval (+ visit_date=today, QR)
-  invite  → scheduled (+ visit_date, QR)   [Iter 3]
-
-ARRIVAL (QR scan)
-  scheduled + visit day     → pending_approval + notify host → awaiting_approval
-  scheduled + future day     → too_early
-  pending_approval           → awaiting_approval
-  reverted                   → reverted (guard resubmit)
-  checked_in                 → checkout
-
-HOST (pending_approval)
-  Approve    → checked_in
-  Reject     → cancelled (= cancel)
-  Revert     → reverted → guard resubmits → pending_approval
-  Reschedule → update arrival + out (+ visit_date if needed)
-               same day → pending_approval
-               other day → scheduled
-
-CHECKOUT
-  checked_in + exit_photo → checked_out + qr_expired
-```
-
-### Manual entry (walk-in) — Iteration 1
-1. Guard fills form (visitor photo + IC copy required; additional images optional multi).
-2. Host is **required**. Optional: expected arrival / expected out.
-3. Submit → `pending_approval` + QR + `visit_date=today`.
-4. Host:
-   - **Approve** (optional override `expected_out_time`) → `checked_in`, `check_in_time=now()`.
-   - **Reject** → `cancelled`, `qr_expired=true` (same as cancel).
-   - **Revert** (+ reason) → `reverted`; guard corrects and **resubmits** (`entry_id`).
-   - **Reschedule** (required: `expected_arrival_time` + `expected_out_time`; optional/explicit `visit_date`):
-     - Same calendar day (location TZ) → keep `pending_approval`.
-     - Later calendar day → `visit_date` = that day, status `scheduled`.
-5. QR while `pending_approval` → **“Not approved yet”**.
-
-### Invitation / preregister — Completed
-1. Create invitation with **`visit_date`** (+ visitor details, host, QR, optional assets) via `POST /visitors/entries/invite/` → status **`scheduled`**. **No host notification** on creation.
-2. Form UI uses a single form with an **"Invitation / Pre-Reg" toggle switch** to show `visit_date`, ETA, and ETO fields.
-3. On visit day, mobile scans QR (`POST /visitors/qr-scan/`):
-   - If `visitor_photo` or `id_proof` is missing: returns `action: "missing_document"`, `type: "missing_document"` redirecting guard to capture form.
-   - If assets exist: status → `pending_approval`, host notified (`action: "awaiting_approval"`).
-4. Guard capture form (`POST /visitors/entries/<id>/complete-invite/`):
-   - Attach missing assets (`visitor_photo`, `id_proof`).
-   - Fields created by host (`visitor_name`, `ic_passport_number`, `host_id`, `visit_date`, ETA, ETO) are **read-only / immutable** for non-host guards.
-   - Upon completion → status `pending_approval` + **host notified**.
-5. Host Approval (`POST /visitors/entries/<id>/approve/`):
-   - Strictly verifies mandatory assets (`visitor_photo` and `id_proof`). Blocks approval with HTTP 400 if assets are missing.
-6. Host Reschedule (`POST /visitors/entries/<id>/reschedule/`):
-   - Updates ETA, ETO, and `visit_date` without requiring assets.
-
-### Checkout (both methods)
-| Method | Rule |
-|--------|------|
-| Scan QR while `checked_in` | Opens checkout; **checkout image required** |
-| Manual “Mark Exit” | Same; **checkout image required** |
-
-After checkout → `checked_out`, `qr_expired=true`.
-
-### QR lifecycle (single token, status-driven)
-| Status | QR scan result |
-|--------|----------------|
-| `pending_approval` | `awaiting_approval` — not approved yet |
-| `reverted` | `reverted` — guard must resubmit |
-| `scheduled` + visit day (missing assets) | `missing_document` — redirect guard to asset capture form |
-| `scheduled` + visit day (assets present) | → `pending_approval` + `awaiting_approval` (start host approval) |
-| `scheduled` + future day | `too_early` |
-| `checked_in` | `checkout` — proceed with image |
-| `checked_out` / `cancelled` / `qr_expired` | Expired / invalid |
-
----
-
-## 1. Database design
-
-Three tables in Django app `visitor` (existing). Key fields on `VisitorEntry`:
-- `status`: pending_approval | reverted | scheduled | checked_in | checked_out | cancelled
-- `expected_arrival_time`, `expected_out_time`, `visit_date`
-- `entry_source`: manual | invitation
-- QR: `qr_token`, `qr_image`, `qr_expired`
-
-**Reject** is a UI label for **cancel** (`cancelled`). No new status.
-
----
-
-## 2. API surface (`/visitors/`)
-
-### Iteration 1 & 3 — Manual + Pre-Reg (Invite) + approval + reschedule + checkout
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/visitors/search/` | Lookup by IC |
-| `POST` | `/visitors/entries/checkin/` | Manual submit / resubmit |
-| `POST` | `/visitors/entries/invite/` | Create Pre-Reg (Invite) entry |
-| `POST` | `/visitors/entries/<id>/complete-invite/` | Guard complete missing assets for invite |
-| `POST` | `/visitors/entries/<id>/approve/` | Host approve = check-in (validates mandatory assets) |
-| `POST` | `/visitors/entries/<id>/revert/` | Host revert |
-| `POST` | `/visitors/entries/<id>/cancel/` | Reject/Cancel |
-| `POST` | `/visitors/entries/<id>/reschedule/` | Host reschedule arrival + out (+ date) |
-| `POST` | `/visitors/entries/<id>/checkout/` | Checkout + exit photo |
-| `POST` | `/visitors/qr-scan/` | Status-driven scan |
-| `GET` | `/visitors/entries/` | List / history |
-| `GET` | `/visitors/entries/export/` | Excel |
-
-### Reschedule body
-```json
-{
-  "expected_arrival_time": "2026-07-22T14:00",
-  "expected_out_time": "2026-07-22T18:00",
-  "visit_date": "2026-07-22"
-}
-```
-- `expected_arrival_time` + `expected_out_time` **required**
-- `visit_date` optional (else from arrival local date)
-- same day → `pending_approval`; future day → `scheduled`
-
-### QR scan (updated)
-- `scheduled` on visit day → set `pending_approval`, return `awaiting_approval`
-- `scheduled` future day → `too_early`
-- No auto check-in from `scheduled`
-
----
-
-## 3–5. AI / Web / Mobile
-
-- Iter 2: OCR helpers (unchanged intent)
-- Web: Visitors tab + Manual Entry; host actions include **Reschedule** and **Reject**
-- Mobile: document in `visitor/MOBILE_API_CURL.md` including reschedule
-- Push notifications: later
-
----
-
-## 6. Schedules
-
-1. **Now:** plan + reschedule API + QR arrival-approval rules + web host Reschedule/Reject on manual  
-2. **Next:** invitation create UI/APIs using the same host actions  
-3. **Later:** Invitations (Iter 3), push notifications
-
-### Iter 2 AI (backend ready for Postman)
-- Endpoint: `POST /visitors/ai/extract/` (`type=id|vehicle`)
-- Docs + Ubuntu/Windows setup: `visitor/docs/VISITOR_AI_OCR.md`
-- Extra pip: `visitor/requirements-visitor-ai.txt`
+### 6. Reschedule
+- Host reschedule does not require assets. Updates visit date, ETA, ETO, and pass images.

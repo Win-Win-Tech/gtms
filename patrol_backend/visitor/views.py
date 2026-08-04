@@ -185,6 +185,40 @@ def _local_date_for_dt(dt, user_tz):
     return local.date() if local else None
 
 
+def _validate_invite_dates_and_times(visit_date, expected_arrival, expected_out, user_tz, today):
+    """
+    Validates visit_date, expected_arrival (ETA), and expected_out (ETO) rules:
+    1. visit_date >= today
+    2. ETA date (in user_tz) == visit_date
+    3. ETO date (in user_tz) >= visit_date
+    4. ETO > ETA
+    Returns error string if invalid, or None if valid.
+    """
+    if not visit_date:
+        return "visit_date is required for invitation"
+
+    if visit_date < today:
+        return "visit_date cannot be in the past"
+
+    tz = user_tz or pytz.UTC
+
+    if expected_arrival:
+        eta_date = expected_arrival.astimezone(tz).date()
+        if eta_date != visit_date:
+            return f"Expected arrival time (ETA) date ({eta_date}) must match the visit date ({visit_date})"
+
+    if expected_out:
+        eto_date = expected_out.astimezone(tz).date()
+        if eto_date < visit_date:
+            return f"Expected out time (ETO) date ({eto_date}) must be on or after the visit date ({visit_date})"
+
+    if expected_arrival and expected_out:
+        if expected_out <= expected_arrival:
+            return "expected_out_time must be after expected_arrival_time"
+
+    return None
+
+
 def _upsert_visitor(location, ic_number, visitor_name, phone_number):
     visitor = (
         Visitor.objects.select_for_update()
@@ -817,46 +851,14 @@ class VisitorRescheduleView(APIView):
         user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
         expected_arrival = _parse_dt(request.data.get("expected_arrival_time"), user_tz)
         expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
-        if not expected_arrival:
-            return Response(
-                {"error": "expected_arrival_time is required"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if not expected_out:
-            return Response(
-                {"error": "expected_out_time is required"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if expected_out <= expected_arrival:
-            return Response(
-                {"error": "expected_out_time must be after expected_arrival_time"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         today = get_user_today(user_tz)
         visit_date = _parse_date(request.data.get("visit_date"))
         if not visit_date:
             visit_date = _local_date_for_dt(expected_arrival, user_tz) or today
 
-        if visit_date < today:
-            return Response(
-                {"error": "visit_date cannot be in the past"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        arrival_day = _local_date_for_dt(expected_arrival, user_tz)
-        out_day = _local_date_for_dt(expected_out, user_tz)
-        # Visit may span multiple days (arrive today, leave later). ETA/ETO must be on/after visit_date.
-        if arrival_day and arrival_day < visit_date:
-            return Response(
-                {
-                    "error": (
-                        "expected_arrival_time cannot be before visit_date "
-                        f"(arrival={arrival_day}, visit_date={visit_date})"
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        val_err = _validate_invite_dates_and_times(visit_date, expected_arrival, expected_out, user_tz, today)
+        if val_err:
+            return Response({"error": val_err}, status=status.HTTP_400_BAD_REQUEST)
         if out_day and out_day < visit_date:
             return Response(
                 {
@@ -1029,29 +1031,11 @@ class VisitorQrScanView(APIView):
                     VisitorAsset.ASSET_ID_PROOF,
                 ),
             )
-            has_photo = _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO)
-            has_id = _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF)
-
-            if not (has_photo and has_id):
-                return Response(
-                    {
-                        "action": "missing_document",
-                        "type": "missing_document",
-                        "message": "Visitor photo or ID proof is missing. Redirect to capture form.",
-                        "entry": VisitorEntrySerializer(entry, context={"request": request}).data,
-                    }
-                )
-
-            entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
-            entry.qr_expired = False
-            entry.scanned_by = request.user
-            entry.save(update_fields=["status", "qr_expired", "scanned_by", "modified_on"])
-            entry = _base_entry_qs().get(id=entry.id)
-            notify_visitor_pending(entry)
             return Response(
                 {
-                    "action": "awaiting_approval",
-                    "message": "Arrival recorded. Waiting for host approval.",
+                    "action": "verify_entry",
+                    "type": "verify_entry",
+                    "message": "Invited visitor arrived. Redirect guard to verification form.",
                     "entry": VisitorEntrySerializer(entry, context={"request": request}).data,
                 }
             )
@@ -1172,19 +1156,16 @@ class VisitorInviteCreateView(APIView):
 
         visit_date_raw = data.get("visit_date")
         visit_date = _parse_date(visit_date_raw)
-        if not visit_date:
-            return Response(
-                {"error": "visit_date is required for invitation"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         today = get_user_today(user_tz)
-        if visit_date < today:
-            return Response(
-                {"error": "visit_date cannot be in the past"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+
+        expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
+        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
+
+        val_err = _validate_invite_dates_and_times(visit_date, expected_arrival, expected_out, user_tz, today)
+        if val_err:
+            return Response({"error": val_err}, status=status.HTTP_400_BAD_REQUEST)
 
         visitor_type = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
         valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
@@ -1198,15 +1179,6 @@ class VisitorInviteCreateView(APIView):
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
         remarks = (data.get("remarks") or "").strip()
-
-        expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
-        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
-
-        if expected_arrival and expected_out and expected_out <= expected_arrival:
-            return Response(
-                {"error": "expected_out_time must be after expected_arrival_time"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         visitor = _upsert_visitor(location, ic_number, visitor_name, phone_number)
 
@@ -1276,40 +1248,56 @@ class VisitorCompleteInviteView(APIView):
             )
 
         data = request.data
-        is_creator_or_host = _is_host_or_super(request, entry) or (
-            entry.created_by_id and str(entry.created_by_id) == str(request.user.id)
-        )
+        ic_number = (data.get("ic_passport_number") or data.get("ic_number") or "").strip()
+        visitor_name = (data.get("visitor_name") or "").strip()
+        phone_number = (data.get("phone_number") or "").strip()
+        if ic_number and visitor_name:
+            visitor = _upsert_visitor(entry.location, ic_number, visitor_name, phone_number)
+            entry.visitor = visitor
+        elif phone_number and entry.visitor and not entry.visitor.phone_number:
+            entry.visitor.phone_number = phone_number
+            entry.visitor.save(update_fields=["phone_number", "modified_on"])
 
-        if is_creator_or_host:
-            ic_number = (data.get("ic_passport_number") or data.get("ic_number") or "").strip()
-            visitor_name = (data.get("visitor_name") or "").strip()
-            phone_number = (data.get("phone_number") or "").strip()
-            if ic_number and visitor_name:
-                visitor = _upsert_visitor(entry.location, ic_number, visitor_name, phone_number)
-                entry.visitor = visitor
+        if data.get("host_id"):
+            host, host_err = _resolve_host(request, data.get("host_id"), entry.location_id)
+            if not host_err and host:
+                entry.host = host
 
-            if data.get("host_id"):
-                host, host_err = _resolve_host(request, data.get("host_id"), entry.location_id)
-                if not host_err and host:
-                    entry.host = host
-
-            if data.get("purpose_of_visit") is not None:
-                entry.purpose_of_visit = data.get("purpose_of_visit").strip()
-            if data.get("visitor_type"):
-                vtype = data.get("visitor_type").strip()
-                if vtype in {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}:
-                    entry.visitor_type = vtype
-            if data.get("remarks") is not None:
-                entry.remarks = data.get("remarks").strip()
-        else:
-            phone_number = (data.get("phone_number") or "").strip()
-            if phone_number and not entry.visitor.phone_number:
-                entry.visitor.phone_number = phone_number
-                entry.visitor.save(update_fields=["phone_number", "modified_on"])
+        if data.get("purpose_of_visit") is not None:
+            entry.purpose_of_visit = data.get("purpose_of_visit").strip()
+        if data.get("visitor_type"):
+            vtype = data.get("visitor_type").strip()
+            if vtype in {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}:
+                entry.visitor_type = vtype
+        if data.get("remarks") is not None:
+            entry.remarks = data.get("remarks").strip()
 
         vehicle_num = (data.get("vehicle_number") or "").strip()
         if vehicle_num:
             entry.vehicle_number = vehicle_num
+
+        user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
+        today = get_user_today(user_tz)
+
+        eff_visit_date = _parse_date(data.get("visit_date")) if data.get("visit_date") else entry.visit_date
+
+        eff_arrival = entry.expected_arrival_time
+        if "expected_arrival_time" in data:
+            arr_val = data.get("expected_arrival_time")
+            eff_arrival = _parse_dt(arr_val, user_tz) if arr_val else None
+
+        eff_out = entry.expected_out_time
+        if "expected_out_time" in data:
+            out_val = data.get("expected_out_time")
+            eff_out = _parse_dt(out_val, user_tz) if out_val else None
+
+        val_err = _validate_invite_dates_and_times(eff_visit_date, eff_arrival, eff_out, user_tz, today)
+        if val_err:
+            return Response({"error": val_err}, status=status.HTTP_400_BAD_REQUEST)
+
+        entry.visit_date = eff_visit_date
+        entry.expected_arrival_time = eff_arrival
+        entry.expected_out_time = eff_out
 
         _save_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO, request.FILES.get("visitor_photo"))
         _save_asset(entry, VisitorAsset.ASSET_ID_PROOF, request.FILES.get("id_proof"))
@@ -1326,13 +1314,26 @@ class VisitorCompleteInviteView(APIView):
             ),
         )
 
-        if not _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO):
+        has_photo = _entry_has_asset(entry, VisitorAsset.ASSET_VISITOR_PHOTO)
+        has_id = _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF)
+
+        # If entry is scheduled and assets are not provided, simply update metadata and stay scheduled
+        if entry.status == VisitorEntry.STATUS_SCHEDULED and not (has_photo and has_id):
+            entry.save()
+            try:
+                refresh_entry_qr_and_pass(entry, regenerate_token=False, save=True)
+            except ImportError:
+                pass
+            entry = _base_entry_qs().get(id=entry.id)
+            return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
+
+        if not has_photo:
             transaction.set_rollback(True)
             return Response(
                 {"error": "visitor_photo is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if not _entry_has_asset(entry, VisitorAsset.ASSET_ID_PROOF):
+        if not has_id:
             transaction.set_rollback(True)
             return Response(
                 {"error": "id_proof is required"},

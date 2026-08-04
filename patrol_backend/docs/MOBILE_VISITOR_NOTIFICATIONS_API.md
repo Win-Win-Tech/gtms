@@ -1122,15 +1122,15 @@ curl -X POST "http://localhost:8000/visitors/qr-scan/" \
 }
 ```
 
-**Example — scheduled → pending on visit day:**
+**Example — scheduled → verify_entry on visit day:**
 
 ```json
 {
-  "action": "awaiting_approval",
-  "message": "Arrival recorded. Waiting for host approval.",
+  "action": "verify_entry",
+  "type": "verify_entry",
+  "message": "Invited visitor arrived. Redirect guard to verification form.",
   "entry": {
-    "status": "pending_approval",
-    "scanned_by": "<GUARD_UUID>",
+    "status": "scheduled",
     "...": "..."
   }
 }

@@ -65,10 +65,10 @@ class VisitorInviteTestCase(TestCase):
             ).exists()
         )
 
-    def test_qr_scan_missing_document_and_completion(self):
+    def test_qr_scan_verify_entry_and_completion(self):
         """
-        Scan QR on visit date when assets are missing returns type missing_document.
-        Completing invite with uploaded assets transitions to pending_approval and notifies host.
+        Scan QR on visit date returns action verify_entry.
+        Completing invite with guard field edits & uploaded assets transitions to pending_approval and notifies host.
         """
         self.client.force_authenticate(user=self.host)
         invite_url = "/visitors/entries/invite/"
@@ -84,14 +84,14 @@ class VisitorInviteTestCase(TestCase):
         entry_id = res_invite.data["id"]
         qr_token = res_invite.data["qr_token"]
 
-        # Guard scans QR on visit date -> assets are missing
+        # Guard scans QR on visit date -> always returns verify_entry action
         self.client.force_authenticate(user=self.guard)
         scan_res = self.client.post("/visitors/qr-scan/", {"qr_token": qr_token}, format="json")
         self.assertEqual(scan_res.status_code, status.HTTP_200_OK)
-        self.assertEqual(scan_res.data["action"], "missing_document")
-        self.assertEqual(scan_res.data["type"], "missing_document")
+        self.assertEqual(scan_res.data["action"], "verify_entry")
+        self.assertEqual(scan_res.data["type"], "verify_entry")
 
-        # Guard completes invite by uploading mandatory assets (photo & ID)
+        # Guard verifies & completes invite by editing details & uploading mandatory assets (photo & ID)
         photo = SimpleUploadedFile("vphoto.jpg", b"photo_content", content_type="image/jpeg")
         id_proof = SimpleUploadedFile("idproof.jpg", b"id_content", content_type="image/jpeg")
         complete_url = f"/visitors/entries/{entry_id}/complete-invite/"
@@ -99,13 +99,12 @@ class VisitorInviteTestCase(TestCase):
             "visitor_photo": photo,
             "id_proof": id_proof,
             "vehicle_number": "MYPLATE123",
-            "visitor_name": "Attempt Hacked Name",  # Should be ignored for non-host guard
+            "visitor_name": "VIP Visitor (Verified)",  # Guards can verify/update fields
         }
         complete_res = self.client.post(complete_url, complete_data, format="multipart")
         self.assertEqual(complete_res.status_code, status.HTTP_200_OK)
         self.assertEqual(complete_res.data["status"], "pending_approval")
-        # Ensure host-filled visitor_name was immutable for guard
-        self.assertEqual(complete_res.data["visitor_name"], "VIP Invited Visitor")
+        self.assertEqual(complete_res.data["visitor_name"], "VIP Visitor (Verified)")
 
         # Verify host received pending_approval notification
         self.assertTrue(
