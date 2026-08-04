@@ -205,7 +205,6 @@ curl -X POST "http://localhost:8000/api/visitors/qr-scan/" \
 | `too_early` | `400 Bad Request` | Visit date is in the future | `visit_date > today` |
 | `verify_entry` | `200 OK` | Guard must verify details & upload photos | `visit_date == today` & `status == scheduled` |
 | `missing_document` | `200 OK` | Photos missing, proceed to upload form | `status == pending_approval` & photos missing |
-| `approve` | `200 OK` | Host can check in visitor | Guard scanned valid pre-approved entry |
 | `checkout` | `200 OK` | Visitor is currently checked in, mark exit | `status == checked_in` |
 | `expired` | `400 Bad Request` | QR code token expired or already checked out | `status == checked_out` or `qr_expired == true` |
 
