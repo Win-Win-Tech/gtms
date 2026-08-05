@@ -17,11 +17,12 @@ from .views import (
     VisitorRevertView,
     VisitorSearchView,
 )
-from .views_ai import VisitorAiExtractView
+from .views_ai import VisitorAiExtractV2View, VisitorAiExtractView
 
 urlpatterns = [
     path("search/", VisitorSearchView.as_view(), name="visitor-search"),
     path("ai/extract/", VisitorAiExtractView.as_view(), name="visitor-ai-extract"),
+    path("ai/extract-v2/", VisitorAiExtractV2View.as_view(), name="visitor-ai-extract-v2"),
     path("qr-scan/", VisitorQrScanView.as_view(), name="visitor-qr-scan"),
     path("entries/", VisitorEntryListView.as_view(), name="visitor-entries-list"),
     path("entries/export/", VisitorEntryExportView.as_view(), name="visitor-entries-export"),

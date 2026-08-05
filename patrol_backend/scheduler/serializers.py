@@ -15,7 +15,7 @@ class LocationSerializer(serializers.ModelSerializer):
         model = Location
         fields = [
             'id', 'sites', 'name', 'address', 'latitude', 'longitude', 
-            'is_qr_scan_enable', 'is_face_attendance_enabled', 
+            'is_qr_scan_enable', 'is_face_attendance_enabled', 'is_ai_extraction_enabled',
             'created_on', 'modified_on', 'is_deleted'
         ]
 

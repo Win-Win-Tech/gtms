@@ -50,6 +50,10 @@ class Location(models.Model):
         default=False,
         help_text="If True, checkin_v4/checkout_v4 require a live face match to the user's enrolled face_photo/encoding.",
     )
+    is_ai_extraction_enabled = models.BooleanField(
+        default=False,
+        help_text="If True, AI OCR auto-extraction (ID/vehicle) is enabled for this location/organization.",
+    )
 
     # Managers
     objects = ActiveManager()        # default: only active

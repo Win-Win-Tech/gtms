@@ -10,6 +10,7 @@
 #     pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
 #     pip install -r visitor/requirements-visitor-ai.txt
 #   Do NOT install only the visitor-ai file first — ultralytics may pull CUDA wheels.
+#pip install rapidocr-onnxruntime
 #
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2
@@ -143,6 +144,7 @@ pytz==2025.2
 PyYAML==6.0.3
 qrcode==8.0
 RapidFuzz==3.14.5
+rapidocr-onnxruntime==1.4.4
 redis==7.0.1
 reportlab==4.4.6
 requests==2.34.2
