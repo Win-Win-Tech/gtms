@@ -243,8 +243,26 @@ def _upsert_visitor(location, ic_number, visitor_name, phone_number):
     )
 
 
+def _is_host_approval_enabled(location_id=None):
+    """
+    Reads SiteSetting key 'is_host_approve_enabled' for the given location_id.
+    Default value is 'true'.
+    Returns False if value is 'false', '0', 'no', or 'off', else True.
+    """
+    try:
+        from scheduler.models import SiteSetting
+        val = SiteSetting.get_setting("is_host_approve_enabled", location_id=location_id, default_value="true")
+        if val is None:
+            return True
+        return str(val).strip().lower() not in ("false", "0", "no", "off")
+    except Exception:
+        return True
+
+
 def _resolve_host(request, host_id, location_id):
     if not host_id:
+        if not _is_host_approval_enabled(location_id):
+            return None, None
         return None, "host_id is required"
     try:
         host = User.objects.get(id=host_id, is_deleted=False)
@@ -515,6 +533,10 @@ class VisitorCheckInView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        approval_enabled = _is_host_approval_enabled(location_id)
+        initial_status = VisitorEntry.STATUS_PENDING_APPROVAL if approval_enabled else VisitorEntry.STATUS_CHECKED_IN
+        check_in_dt = None if approval_enabled else timezone.now()
+
         try:
             if entry:
                 entry.visitor = visitor
@@ -526,7 +548,9 @@ class VisitorCheckInView(APIView):
                 entry.expected_arrival_time = expected_arrival
                 entry.expected_out_time = expected_out
                 entry.visit_date = visit_date_today
-                entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
+                entry.status = initial_status
+                if check_in_dt:
+                    entry.check_in_time = check_in_dt
                 entry.revert_reason = ""
                 entry.qr_expired = False
                 entry.save()
@@ -539,7 +563,8 @@ class VisitorCheckInView(APIView):
                     location=location,
                     entry_source=VisitorEntry.ENTRY_MANUAL,
                     visitor_type=visitor_type,
-                    status=VisitorEntry.STATUS_PENDING_APPROVAL,
+                    status=initial_status,
+                    check_in_time=check_in_dt,
                     purpose_of_visit=purpose,
                     vehicle_number=vehicle_number,
                     remarks=remarks,
@@ -606,7 +631,8 @@ class VisitorCheckInView(APIView):
             .exclude(id=entry.id)
             .exists()
         )
-        notify_visitor_pending(entry)
+        if approval_enabled:
+            notify_visitor_pending(entry)
         payload = VisitorEntrySerializer(entry, context={"request": request}).data
         payload["returning_visitor"] = returning_visitor
         return Response(
@@ -934,8 +960,15 @@ class VisitorCheckOutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        exit_photo = request.FILES.get("exit_photo") or request.FILES.get("checkout_image")
-        if not exit_photo:
+        exit_photos = (
+            request.FILES.getlist("exit_photo")
+            or request.FILES.getlist("exit_photos")
+            or request.FILES.getlist("checkout_image")
+            or request.FILES.getlist("checkout_images")
+        )
+        single_exit_photo = request.FILES.get("exit_photo") or request.FILES.get("checkout_image")
+
+        if not exit_photos and not single_exit_photo:
             return Response(
                 {"error": "Checkout image (exit_photo) is required"},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -945,7 +978,11 @@ class VisitorCheckOutView(APIView):
         entry.check_out_time = timezone.now()
         entry.qr_expired = True
         entry.save(update_fields=["status", "check_out_time", "qr_expired", "modified_on"])
-        _save_asset(entry, VisitorAsset.ASSET_EXIT_PHOTO, exit_photo)
+
+        if exit_photos:
+            _save_assets_many(entry, VisitorAsset.ASSET_EXIT_PHOTO, exit_photos)
+        elif single_exit_photo:
+            _save_asset(entry, VisitorAsset.ASSET_EXIT_PHOTO, single_exit_photo)
 
         entry = _base_entry_qs().get(id=entry.id)
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
@@ -1340,7 +1377,13 @@ class VisitorCompleteInviteView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
+        approval_enabled = _is_host_approval_enabled(entry.location_id)
+        if approval_enabled:
+            entry.status = VisitorEntry.STATUS_PENDING_APPROVAL
+        else:
+            entry.status = VisitorEntry.STATUS_CHECKED_IN
+            entry.check_in_time = timezone.now()
+
         entry.scanned_by = request.user
         entry.qr_expired = False
         entry.save()
@@ -1351,6 +1394,7 @@ class VisitorCompleteInviteView(APIView):
             pass
 
         entry = _base_entry_qs().get(id=entry.id)
-        notify_visitor_pending(entry)
+        if approval_enabled:
+            notify_visitor_pending(entry)
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
 

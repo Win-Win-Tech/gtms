@@ -6,6 +6,8 @@ from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
+from scheduler.models import SiteSetting
+from django.db.models import Q, F
 from .models import User, Role
 from .serializers import (
     UserSerializer,
@@ -80,6 +82,22 @@ def build_login_client_fields(request, user):
 
     is_qr_scan_enabled = getattr(user.location, "is_qr_scan_enable", False) if user.location else False
 
+    site_settings_dict = {}
+    is_host_approval_enabled = True
+    try:
+        loc_id = user.location_id if user.location_id else None
+        settings_qs = SiteSetting.objects.filter(is_deleted=False).filter(
+            Q(location_id=loc_id) | Q(location_id__isnull=True)
+        ).order_by(F('location_id').asc(nulls_first=True))
+
+        for s in settings_qs:
+            site_settings_dict[s.key] = s.value
+
+        val = site_settings_dict.get("is_host_approve_enabled", "true")
+        is_host_approval_enabled = str(val).strip().lower() not in ("false", "0", "no", "off")
+    except Exception:
+        is_host_approval_enabled = True
+
     return {
         "user_id": str(user.id),
         "role": user.role,
@@ -89,6 +107,7 @@ def build_login_client_fields(request, user):
         "location_id": str(user.location.id) if user.location else None,
         "timezone": user.timezone,
         "is_qr_scan_enabled": is_qr_scan_enabled,
+        "is_host_approve_enabled": is_host_approval_enabled,
     }
 
 
