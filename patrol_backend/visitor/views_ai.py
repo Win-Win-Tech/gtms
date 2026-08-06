@@ -78,11 +78,11 @@ class VisitorAiExtractView(APIView):
             or ""
         ).strip().lower()
 
-        if not _is_ai_extraction_enabled_for_request(request):
-            return Response(
+        # if not _is_ai_extraction_enabled_for_request(request):
+        return Response(
                 _slim_response(extract_type, found=False),
                 status=status.HTTP_400_BAD_REQUEST,
-            )
+        )
 
         uploaded = (
             request.FILES.get("image")
