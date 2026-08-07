@@ -11,17 +11,24 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any, Dict
 
+import cv2
 from .detect import crop_with_padding, detect_id_region, detect_vehicles, warp_document_if_possible
-from .parse import extract_id_number, extract_vehicle_number
+from .parse import extract_id_name, extract_id_number, extract_vehicle_number
 from .preprocess import load_and_resize_image, pil_to_bgr_ndarray
 from .rapid_ocr_engine import ensure_rapid_ocr_ready, run_rapid_ocr
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SEC = float(os.environ.get("VISITOR_AI_TIMEOUT_SEC", "30"))
+DEFAULT_TIMEOUT_SEC = float(os.environ.get("VISITOR_AI_TIMEOUT_SEC", "25"))
 MIN_OCR_CONF = float(os.environ.get("VISITOR_AI_MIN_OCR_CONF", "0.45"))
 MAX_CONCURRENT = int(os.environ.get("VISITOR_AI_MAX_CONCURRENT", "2"))
+# Pre-resize longest side before OCR (smaller = faster on CPU).
+ID_MAX_SIDE = int(os.environ.get("VISITOR_AI_ID_MAX_SIDE", "800"))
+# Hard cap on RapidOCR calls per ID request (each ~1–3s on CPU).
+MAX_ID_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_ID_OCR_PASSES", "2"))
 _ai_sema_v2 = threading.Semaphore(max(1, MAX_CONCURRENT))
+# Reuse one worker pool instead of creating/destroying per request.
+_timeout_pool = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT))
 
 
 def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
@@ -51,36 +58,40 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
     timeout = DEFAULT_TIMEOUT_SEC
     t0 = time.monotonic()
     try:
+        from .memory import touch_activity
+
         ensure_rapid_ocr_ready()
+        touch_activity()
 
         def _run():
-            img = load_and_resize_image(file_obj, max_side=1024)
+            img = load_and_resize_image(file_obj, max_side=ID_MAX_SIDE)
             bgr = pil_to_bgr_ndarray(img)
             if extract_type == "id":
                 return _pipeline_id_v2(bgr, t0)
             return _pipeline_vehicle_v2(bgr, t0)
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(_run)
-            try:
-                result = fut.result(timeout=timeout)
-                return result
-            except FuturesTimeout:
-                logger.warning("Visitor RapidOCR v2 timed out after %ss type=%s", timeout, extract_type)
-                return {
-                    "type": extract_type,
-                    "found": False,
-                    "reason": "timeout",
-                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
-                }
-            except ValueError as exc:
-                return {
-                    "type": extract_type,
-                    "found": False,
-                    "reason": "bad_image",
-                    "error": str(exc),
-                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
-                }
+        fut = _timeout_pool.submit(_run)
+        try:
+            result = fut.result(timeout=timeout)
+            touch_activity()
+            return result
+        except FuturesTimeout:
+            logger.warning("Visitor RapidOCR v2 timed out after %ss type=%s", timeout, extract_type)
+            touch_activity()
+            return {
+                "type": extract_type,
+                "found": False,
+                "reason": "timeout",
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }
+        except ValueError as exc:
+            return {
+                "type": extract_type,
+                "found": False,
+                "reason": "bad_image",
+                "error": str(exc),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }
     finally:
         _ai_sema_v2.release()
 
@@ -205,6 +216,21 @@ def _prepare_warp_variants(bgr, detect_meta: Dict[str, Any]):
     ]
 
 
+def _prepare_rotation_variants(bgr):
+    # Only rotate if image is vertical (height > width)
+    if bgr.shape[0] <= bgr.shape[1]:
+        return []
+    try:
+        r90 = cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+        r270 = cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return [
+            (r90, {"detector": "rotated_90_cw", "confidence": None, "box": None, "frame_fill_ratio": 1.0}),
+            (r270, {"detector": "rotated_90_ccw", "confidence": None, "box": None, "frame_fill_ratio": 1.0}),
+        ]
+    except Exception:
+        return []
+
+
 def _prepare_enhanced_roi_variant(roi, detect_meta: Dict[str, Any]):
     return [
         (
@@ -239,25 +265,55 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
         }
 
     attempts = []
+    ocr_passes = 0
 
-    def _add_attempt(image, meta):
+    def _add_attempt(image, meta) -> bool:
+        """Run OCR once. Returns True if we should stop (got id+name)."""
+        nonlocal ocr_passes
+        if ocr_passes >= MAX_ID_OCR_PASSES:
+            return True
+        ocr_passes += 1
         lines_local = run_rapid_ocr(image)
         parsed_local = extract_id_number(lines_local) if lines_local else None
-        attempts.append((lines_local, parsed_local, meta))
+        name_local = (
+            extract_id_name(lines_local, parsed_local[2])
+            if (lines_local and parsed_local)
+            else None
+        )
+        attempts.append((lines_local, parsed_local, name_local, meta))
+        return bool(parsed_local and name_local and parsed_local[1] >= MIN_OCR_CONF)
 
-    # Pass 1: Primary ROI
-    _add_attempt(roi, detect_meta)
-    _first_lines, first_parsed, first_meta = attempts[0]
+    # Pass 1: primary ROI (or full frame)
+    done = _add_attempt(roi, detect_meta)
+    _first_lines, first_parsed, first_name, first_meta = attempts[0]
 
-    need_fallback_passes = (
-        not first_parsed
-        or _should_reject_ambiguous_id(first_parsed[2], first_parsed[1], first_meta)
-        or first_parsed[1] < max(MIN_OCR_CONF + 0.1, 0.65)
-    )
-
-    if need_fallback_passes:
-        if box is not None:
-            _add_attempt(
+    # Good enough on first pass — skip expensive fallbacks
+    if done or (
+        first_parsed
+        and first_name
+        and not _should_reject_ambiguous_id(first_parsed[2], first_parsed[1], first_meta)
+        and first_parsed[1] >= MIN_OCR_CONF
+    ):
+        pass
+    elif ocr_passes < MAX_ID_OCR_PASSES:
+        # Pass 2 only: pick the single most useful fallback (not a chain of 5+)
+        fallback = None
+        # Vertical / phone photos of landscape cards → rotate first
+        if bgr.shape[0] > bgr.shape[1] * 1.05:
+            try:
+                fallback = (
+                    cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE),
+                    {
+                        "detector": "rotated_90_cw",
+                        "confidence": None,
+                        "box": None,
+                        "frame_fill_ratio": 1.0,
+                    },
+                )
+            except Exception:
+                fallback = None
+        if fallback is None and box is not None:
+            fallback = (
                 bgr,
                 {
                     "detector": "full_frame_fallback",
@@ -266,34 +322,36 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
                     "frame_fill_ratio": 1.0,
                 },
             )
+        if fallback is None:
+            inset_list = _prepare_inset_variant(bgr)
+            if inset_list:
+                fallback = inset_list[0]
+        if fallback is not None:
+            _add_attempt(fallback[0], fallback[1])
 
-        fallback_variants = []
-        fallback_variants.extend(_prepare_inset_variant(bgr))
-        fallback_variants.extend(_prepare_warp_variants(bgr, detect_meta))
-        if box is not None:
-            fallback_variants.extend(_prepare_enhanced_roi_variant(roi, detect_meta))
-
-        for image, meta in fallback_variants:
-            _add_attempt(image, meta)
-
-    lines = next((lines_local for lines_local, _, _ in attempts if lines_local), [])
+    lines = next((lines_local for lines_local, _, _, _ in attempts if lines_local), [])
     parsed = None
+    extracted_name = None
     best_meta = detect_meta
     best_score = float("-inf")
-    for lines_local, parsed_local, meta_local in attempts:
+
+    for lines_local, parsed_local, name_local, meta_local in attempts:
         if not lines_local:
             continue
         if parsed_local:
-            score = _id_attempt_rank(parsed_local, meta_local)
+            score = _id_attempt_rank(parsed_local, meta_local) + (0.25 if name_local else 0.0)
             if score > best_score:
                 best_score = score
                 lines = lines_local
                 parsed = parsed_local
+                extracted_name = name_local
                 best_meta = meta_local
         elif not lines:
             lines = lines_local
 
     detect_meta = best_meta
+    if isinstance(detect_meta, dict):
+        detect_meta = {**detect_meta, "ocr_passes": ocr_passes}
 
     if not lines or not parsed:
         return {
@@ -302,6 +360,7 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
             "reason": "no_id_document",
             "detect": detect_meta,
             "ocr_preview": [t for t, _ in lines[:5]] if lines else [],
+            "raw_text": [t for t, _ in lines] if lines else [],
             "elapsed_ms": _elapsed_ms(t0),
             "engine": "rapidocr",
         }
@@ -313,16 +372,22 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
             "found": False,
             "reason": "low_confidence",
             "detect": detect_meta,
+            "raw_text": [t for t, _ in lines] if lines else [],
             "elapsed_ms": _elapsed_ms(t0),
             "engine": "rapidocr",
         }
+
+    if not extracted_name and lines:
+        extracted_name = extract_id_name(lines, hint)
 
     return {
         "type": "id",
         "found": True,
         "id_number": id_number,
+        "name": extracted_name,
         "confidence": round(float(conf), 3),
         "document_hint": hint,
+        "raw_text": [t for t, _ in lines],
         "detect": detect_meta,
         "elapsed_ms": _elapsed_ms(t0),
         "engine": "rapidocr",
@@ -330,63 +395,83 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
 
 
 def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
+    # Fast path: most visitor plate photos are close-ups — OCR full frame first
+    # and skip YOLO unless needed (YOLO load/infer is costly on CPU).
+    detect_meta = {"detector": "full_frame_fast"}
+    lines = run_rapid_ocr(bgr)
+    if lines:
+        parsed = extract_vehicle_number(lines)
+        if parsed and parsed[1] >= MIN_OCR_CONF:
+            return {
+                "type": "vehicle",
+                "found": True,
+                "vehicle_number": parsed[0],
+                "confidence": round(float(parsed[1]), 3),
+                "detect": detect_meta,
+                "elapsed_ms": _elapsed_ms(t0),
+                "engine": "rapidocr",
+            }
+
+    attempts = [(lines, extract_vehicle_number(lines) if lines else None)]
+
+    # One more cheap crop before YOLO
+    inset = _crop_inset(bgr, inset_ratio=0.06)
+    if inset is not bgr:
+        lines_i = run_rapid_ocr(inset)
+        parsed_i = extract_vehicle_number(lines_i) if lines_i else None
+        if parsed_i and parsed_i[1] >= MIN_OCR_CONF:
+            return {
+                "type": "vehicle",
+                "found": True,
+                "vehicle_number": parsed_i[0],
+                "confidence": round(float(parsed_i[1]), 3),
+                "detect": {"detector": "full_frame_inset"},
+                "elapsed_ms": _elapsed_ms(t0),
+                "engine": "rapidocr",
+            }
+        attempts.append((lines_i, parsed_i))
+
     vehicles = detect_vehicles(bgr)
-    if not vehicles:
+    detect_meta = {"detector": "yolov8n", "vehicle_count": len(vehicles)}
+
+    if vehicles:
+        best = vehicles[0]
+        detect_meta.update({
+            "label": best.label,
+            "confidence": round(best.confidence, 3),
+            "box": [best.x1, best.y1, best.x2, best.y2],
+        })
+        roi = crop_with_padding(bgr, best, pad_ratio=0.05)
+        h_roi = roi.shape[0]
+        bottom_roi = roi[int(h_roi * 0.45):, :] if h_roi > 40 else roi
+
+        lines_bottom = run_rapid_ocr(bottom_roi)
+        parsed_bottom = extract_vehicle_number(lines_bottom) if lines_bottom else None
+        if parsed_bottom and parsed_bottom[1] >= MIN_OCR_CONF:
+            return {
+                "type": "vehicle",
+                "found": True,
+                "vehicle_number": parsed_bottom[0],
+                "confidence": round(float(parsed_bottom[1]), 3),
+                "detect": detect_meta,
+                "elapsed_ms": _elapsed_ms(t0),
+                "engine": "rapidocr",
+            }
+        attempts.append((lines_bottom, parsed_bottom))
+
+    best_candidate = None
+    best_conf = float("-inf")
+    for lines, parsed in attempts:
+        if parsed and parsed[1] > best_conf:
+            best_conf = parsed[1]
+            best_candidate = parsed[0]
+
+    if best_candidate and best_conf >= 0.35:
         return {
             "type": "vehicle",
-            "found": False,
-            "reason": "no_vehicle",
-            "elapsed_ms": _elapsed_ms(t0),
-            "engine": "rapidocr",
-        }
-
-    best = vehicles[0]
-    roi = crop_with_padding(bgr, best, pad_ratio=0.05)
-    h = roi.shape[0]
-    bottom = roi[int(h * 0.45) :, :] if h > 40 else roi
-
-    lines = run_rapid_ocr(bottom)
-    if not lines:
-        lines = run_rapid_ocr(roi)
-
-    detect_meta = {
-        "detector": "yolov8n",
-        "label": best.label,
-        "confidence": round(best.confidence, 3),
-        "box": [best.x1, best.y1, best.x2, best.y2],
-        "vehicle_count": len(vehicles),
-    }
-
-    if not lines:
-        return {
-            "type": "vehicle",
-            "found": False,
-            "reason": "no_vehicle",
-            "detect": detect_meta,
-            "detail": "vehicle_seen_but_no_text",
-            "elapsed_ms": _elapsed_ms(t0),
-            "engine": "rapidocr",
-        }
-
-    parsed = extract_vehicle_number(lines)
-    if not parsed:
-        return {
-            "type": "vehicle",
-            "found": False,
-            "reason": "no_vehicle",
-            "detect": detect_meta,
-            "detail": "vehicle_seen_but_no_plate",
-            "ocr_preview": [t for t, _ in lines[:5]],
-            "elapsed_ms": _elapsed_ms(t0),
-            "engine": "rapidocr",
-        }
-
-    plate, conf = parsed
-    if conf < MIN_OCR_CONF:
-        return {
-            "type": "vehicle",
-            "found": False,
-            "reason": "low_confidence",
+            "found": True,
+            "vehicle_number": best_candidate,
+            "confidence": round(float(best_conf), 3),
             "detect": detect_meta,
             "elapsed_ms": _elapsed_ms(t0),
             "engine": "rapidocr",
@@ -394,9 +479,8 @@ def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
 
     return {
         "type": "vehicle",
-        "found": True,
-        "vehicle_number": plate,
-        "confidence": round(float(conf), 3),
+        "found": False,
+        "reason": "no_vehicle" if not vehicles else "no_plate_found",
         "detect": detect_meta,
         "elapsed_ms": _elapsed_ms(t0),
         "engine": "rapidocr",

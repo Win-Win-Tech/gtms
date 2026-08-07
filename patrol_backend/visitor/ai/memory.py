@@ -12,9 +12,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# After this many idle seconds, drop PaddleOCR / YOLO from RAM.
-# Set VISITOR_AI_IDLE_UNLOAD_SEC=0 to keep models warm forever.
-IDLE_UNLOAD_SEC = float(os.environ.get("VISITOR_AI_IDLE_UNLOAD_SEC", "300"))
+# After this many idle seconds, drop YOLO / PaddleOCR from RAM.
+# RapidOCR stays warm (main ID path) — unload it only via unload_rapid_ocr().
+# Set VISITOR_AI_IDLE_UNLOAD_SEC=0 to keep all models warm forever.
+IDLE_UNLOAD_SEC = float(os.environ.get("VISITOR_AI_IDLE_UNLOAD_SEC", "900"))
 
 _lock = threading.Lock()
 _last_used = 0.0
@@ -48,7 +49,7 @@ def _idle_unload() -> None:
 
 
 def unload_all_models() -> None:
-    """Drop warm models and ask the allocator to return memory."""
+    """Drop warm YOLO/Paddle models. RapidOCR stays loaded for fast ID OCR."""
     try:
         from .ocr_engine import unload_ocr
 

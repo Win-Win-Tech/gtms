@@ -84,6 +84,9 @@ def build_login_client_fields(request, user):
 
     site_settings_dict = {}
     is_host_approval_enabled = True
+    visitor_default_purpose = ""
+    visitor_default_remarks = ""
+    visitor_expected_out_hours = ""
     try:
         loc_id = user.location_id if user.location_id else None
         settings_qs = SiteSetting.objects.filter(is_deleted=False).filter(
@@ -95,6 +98,25 @@ def build_login_client_fields(request, user):
 
         val = site_settings_dict.get("is_host_approve_enabled", "true")
         is_host_approval_enabled = str(val).strip().lower() not in ("false", "0", "no", "off")
+
+        visitor_default_purpose = str(
+            site_settings_dict.get("visitor_default_purpose_of_visit") or ""
+        ).strip()
+        visitor_default_remarks = str(
+            site_settings_dict.get("visitor_default_remarks") or ""
+        ).strip()
+        # Hours offset as string number, e.g. "2" / "3" / "6" (empty if unset)
+        hours_raw = str(site_settings_dict.get("visitor_expected_out_hours") or "").strip()
+        if hours_raw:
+            try:
+                hours_val = float(hours_raw)
+                if hours_val >= 0:
+                    # Keep clean string (2 not 2.0 when whole)
+                    visitor_expected_out_hours = (
+                        str(int(hours_val)) if hours_val == int(hours_val) else str(hours_val)
+                    )
+            except (TypeError, ValueError):
+                visitor_expected_out_hours = ""
     except Exception:
         is_host_approval_enabled = True
 
@@ -108,6 +130,9 @@ def build_login_client_fields(request, user):
         "timezone": user.timezone,
         "is_qr_scan_enabled": is_qr_scan_enabled,
         "is_host_approve_enabled": is_host_approval_enabled,
+        "visitor_default_purpose_of_visit": visitor_default_purpose,
+        "visitor_default_remarks": visitor_default_remarks,
+        "visitor_expected_out_hours": visitor_expected_out_hours,
     }
 
 

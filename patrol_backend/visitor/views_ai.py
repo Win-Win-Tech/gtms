@@ -18,22 +18,27 @@ from .ai import extract_from_upload
 from .utils import resolve_location_for_request
 
 
-def _slim_response(extract_type, result=None, found=False, number=None, confidence=None):
-    """Public API shape — only type / found / number / confidence."""
+def _slim_response(extract_type, result=None, found=False, number=None, confidence=None, name=None, raw_text=None):
+    """Public API shape — type / found / number / name / confidence / raw_text."""
     if result is not None:
         found = bool(result.get("found"))
+        raw_text = result.get("raw_text") or []
         if found:
             number = result.get("id_number") or result.get("vehicle_number") or result.get("number")
+            name = result.get("name")
             confidence = result.get("confidence")
         else:
             number = None
+            name = None
             confidence = None
         extract_type = result.get("type") or extract_type
     return {
         "type": extract_type or None,
         "found": found,
         "number": number,
+        "name": name,
         "confidence": confidence,
+        "raw_text": raw_text or [],
     }
 
 
