@@ -7,6 +7,8 @@ Response (always):
   { "type", "found", "number", "confidence" }
 """
 
+import logging
+
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -16,6 +18,8 @@ from rest_framework.views import APIView
 from scheduler.models import Location
 from .ai import extract_from_upload
 from .utils import resolve_location_for_request
+
+logger = logging.getLogger(__name__)
 
 
 def _slim_response(extract_type, result=None, found=False, number=None, confidence=None, name=None, raw_text=None):
@@ -141,6 +145,11 @@ class VisitorAiExtractV2View(APIView):
         ).strip().lower()
 
         if not _is_ai_extraction_enabled_for_request(request):
+            logger.info(
+                "AI extract-v2 rejected: ai_disabled type=%s user=%s",
+                extract_type,
+                getattr(request.user, "id", None),
+            )
             return Response(
                 _slim_response(extract_type, found=False),
                 status=status.HTTP_400_BAD_REQUEST,
@@ -153,16 +162,34 @@ class VisitorAiExtractV2View(APIView):
             or request.FILES.get("vehicle_image")
         )
         if not uploaded:
+            logger.info(
+                "AI extract-v2 rejected: no_image type=%s user=%s",
+                extract_type,
+                getattr(request.user, "id", None),
+            )
             return Response(
                 _slim_response(extract_type, found=False),
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        name = getattr(uploaded, "name", "") or ""
+        content_type = getattr(uploaded, "content_type", "") or ""
+        size = getattr(uploaded, "size", None)
+        logger.info(
+            "AI extract-v2 request type=%s user=%s file_name=%s content_type=%s size_bytes=%s",
+            extract_type,
+            getattr(request.user, "id", None),
+            name,
+            content_type,
+            size,
+        )
 
         try:
             from .ai.pipeline_v2 import extract_from_upload_v2
 
             result = extract_from_upload_v2(uploaded, extract_type)
         except ImportError as exc:
+            logger.exception("AI extract-v2 ImportError type=%s", extract_type)
             return Response(
                 {
                     **_slim_response(extract_type, found=False),
@@ -171,6 +198,7 @@ class VisitorAiExtractV2View(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         except Exception as exc:
+            logger.exception("AI extract-v2 failed type=%s file_name=%s", extract_type, name)
             return Response(
                 {
                     **_slim_response(extract_type, found=False),
@@ -178,6 +206,20 @@ class VisitorAiExtractV2View(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+        logger.info(
+            "AI extract-v2 response type=%s found=%s number=%s name=%s conf=%s reason=%s "
+            "elapsed_ms=%s detect=%s file_name=%s",
+            result.get("type") or extract_type,
+            result.get("found"),
+            result.get("id_number") or result.get("vehicle_number") or result.get("number"),
+            result.get("name"),
+            result.get("confidence"),
+            result.get("reason"),
+            result.get("elapsed_ms"),
+            result.get("detect"),
+            name,
+        )
 
         http_status = status.HTTP_200_OK
         if result.get("reason") == "invalid_type":

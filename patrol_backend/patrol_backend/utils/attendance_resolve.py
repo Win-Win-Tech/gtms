@@ -334,6 +334,10 @@ def apply_v4_attendance_after_log(
     elif action_mode == "checkout" and raw_bytes is not None:
         attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
 
+    # New/open shift day: drop leftover checkout photo from a previously reused row
+    if action_mode == "checkin" and attendance.checkout_time is None and attendance.checkout_image:
+        attendance.checkout_image = None
+
     attendance.save()
 
     if refresh_fn:

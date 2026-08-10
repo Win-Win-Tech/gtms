@@ -31,6 +31,17 @@ _ai_sema_v2 = threading.Semaphore(max(1, MAX_CONCURRENT))
 _timeout_pool = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT))
 
 
+def _ocr_lines_preview(lines, limit: int = 20) -> str:
+    """Compact OCR dump for logs (text + confidence)."""
+    if not lines:
+        return "[]"
+    parts = []
+    for text, conf in lines[:limit]:
+        parts.append(f"{text!r}:{float(conf):.2f}")
+    extra = f" …(+{len(lines) - limit})" if len(lines) > limit else ""
+    return "[" + "; ".join(parts) + "]" + extra
+
+
 def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
     """
     Public entry point for RapidOCR (v2 API).
@@ -39,6 +50,7 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
     """
     extract_type = (extract_type or "").strip().lower()
     if extract_type not in ("id", "vehicle"):
+        logger.info("extract-v2 invalid_type=%s", extract_type)
         return {
             "type": extract_type or None,
             "found": False,
@@ -48,6 +60,7 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
 
     acquired = _ai_sema_v2.acquire(blocking=False)
     if not acquired:
+        logger.warning("extract-v2 busy type=%s", extract_type)
         return {
             "type": extract_type,
             "found": False,
@@ -66,6 +79,15 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
         def _run():
             img = load_and_resize_image(file_obj, max_side=ID_MAX_SIDE)
             bgr = pil_to_bgr_ndarray(img)
+            h, w = bgr.shape[:2]
+            logger.info(
+                "extract-v2 image type=%s resized=%sx%s max_side=%s elapsed_ms=%s",
+                extract_type,
+                w,
+                h,
+                ID_MAX_SIDE,
+                _elapsed_ms(t0),
+            )
             if extract_type == "id":
                 return _pipeline_id_v2(bgr, t0)
             return _pipeline_vehicle_v2(bgr, t0)
@@ -74,6 +96,16 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
         try:
             result = fut.result(timeout=timeout)
             touch_activity()
+            logger.info(
+                "extract-v2 done type=%s found=%s reason=%s conf=%s number=%s name=%s elapsed_ms=%s",
+                extract_type,
+                result.get("found"),
+                result.get("reason"),
+                result.get("confidence"),
+                result.get("id_number") or result.get("vehicle_number"),
+                result.get("name"),
+                result.get("elapsed_ms"),
+            )
             return result
         except FuturesTimeout:
             logger.warning("Visitor RapidOCR v2 timed out after %ss type=%s", timeout, extract_type)
@@ -85,6 +117,7 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
                 "elapsed_ms": int((time.monotonic() - t0) * 1000),
             }
         except ValueError as exc:
+            logger.warning("extract-v2 bad_image type=%s err=%s", extract_type, exc)
             return {
                 "type": extract_type,
                 "found": False,
@@ -397,34 +430,54 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
 def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
     # Fast path: most visitor plate photos are close-ups — OCR full frame first
     # and skip YOLO unless needed (YOLO load/infer is costly on CPU).
+    h, w = bgr.shape[:2]
     detect_meta = {"detector": "full_frame_fast"}
-    lines = run_rapid_ocr(bgr)
-    if lines:
-        parsed = extract_vehicle_number(lines)
-        if parsed and parsed[1] >= MIN_OCR_CONF:
-            return {
-                "type": "vehicle",
-                "found": True,
-                "vehicle_number": parsed[0],
-                "confidence": round(float(parsed[1]), 3),
-                "detect": detect_meta,
-                "elapsed_ms": _elapsed_ms(t0),
-                "engine": "rapidocr",
-            }
+    logger.info("vehicle-v2 start frame=%sx%s", w, h)
 
-    attempts = [(lines, extract_vehicle_number(lines) if lines else None)]
+    lines = run_rapid_ocr(bgr)
+    parsed = extract_vehicle_number(lines) if lines else None
+    logger.info(
+        "vehicle-v2 full_frame ocr_lines=%s parsed=%s conf=%s texts=%s",
+        len(lines or []),
+        parsed[0] if parsed else None,
+        round(float(parsed[1]), 3) if parsed else None,
+        _ocr_lines_preview(lines),
+    )
+    if parsed and parsed[1] >= MIN_OCR_CONF:
+        logger.info("vehicle-v2 hit=full_frame plate=%s conf=%.3f", parsed[0], parsed[1])
+        return {
+            "type": "vehicle",
+            "found": True,
+            "vehicle_number": parsed[0],
+            "confidence": round(float(parsed[1]), 3),
+            "raw_text": [t for t, _ in lines],
+            "detect": detect_meta,
+            "elapsed_ms": _elapsed_ms(t0),
+            "engine": "rapidocr",
+        }
+
+    attempts = [(lines, parsed)]
 
     # One more cheap crop before YOLO
     inset = _crop_inset(bgr, inset_ratio=0.06)
     if inset is not bgr:
         lines_i = run_rapid_ocr(inset)
         parsed_i = extract_vehicle_number(lines_i) if lines_i else None
+        logger.info(
+            "vehicle-v2 inset ocr_lines=%s parsed=%s conf=%s texts=%s",
+            len(lines_i or []),
+            parsed_i[0] if parsed_i else None,
+            round(float(parsed_i[1]), 3) if parsed_i else None,
+            _ocr_lines_preview(lines_i),
+        )
         if parsed_i and parsed_i[1] >= MIN_OCR_CONF:
+            logger.info("vehicle-v2 hit=inset plate=%s conf=%.3f", parsed_i[0], parsed_i[1])
             return {
                 "type": "vehicle",
                 "found": True,
                 "vehicle_number": parsed_i[0],
                 "confidence": round(float(parsed_i[1]), 3),
+                "raw_text": [t for t, _ in lines_i],
                 "detect": {"detector": "full_frame_inset"},
                 "elapsed_ms": _elapsed_ms(t0),
                 "engine": "rapidocr",
@@ -433,6 +486,19 @@ def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
 
     vehicles = detect_vehicles(bgr)
     detect_meta = {"detector": "yolov8n", "vehicle_count": len(vehicles)}
+    logger.info(
+        "vehicle-v2 yolo count=%s boxes=%s",
+        len(vehicles),
+        [
+            {
+                "label": v.label,
+                "conf": round(v.confidence, 3),
+                "box": [v.x1, v.y1, v.x2, v.y2],
+                "area": v.area,
+            }
+            for v in vehicles[:3]
+        ],
+    )
 
     if vehicles:
         best = vehicles[0]
@@ -447,12 +513,25 @@ def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
 
         lines_bottom = run_rapid_ocr(bottom_roi)
         parsed_bottom = extract_vehicle_number(lines_bottom) if lines_bottom else None
+        logger.info(
+            "vehicle-v2 yolo_bottom ocr_lines=%s parsed=%s conf=%s texts=%s",
+            len(lines_bottom or []),
+            parsed_bottom[0] if parsed_bottom else None,
+            round(float(parsed_bottom[1]), 3) if parsed_bottom else None,
+            _ocr_lines_preview(lines_bottom),
+        )
         if parsed_bottom and parsed_bottom[1] >= MIN_OCR_CONF:
+            logger.info(
+                "vehicle-v2 hit=yolo_bottom plate=%s conf=%.3f",
+                parsed_bottom[0],
+                parsed_bottom[1],
+            )
             return {
                 "type": "vehicle",
                 "found": True,
                 "vehicle_number": parsed_bottom[0],
                 "confidence": round(float(parsed_bottom[1]), 3),
+                "raw_text": [t for t, _ in lines_bottom],
                 "detect": detect_meta,
                 "elapsed_ms": _elapsed_ms(t0),
                 "engine": "rapidocr",
@@ -461,26 +540,52 @@ def _pipeline_vehicle_v2(bgr, t0: float) -> Dict[str, Any]:
 
     best_candidate = None
     best_conf = float("-inf")
-    for lines, parsed in attempts:
-        if parsed and parsed[1] > best_conf:
-            best_conf = parsed[1]
-            best_candidate = parsed[0]
+    best_lines = None
+    for att_lines, att_parsed in attempts:
+        if att_parsed and att_parsed[1] > best_conf:
+            best_conf = att_parsed[1]
+            best_candidate = att_parsed[0]
+            best_lines = att_lines
 
     if best_candidate and best_conf >= 0.35:
+        logger.info(
+            "vehicle-v2 hit=low_conf_fallback plate=%s conf=%.3f min_strict=%.2f",
+            best_candidate,
+            best_conf,
+            MIN_OCR_CONF,
+        )
         return {
             "type": "vehicle",
             "found": True,
             "vehicle_number": best_candidate,
             "confidence": round(float(best_conf), 3),
+            "raw_text": [t for t, _ in (best_lines or [])],
             "detect": detect_meta,
             "elapsed_ms": _elapsed_ms(t0),
             "engine": "rapidocr",
         }
 
+    reason = "no_vehicle" if not vehicles else "no_plate_found"
+    logger.warning(
+        "vehicle-v2 miss reason=%s best_candidate=%s best_conf=%s yolo_count=%s attempts=%s",
+        reason,
+        best_candidate,
+        None if best_conf == float("-inf") else round(float(best_conf), 3),
+        len(vehicles),
+        [
+            {
+                "parsed": p[0] if p else None,
+                "conf": round(float(p[1]), 3) if p else None,
+                "ocr_n": len(ls or []),
+            }
+            for ls, p in attempts
+        ],
+    )
     return {
         "type": "vehicle",
         "found": False,
-        "reason": "no_vehicle" if not vehicles else "no_plate_found",
+        "reason": reason,
+        "raw_text": [t for t, _ in (lines or [])],
         "detect": detect_meta,
         "elapsed_ms": _elapsed_ms(t0),
         "engine": "rapidocr",

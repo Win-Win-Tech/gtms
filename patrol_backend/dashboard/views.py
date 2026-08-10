@@ -1945,8 +1945,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         """
         Same as checkin_v3, plus if location.is_face_attendance_enabled:
         require live image and match to user's enrolled face_encoding / face_photo.
+
+        Attendance row rules match kiosk: one row per shift_date (not reused across days).
         """
-        from patrol_backend.utils.attendance_resolve import CheckinTooSoonAfterCheckout, enforce_checkin_allowed_after_checkout
+        from patrol_backend.utils.attendance_resolve import (
+            CheckinTooSoonAfterCheckout,
+            apply_v4_attendance_after_log,
+            build_log_window_filter,
+            enforce_checkin_allowed_after_checkout,
+            get_or_create_attendance_for_shift_day,
+        )
         from patrol_backend.utils.face_utils import (
             is_face_attendance_available,
             verify_user_face,
@@ -1975,6 +1983,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+        )
+        log_filter = build_log_window_filter(
+            user, assignment, shift, org_location, search_start_utc, search_end_utc
         )
 
         try:
@@ -2027,51 +2038,27 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
 
-        attendance, _ = AttendanceCheckin.objects.get_or_create(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            defaults={
-                "created_on": timezone.now(),
-                "shift_date": shift_start_date,
-            }
+        # Same as kiosk: one AttendanceCheckin per (guard, assignment, shift, org, shift_date)
+        attendance = get_or_create_attendance_for_shift_day(
+            user, assignment, shift, org_location, shift_start_date
         )
-
-        attendance_list = AttendanceCheckin.objects.filter(
-            guard=user,
+        apply_v4_attendance_after_log(
+            attendance=attendance,
+            user=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            shift_date=shift_start_date,
-        )
-        if attendance_list.exists():
-            attendance = attendance_list.first()
-
-        earliest_checkin = CheckInLog.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            type="checkin",
-            timestamp__gte=search_start_utc,
-            timestamp__lt=search_end_utc
-        ).order_by("timestamp").first()
-
-        if earliest_checkin:
-            attendance.checkin_time = earliest_checkin.timestamp
-            attendance.latitude = earliest_checkin.latitude
-            attendance.longitude = earliest_checkin.longitude
-
-        attendance.shift_date = shift_start_date
-        attendance.site = matched_site
-
-        if raw_bytes is not None:
-            attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
-
-        attendance.save()
-        _attendance_v3_refresh_saved_fields(
-            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+            shift_start_date=shift_start_date,
+            matched_site=matched_site,
+            log_filter=log_filter,
+            search_start_utc=search_start_utc,
+            search_end_utc=search_end_utc,
+            action_mode="checkin",
+            raw_bytes=raw_bytes,
+            img_name=img_name,
+            user_tz=user_tz,
+            refresh_fn=_attendance_v3_refresh_saved_fields,
+            skip_sibling_reconcile=False,
         )
 
         data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
@@ -2085,7 +2072,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     def checkout_v4(self, request):
         """
         Same as checkout_v3, plus optional face match when location.is_face_attendance_enabled.
+
+        Attendance row rules match kiosk: update the shift_date row; times come from logs in window.
         """
+        from patrol_backend.utils.attendance_resolve import (
+            apply_v4_attendance_after_log,
+            build_log_window_filter,
+            get_or_create_attendance_for_shift_day,
+        )
         from patrol_backend.utils.face_utils import (
             is_face_attendance_available,
             verify_user_face,
@@ -2114,16 +2108,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
             shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
         )
+        log_filter = build_log_window_filter(
+            user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
 
-        attendance = AttendanceCheckin.objects.filter(
-            guard=user,
-            assignment=assignment,
-            shift=shift,
-            org_location=org_location,
-            shift_date=shift_start_date,
-        ).first()
+        attendance = get_or_create_attendance_for_shift_day(
+            user, assignment, shift, org_location, shift_start_date
+        )
 
-        if not attendance or not attendance.checkin_time:
+        has_checkin_in_window = CheckInLog.objects.filter(**log_filter, type="checkin").exists()
+        if not has_checkin_in_window and not attendance.checkin_time:
             return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
 
         image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
@@ -2161,27 +2155,23 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if raw_bytes is not None:
             log.image.save(img_name, ContentFile(raw_bytes), save=True)
 
-        if raw_bytes is not None:
-            attendance.checkout_image.save(img_name, ContentFile(raw_bytes), save=False)
-
-        latest_checkout = CheckInLog.objects.filter(
-            guard=user,
+        apply_v4_attendance_after_log(
+            attendance=attendance,
+            user=user,
             assignment=assignment,
             shift=shift,
             org_location=org_location,
-            type="checkout",
-            timestamp__gte=search_start_utc,
-            timestamp__lt=search_end_utc
-        ).order_by("-timestamp").first()
-
-        if latest_checkout:
-            attendance.checkout_time = latest_checkout.timestamp
-        attendance.shift_date = shift_start_date
-        attendance.site = matched_site
-        attendance.save()
-
-        _attendance_v3_refresh_saved_fields(
-            attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+            shift_start_date=shift_start_date,
+            matched_site=matched_site,
+            log_filter=log_filter,
+            search_start_utc=search_start_utc,
+            search_end_utc=search_end_utc,
+            action_mode="checkout",
+            raw_bytes=raw_bytes,
+            img_name=img_name,
+            user_tz=user_tz,
+            refresh_fn=_attendance_v3_refresh_saved_fields,
+            skip_sibling_reconcile=False,
         )
 
         data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
