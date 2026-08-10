@@ -140,7 +140,10 @@ Public response fields are only: `type`, `found`, `number`, `confidence` (same `
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `VISITOR_AI_YOLO_WEIGHTS` | `yolov8n.pt` | Ultralytics weights path/name |
+| `VISITOR_AI_YOLO_WEIGHTS` | `yolov8n.pt` | Ultralytics COCO vehicle weights (legacy `_pipeline_vehicle_v2`) |
+| `VISITOR_AI_PLATE_WEIGHTS` | Hub plate model | Dedicated license-plate YOLO for extract-v2 `type=vehicle` (local `.pt` or Ultralytics Hub id) |
+| `VISITOR_AI_PLATE_SKIP_YOLO` | `false` | Skip plate YOLO; OCR-only fallbacks |
+| `VISITOR_AI_MAX_PLATE_OCR_PASSES` | `3` | Max RapidOCR calls per vehicle extract |
 | `VISITOR_AI_ID_WEIGHTS` | _(empty)_ | Optional custom ID YOLO `.pt` |
 | `VISITOR_AI_OCR_LANG` | `en` | PaddleOCR language |
 | `VISITOR_AI_USE_GPU` | `false` | Set `true` only if CUDA available |
