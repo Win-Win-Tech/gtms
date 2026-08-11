@@ -72,6 +72,8 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     approved_by_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     scanned_by_name = serializers.SerializerMethodField()
+    checked_in_by_name = serializers.SerializerMethodField()
+    checked_out_by_name = serializers.SerializerMethodField()
     qr_image_url = serializers.SerializerMethodField()
     pass_image_url = serializers.SerializerMethodField()
     qr_usable = serializers.SerializerMethodField()
@@ -94,6 +96,8 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
             "visitor_type",
             "purpose_of_visit",
             "vehicle_number",
+            "vehicle_type",
+            "company_name",
             "remarks",
             "revert_reason",
             "location_id",
@@ -123,6 +127,10 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
             "created_by_name",
             "scanned_by",
             "scanned_by_name",
+            "checked_in_by",
+            "checked_in_by_name",
+            "checked_out_by",
+            "checked_out_by_name",
             "created_on",
             "assets",
         ]
@@ -145,6 +153,12 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
 
     def get_scanned_by_name(self, obj):
         return getattr(obj.scanned_by, "name", None) if obj.scanned_by else None
+
+    def get_checked_in_by_name(self, obj):
+        return getattr(obj.checked_in_by, "name", None) if obj.checked_in_by else None
+
+    def get_checked_out_by_name(self, obj):
+        return getattr(obj.checked_out_by, "name", None) if obj.checked_out_by else None
 
     def get_qr_image_url(self, obj):
         return _abs_media_url(obj.qr_image, self.context.get("request"))

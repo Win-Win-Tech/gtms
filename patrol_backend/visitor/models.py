@@ -59,6 +59,21 @@ class VisitorEntry(models.Model):
         (TYPE_OTHER, "Other"),
     ]
 
+    VEHICLE_CAR = "car"
+    VEHICLE_MOTORCYCLE = "motorcycle"
+    VEHICLE_VAN = "van"
+    VEHICLE_TRUCK = "truck"
+    VEHICLE_BUS = "bus"
+    VEHICLE_OTHER = "other"
+    VEHICLE_TYPE_CHOICES = [
+        (VEHICLE_CAR, "Car"),
+        (VEHICLE_MOTORCYCLE, "Motorcycle"),
+        (VEHICLE_VAN, "Van"),
+        (VEHICLE_TRUCK, "Truck"),
+        (VEHICLE_BUS, "Bus"),
+        (VEHICLE_OTHER, "Other"),
+    ]
+
     # Manual entry → pending_approval → (host approve = check-in)
     # Invitation → scheduled → (QR scan = check-in)
     STATUS_PENDING_APPROVAL = "pending_approval"
@@ -120,6 +135,13 @@ class VisitorEntry(models.Model):
     )
     purpose_of_visit = models.CharField(max_length=500, blank=True, default="")
     vehicle_number = models.CharField(max_length=64, blank=True, default="")
+    vehicle_type = models.CharField(
+        max_length=32,
+        choices=VEHICLE_TYPE_CHOICES,
+        blank=True,
+        default="",
+    )
+    company_name = models.CharField(max_length=255, blank=True, default="")
     remarks = models.TextField(blank=True, default="")
     revert_reason = models.TextField(blank=True, default="")
 
@@ -173,6 +195,21 @@ class VisitorEntry(models.Model):
         blank=True,
         related_name="visitor_entries_scanned",
         help_text="Guard who scanned invite/scheduled QR into pending_approval",
+    )
+    checked_in_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="visitor_entries_checked_in",
+        help_text="User who performed the actual check-in",
+    )
+    checked_out_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="visitor_entries_checked_out",
     )
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)

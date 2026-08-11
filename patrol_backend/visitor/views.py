@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, time
 
 from django.db import transaction
 from django.db.models import Q
@@ -39,7 +39,7 @@ def _base_entry_qs():
     return (
         VisitorEntry.objects.filter(is_deleted=False)
         .select_related(
-            "visitor", "host", "location", "created_by", "approved_by", "scanned_by"
+            "visitor", "host", "location", "created_by", "approved_by", "scanned_by", "checked_in_by", "checked_out_by"
         )
         .prefetch_related("assets")
     )
@@ -164,6 +164,45 @@ def _parse_dt(value, user_tz=None):
         else:
             dt = dt.replace(tzinfo=tz)
     return dt.astimezone(pytz.UTC)
+
+
+def _parse_expected_out_time(value, user_tz=None):
+    """
+    Parse expected_out_time.
+
+    Date-only (YYYY-MM-DD) from the registration form → end of that local day
+    (datetime.time.max = 23:59:59.999999) in user_tz, stored as UTC.
+    Full datetimes still accepted (approve / legacy clients) via _parse_dt.
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return _parse_dt(value, user_tz)
+
+    text = str(value).strip()
+    # Pure date → last representable instant of that local calendar day
+    if len(text) >= 10 and "T" not in text and " " not in text[:11]:
+        out_date = _parse_date(text[:10])
+        if not out_date:
+            return None
+        tz = user_tz or pytz.UTC
+        local_eod = datetime.combine(out_date, time.max)
+        if hasattr(tz, "localize"):
+            local_eod = tz.localize(local_eod)
+        else:
+            local_eod = local_eod.replace(tzinfo=tz)
+        return local_eod.astimezone(pytz.UTC)
+
+    return _parse_dt(text, user_tz)
+
+
+def _normalize_vehicle_type(value):
+    """Return valid vehicle_type or empty string."""
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    valid = {c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES}
+    return text if text in valid else None
 
 
 def _parse_date(value):
@@ -329,6 +368,17 @@ def _filtered_entries(request):
     if has_vehicle in ("1", "true", "yes"):
         qs = qs.exclude(vehicle_number__isnull=True).exclude(vehicle_number__exact="")
 
+    # Vehicle type filter
+    vtype_filter = (request.query_params.get("vehicle_type") or "").strip().lower()
+    if vtype_filter and vtype_filter != "all":
+        valid_vtypes = {c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES}
+        if vtype_filter not in valid_vtypes:
+            return None, Response(
+                {"error": f"Invalid vehicle_type filter. Choose from: {', '.join(sorted(valid_vtypes))}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qs = qs.filter(vehicle_type=vtype_filter)
+
     date_filter = request.query_params.get("date_filter", "today")
     start_date = request.query_params.get("start_date")
     end_date = request.query_params.get("end_date")
@@ -417,6 +467,8 @@ class VisitorSearchView(APIView):
                 "visitor_type": last_entry.visitor_type,
                 "purpose_of_visit": last_entry.purpose_of_visit or "",
                 "vehicle_number": last_entry.vehicle_number or "",
+                "vehicle_type": last_entry.vehicle_type or "",
+                "company_name": last_entry.company_name or "",
                 "remarks": last_entry.remarks or "",
                 "host_id": str(last_entry.host_id) if last_entry.host_id else None,
                 "host_name": getattr(last_entry.host, "name", None) if last_entry.host else None,
@@ -486,13 +538,25 @@ class VisitorCheckInView(APIView):
         phone_number = (data.get("phone_number") or "").strip()
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
+        vehicle_type = _normalize_vehicle_type(data.get("vehicle_type"))
+        if vehicle_type is None:
+            return Response(
+                {
+                    "error": (
+                        "Invalid vehicle_type. Choose from: "
+                        + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company_name = (data.get("company_name") or "").strip()
         remarks = (data.get("remarks") or "").strip()
 
         user_tz = get_user_timezone_from_request(request, location_id=location_id)
         visit_date_today = get_user_today(user_tz)
         # Walk-in: visit_date + expected_arrival = create time (now). Ignore client arrival.
         expected_arrival = timezone.now()
-        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
+        expected_out = _parse_expected_out_time(data.get("expected_out_time"), user_tz)
 
         if expected_out and expected_out <= expected_arrival:
             return Response(
@@ -544,6 +608,8 @@ class VisitorCheckInView(APIView):
                 entry.visitor_type = visitor_type
                 entry.purpose_of_visit = purpose
                 entry.vehicle_number = vehicle_number
+                entry.vehicle_type = vehicle_type
+                entry.company_name = company_name
                 entry.remarks = remarks
                 entry.expected_arrival_time = expected_arrival
                 entry.expected_out_time = expected_out
@@ -551,6 +617,7 @@ class VisitorCheckInView(APIView):
                 entry.status = initial_status
                 if check_in_dt:
                     entry.check_in_time = check_in_dt
+                    entry.checked_in_by = request.user
                 entry.revert_reason = ""
                 entry.qr_expired = False
                 entry.save()
@@ -565,8 +632,11 @@ class VisitorCheckInView(APIView):
                     visitor_type=visitor_type,
                     status=initial_status,
                     check_in_time=check_in_dt,
+                    checked_in_by=request.user if check_in_dt else None,
                     purpose_of_visit=purpose,
                     vehicle_number=vehicle_number,
+                    vehicle_type=vehicle_type,
+                    company_name=company_name,
                     remarks=remarks,
                     expected_arrival_time=expected_arrival,
                     expected_out_time=expected_out,
@@ -690,10 +760,11 @@ class VisitorApproveView(APIView):
             )
 
         user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
-        expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
+        expected_out = _parse_expected_out_time(request.data.get("expected_out_time"), user_tz)
         now = timezone.now()
         entry.status = VisitorEntry.STATUS_CHECKED_IN
         entry.check_in_time = now
+        entry.checked_in_by = request.user
         entry.approved_by = request.user
         entry.approved_on = now
         entry.revert_reason = ""
@@ -876,7 +947,7 @@ class VisitorRescheduleView(APIView):
 
         user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
         expected_arrival = _parse_dt(request.data.get("expected_arrival_time"), user_tz)
-        expected_out = _parse_dt(request.data.get("expected_out_time"), user_tz)
+        expected_out = _parse_expected_out_time(request.data.get("expected_out_time"), user_tz)
         today = get_user_today(user_tz)
         visit_date = _parse_date(request.data.get("visit_date"))
         if not visit_date:
@@ -976,8 +1047,9 @@ class VisitorCheckOutView(APIView):
 
         entry.status = VisitorEntry.STATUS_CHECKED_OUT
         entry.check_out_time = timezone.now()
+        entry.checked_out_by = request.user
         entry.qr_expired = True
-        entry.save(update_fields=["status", "check_out_time", "qr_expired", "modified_on"])
+        entry.save(update_fields=["status", "check_out_time", "checked_out_by", "qr_expired", "modified_on"])
 
         if exit_photos:
             _save_assets_many(entry, VisitorAsset.ASSET_EXIT_PHOTO, exit_photos)
@@ -1198,7 +1270,7 @@ class VisitorInviteCreateView(APIView):
         today = get_user_today(user_tz)
 
         expected_arrival = _parse_dt(data.get("expected_arrival_time"), user_tz)
-        expected_out = _parse_dt(data.get("expected_out_time"), user_tz)
+        expected_out = _parse_expected_out_time(data.get("expected_out_time"), user_tz)
 
         val_err = _validate_invite_dates_and_times(visit_date, expected_arrival, expected_out, user_tz, today)
         if val_err:
@@ -1215,6 +1287,18 @@ class VisitorInviteCreateView(APIView):
         phone_number = (data.get("phone_number") or "").strip()
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
+        vehicle_type = _normalize_vehicle_type(data.get("vehicle_type"))
+        if vehicle_type is None:
+            return Response(
+                {
+                    "error": (
+                        "Invalid vehicle_type. Choose from: "
+                        + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company_name = (data.get("company_name") or "").strip()
         remarks = (data.get("remarks") or "").strip()
 
         visitor = _upsert_visitor(location, ic_number, visitor_name, phone_number)
@@ -1228,6 +1312,8 @@ class VisitorInviteCreateView(APIView):
             status=VisitorEntry.STATUS_SCHEDULED,
             purpose_of_visit=purpose,
             vehicle_number=vehicle_number,
+            vehicle_type=vehicle_type,
+            company_name=company_name,
             remarks=remarks,
             expected_arrival_time=expected_arrival,
             expected_out_time=expected_out,
@@ -1312,6 +1398,21 @@ class VisitorCompleteInviteView(APIView):
         vehicle_num = (data.get("vehicle_number") or "").strip()
         if vehicle_num:
             entry.vehicle_number = vehicle_num
+        if "vehicle_type" in data:
+            vtype = _normalize_vehicle_type(data.get("vehicle_type"))
+            if vtype is None:
+                return Response(
+                    {
+                        "error": (
+                            "Invalid vehicle_type. Choose from: "
+                            + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            entry.vehicle_type = vtype
+        if data.get("company_name") is not None:
+            entry.company_name = (data.get("company_name") or "").strip()
 
         user_tz = get_user_timezone_from_request(request, location_id=entry.location_id)
         today = get_user_today(user_tz)
@@ -1326,7 +1427,7 @@ class VisitorCompleteInviteView(APIView):
         eff_out = entry.expected_out_time
         if "expected_out_time" in data:
             out_val = data.get("expected_out_time")
-            eff_out = _parse_dt(out_val, user_tz) if out_val else None
+            eff_out = _parse_expected_out_time(out_val, user_tz) if out_val else None
 
         val_err = _validate_invite_dates_and_times(eff_visit_date, eff_arrival, eff_out, user_tz, today)
         if val_err:
@@ -1383,6 +1484,7 @@ class VisitorCompleteInviteView(APIView):
         else:
             entry.status = VisitorEntry.STATUS_CHECKED_IN
             entry.check_in_time = timezone.now()
+            entry.checked_in_by = request.user
 
         entry.scanned_by = request.user
         entry.qr_expired = False
