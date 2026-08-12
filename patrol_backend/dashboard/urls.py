@@ -33,6 +33,7 @@ urlpatterns = [
     path("api/attendance_v4/", AttendanceCheckinV4ListView.as_view(), name="attendance-api-v4"),
     path('dashboard-checkin-report-excel/', DashboardCheckInReportExcelView.as_view(), name='dashboard-checkin-report-excel'),
     path('dashboard-checkin-report-excel/v2/', DashboardCheckInReportExcelViewV2.as_view(), name='dashboard-checkin-report-excel-v2'),
+    path('dashboard-checkin-report-pdf/v2/', DashboardCheckInReportPdfViewV2.as_view(), name='dashboard-checkin-report-pdf-v2'),
     path("api/attendance/export/", AttendanceCheckinExportView.as_view(), name="attendance-export-api"),
     path("api/attendance/export_v3/", AttendanceCheckinV3ExportView.as_view(), name="attendance-export-api-v3"),
     path("api/attendance/export_v4/", AttendanceCheckinV4ExportView.as_view(), name="attendance-export-api-v4"),

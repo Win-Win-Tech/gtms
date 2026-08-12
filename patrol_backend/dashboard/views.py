@@ -8830,3 +8830,57 @@ class DashboardCheckInReportExcelViewV2(APIView):
                 {"error": f"An error occurred while generating the v2 Excel report: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class DashboardCheckInReportPdfViewV2(APIView):
+    """PDF download with the same fields/filters as dashboard-checkin-report-excel/v2/."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        filter_type = request.query_params.get('filter', 'today')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        user_id = request.query_params.get('user_id')
+        location_id = request.query_params.get('location_id')
+        shift_id = request.query_params.get('shift_id')
+        search = (request.query_params.get('search') or '').strip()
+        role = (request.query_params.get('role') or '').strip()
+        status_filter = (request.query_params.get('status') or '').strip()
+
+        try:
+            report_data = _get_checkin_report_data_v2(
+                filter_type=filter_type,
+                start_date_str=start_date,
+                end_date_str=end_date,
+                user_id=user_id,
+                location_id=location_id,
+                shift_id=shift_id,
+                request=request,
+                search=search or None,
+                role=role or None,
+            )
+            if status_filter and status_filter != 'all':
+                report_data = [r for r in report_data if r.get('status') == status_filter]
+
+            from .checkin_report_pdf import generate_checkin_report_pdf
+
+            content, filename = generate_checkin_report_pdf(
+                report_data,
+                request,
+                filter_type,
+                start_date,
+                end_date,
+                location_id,
+            )
+            response = HttpResponse(content, content_type="application/pdf")
+            response["Content-Disposition"] = f'attachment; filename="{filename}"'
+            return response
+        except ImportError as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response(
+                {"error": f"An error occurred while generating the check-in PDF report: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

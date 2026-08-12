@@ -10,6 +10,11 @@ from django.http import HttpResponse
 from datetime import datetime, timedelta
 from io import BytesIO
 from openpyxl import Workbook
+from .exports import (
+    generate_incident_excel,
+    generate_incident_pdf,
+    get_incident_export_queryset,
+)
 from .models import incidentreport
 from .serializers import IncidentSerializer
 from twilio.rest import Client
@@ -473,206 +478,27 @@ class IncidentExportExcelView(APIView):
     Includes all filters from IncidentFilterView plus additional Excel-only fields.
     """
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
-        # Get query parameters (same as IncidentFilterView)
-        date_filter = request.query_params.get('date_filter', '').lower()
-        status_filter = request.query_params.get('status', '').title()
-        severity_filter = request.query_params.get('severity', '').capitalize()
-        start_date = request.query_params.get('start_date')
-        end_date = request.query_params.get('end_date')
+        queryset, error_response = get_incident_export_queryset(request)
+        if error_response:
+            return error_response
+        return generate_incident_excel(queryset, request)
 
-        # Additional filters
-        location_id = request.query_params.get('location_id')
-        assigned_to_id = request.query_params.get('assigned_to')
-        created_by_id = request.query_params.get('created_by')
-        checkpoint_id = request.query_params.get('checkpoint_id')
 
-        # Base queryset
-        queryset = incidentreport.objects.select_related(
-            'created_by', 'assigned_by', 'assigned_to', 'resolved_by', 
-            'location', 'checkpoint'
-        ).all()
+class IncidentExportPdfView(APIView):
+    """GET /incident/dashboard/export-pdf/ — same fields as Excel, dashboard PDF style."""
+    permission_classes = [IsAuthenticated]
 
-        # Apply status filter
-        if status_filter in ['Open', 'In-Progress', 'Closed']:
-            queryset = queryset.filter(status=status_filter)
-
-        # Apply severity filter
-        if severity_filter in ['Low', 'Medium', 'High']:
-            queryset = queryset.filter(severity=severity_filter)
-
-        # Apply date filter - use location timezone if location_id filter is provided
-        filter_location_id = location_id if location_id else None
-        user_tz = get_user_timezone_from_request(request, location_id=filter_location_id)
-        user_now = get_user_now(user_tz)
-        user_today = user_now.date()
-        
-        if date_filter == 'today':
-            start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
-            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-        elif date_filter == 'this_week':
-            start_of_week = user_today - timedelta(days=user_today.weekday())
-            end_of_week = start_of_week + timedelta(days=6)
-            start_utc, end_utc = convert_date_range_to_utc(start_of_week, end_of_week, user_tz)
-            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-        elif date_filter == 'this_month':
-            start_of_month = user_today.replace(day=1)
-            if user_today.month == 12:
-                end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
-            else:
-                end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
-            start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
-            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-        elif date_filter == 'custom' and start_date and end_date:
-            try:
-                start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
-                end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
-                start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
-                queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-            except ValueError:
-                return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Apply additional filters
-        if location_id:
-            queryset = queryset.filter(location_id=location_id)
-        if assigned_to_id:
-            queryset = queryset.filter(assigned_to_id=assigned_to_id)
-        if created_by_id:
-            queryset = queryset.filter(created_by_id=created_by_id)
-        if checkpoint_id:
-            queryset = queryset.filter(checkpoint_id=checkpoint_id)
-
-        # Create Excel workbook
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Incident Report"
-
-        # Header row with all fields including Excel-only fields
-        headers = [
-            'Ticket Number', 'Severity', 'Status', 'Location', 'Checkpoint',
-            'Created On', 'Created By', 
-            'Assigned On', 'Assigned By', 'Assigned To',
-            'Closed On', 'Closed By',
-            'Time Difference (Created-Assigned)', 
-            'Time Difference (Assigned-Closed)',
-            'Time Difference (Created-Closed)',
-            'Description', 'Closure Description', 'SLA Status'
-        ]
-        ws.append(headers)
-
-        # Helper function to format time difference
-        def format_time_difference(start_time, end_time):
-            """Format time difference as hours and minutes"""
-            if not start_time or not end_time:
-                return ""
-            diff = end_time - start_time
-            total_seconds = int(diff.total_seconds())
-            hours = total_seconds // 3600
-            minutes = (total_seconds % 3600) // 60
-            if hours > 0:
-                return f"{hours}h {minutes}m"
-            else:
-                return f"{minutes}m"
-
-        # Helper function to calculate SLA status
-        def calculate_sla_status(incident):
-            """Calculate SLA status based on severity and closure time"""
-            if not incident.resolved_on or not incident.created_on:
-                return "N/A"
-            
-            # Define SLA thresholds in hours based on severity
-            sla_thresholds = {
-                'High': 8,    # 8 hours for High severity
-                'Medium': 16,  # 16 hours for Medium severity
-                'Low': 24      # 24 hours for Low severity
-            }
-            
-            threshold_hours = sla_thresholds.get(incident.severity, 8)
-            time_diff = incident.resolved_on - incident.created_on
-            hours_taken = time_diff.total_seconds() / 3600
-            
-            if hours_taken <= threshold_hours:
-                return "Met"
-            else:
-                return "Not Met"
-
-        # Add data rows
-        for incident in queryset:
-            # Get location timezone for this incident
-            incident_location_id = str(incident.location.id) if incident.location else None
-            incident_tz = get_user_timezone_from_request(request, location_id=incident_location_id)
-            
-            # Convert timestamps to user timezone
-            created_on_tz = to_user_timezone(incident.created_on, incident_tz) if incident.created_on else None
-            assigned_on_tz = to_user_timezone(incident.assigned_on, incident_tz) if incident.assigned_on else None
-            closed_on_tz = to_user_timezone(incident.resolved_on, incident_tz) if incident.resolved_on else None
-            
-            # Calculate time differences (using UTC times for accurate calculation)
-            time_diff_created_assigned = format_time_difference(incident.created_on, incident.assigned_on)
-            time_diff_assigned_closed = format_time_difference(incident.assigned_on, incident.resolved_on)
-            time_diff_created_closed = format_time_difference(incident.created_on, incident.resolved_on)
-            
-            # Get user names
-            created_by_name = incident.created_by.name if incident.created_by else ""
-            assigned_by_name = incident.assigned_by.name if incident.assigned_by else ""
-            assigned_to_name = incident.assigned_to.name if incident.assigned_to else ""
-            closed_by_name = incident.resolved_by.name if incident.resolved_by else ""
-            
-            # Get location and checkpoint names
-            location_name = incident.location.name if incident.location else ""
-            checkpoint_name = incident.checkpoint.label if incident.checkpoint else ""
-            
-            # Calculate SLA status
-            sla_status = calculate_sla_status(incident)
-            
-            # Format datetime strings
-            created_on_str = created_on_tz.strftime("%Y-%m-%d %H:%M:%S") if created_on_tz else ""
-            assigned_on_str = assigned_on_tz.strftime("%Y-%m-%d %H:%M:%S") if assigned_on_tz else ""
-            closed_on_str = closed_on_tz.strftime("%Y-%m-%d %H:%M:%S") if closed_on_tz else ""
-            
-            ws.append([
-                incident.ticket_number,
-                incident.severity,
-                incident.status,
-                location_name,
-                checkpoint_name,
-                created_on_str,
-                created_by_name,
-                assigned_on_str,
-                assigned_by_name,
-                assigned_to_name,
-                closed_on_str,
-                closed_by_name,
-                time_diff_created_assigned,
-                time_diff_assigned_closed,
-                time_diff_created_closed,
-                incident.incident_description or "",
-                incident.closure_description or "",
-                sla_status
-            ])
-
-        # Save to in-memory buffer
-        buffer = BytesIO()
-        wb.save(buffer)
-        buffer.seek(0)
-
-        # Return Excel file as HTTP response
-        excel_content = buffer.getvalue()
-        
-        response = HttpResponse(
-            excel_content,
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        
-        # Generate a meaningful filename based on filter
-        if date_filter == 'custom' and start_date and end_date:
-            filename = f"incident_report_{start_date}_{end_date}.xlsx"
-        elif date_filter:
-            filename = f"incident_report_{date_filter}_{timezone.now().strftime('%Y%m%d')}.xlsx"
-        else:
-            filename = f"incident_report_{timezone.now().strftime('%Y%m%d')}.xlsx"
-        
+    def get(self, request):
+        queryset, error_response = get_incident_export_queryset(request)
+        if error_response:
+            return error_response
+        try:
+            content, filename = generate_incident_pdf(queryset, request)
+        except ImportError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        response = HttpResponse(content, content_type="application/pdf")
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
         return response
 

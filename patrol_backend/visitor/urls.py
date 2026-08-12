@@ -16,6 +16,9 @@ from .views import (
     VisitorRescheduleView,
     VisitorRevertView,
     VisitorSearchView,
+    VehicleMovementReportExportPdfView,
+    VehicleMovementReportExportView,
+    VehicleMovementReportView,
 )
 from .views_ai import VisitorAiExtractV2View, VisitorAiExtractView
 
@@ -72,5 +75,20 @@ urlpatterns = [
         "entries/<uuid:entry_id>/checkout/",
         VisitorCheckOutView.as_view(),
         name="visitor-entries-checkout",
+    ),
+    path(
+        "reports/vehicle-movement/",
+        VehicleMovementReportView.as_view(),
+        name="visitor-vehicle-movement-report",
+    ),
+    path(
+        "reports/vehicle-movement/export/",
+        VehicleMovementReportExportView.as_view(),
+        name="visitor-vehicle-movement-export",
+    ),
+    path(
+        "reports/vehicle-movement/export-pdf/",
+        VehicleMovementReportExportPdfView.as_view(),
+        name="visitor-vehicle-movement-export-pdf",
     ),
 ]

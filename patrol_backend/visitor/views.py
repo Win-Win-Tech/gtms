@@ -22,6 +22,11 @@ from scheduler.models import Location
 from .exports import generate_visitor_excel, generate_visitor_pdf
 from .models import Visitor, VisitorAsset, VisitorEntry
 from .serializers import VisitorAssetSerializer, VisitorEntrySerializer, VisitorSerializer
+from .vehicle_movement_report import (
+    build_vehicle_movement_report,
+    generate_vehicle_movement_excel,
+    generate_vehicle_movement_pdf,
+)
 from .utils import (
     apply_checkin_date_filter,
     make_qr_token,
@@ -1499,4 +1504,95 @@ class VisitorCompleteInviteView(APIView):
         if approval_enabled:
             notify_visitor_pending(entry)
         return Response(VisitorEntrySerializer(entry, context={"request": request}).data)
+
+
+class VehicleMovementReportView(APIView):
+    """
+    GET /visitors/reports/vehicle-movement/
+    Query: location_id, report_date (YYYY-MM-DD), start_time (HH:MM), end_time (HH:MM)
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_movement_report_from_request(request)
+        if error_response:
+            return error_response
+        return Response(data)
+
+
+def _vehicle_movement_report_from_request(request):
+    location_id_param = request.query_params.get("location_id") or request.query_params.get(
+        "location"
+    )
+    location_id, err = resolve_location_for_request(request, location_id_param)
+    if err:
+        return None, Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+    if not location_id:
+        return None, Response(
+            {"error": "location_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    date_filter = request.query_params.get("date_filter") or "today"
+    start_date = request.query_params.get("start_date")
+    end_date = request.query_params.get("end_date")
+    start_time = request.query_params.get("start_time")
+    end_time = request.query_params.get("end_time")
+
+    # Legacy single-day param
+    report_date_raw = request.query_params.get("report_date")
+    if report_date_raw and not start_date:
+        start_date = report_date_raw
+        end_date = report_date_raw
+        if not request.query_params.get("date_filter"):
+            date_filter = "custom"
+
+    try:
+        data = build_vehicle_movement_report(
+            request,
+            location_id,
+            date_filter=date_filter,
+            start_date_str=start_date,
+            end_date_str=end_date,
+            start_time_str=start_time,
+            end_time_str=end_time,
+        )
+    except ValueError as exc:
+        return None, Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return data, None
+
+
+class VehicleMovementReportExportView(APIView):
+    """GET /visitors/reports/vehicle-movement/export/ — Excel download."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_movement_report_from_request(request)
+        if error_response:
+            return error_response
+        return generate_vehicle_movement_excel(data)
+
+
+class VehicleMovementReportExportPdfView(APIView):
+    """GET /visitors/reports/vehicle-movement/export-pdf/ — PDF download."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_movement_report_from_request(request)
+        if error_response:
+            return error_response
+        try:
+            content, filename = generate_vehicle_movement_pdf(data, request)
+        except ImportError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 

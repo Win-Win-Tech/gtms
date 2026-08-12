@@ -260,7 +260,7 @@ def _draw_rollcall_pdf_header_and_footer(canvas, doc):
                 Paragraph(f"Company &nbsp; {org_name}", meta_style),
                 Paragraph(printed_text, meta_right_style),
             ],
-            [Paragraph(f"Department &nbsp; {dept_label}", meta_style), ""],
+            [Paragraph(f"Site &nbsp; {dept_label}", meta_style), ""],
         ],
         colWidths=[doc.width * 0.55, doc.width * 0.45],
     )

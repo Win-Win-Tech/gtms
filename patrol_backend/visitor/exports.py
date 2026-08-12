@@ -263,7 +263,7 @@ def _draw_visitor_pdf_header_and_footer(canvas, doc):
         alignment=TA_RIGHT,
     )
 
-    title_p = Paragraph("Visitor Entries Report (Detailed Summary Report)", title_style)
+    title_p = Paragraph("Vehicle/Visitor Entries Report", title_style)
     if range_start and range_end:
         date_line = f"{_fmt_report_date(range_start)} To {_fmt_report_date(range_end)}"
     else:
@@ -279,7 +279,7 @@ def _draw_visitor_pdf_header_and_footer(canvas, doc):
                 Paragraph(f"Company &nbsp; {org_name}", meta_style),
                 Paragraph(printed_text, meta_right_style),
             ],
-            [Paragraph(f"Department &nbsp; {dept_label}", meta_style), ""],
+            [Paragraph(f"Site &nbsp; {dept_label}", meta_style), ""],
         ],
         colWidths=[doc.width * 0.55, doc.width * 0.45],
     )
