@@ -40,7 +40,7 @@ User site access types (from login):
 
 **Behaviour:**
 
-- Call **`GET /auth/my-sites/`** (same API as mobile). Fill dropdown from `assigned_sites`.
+- Call **`GET /auth/v5/my-sites/`**. Fill dropdown from `assigned_sites`.
 - If `current_site` is set, default the header to that site.
 - Persist `selectedSiteId` in session (same idea as `locationId`). User can still change the header to another assigned site.
 - On change: in-scope pages refetch with `site_id`.
@@ -99,11 +99,11 @@ Screens:
 
 ## 5. Login / session
 
-After login and refresh, also call **`GET /auth/my-sites/`** (shared with mobile). Store:
+After login and refresh **v5**, also call **`GET /auth/v5/my-sites/`**. Store:
 
 - `assigned_sites`
 - `all_org_sites`
-- `current_site` (today’s posted site, or null)
+- `current_site` (latest `GuardSiteCache` for today, else daily roster, or null)
 - visitor SiteSetting keys (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`)
 - `selectedSiteId` — prefer `current_site.id`, else the only assigned site, else last session value if still allowed
 
@@ -115,15 +115,15 @@ Do not change login JSON wrapper (`status`, `message`, `data`).
 
 ## 6. Frontend rollout
 
-| Phase | Work |
-|-------|------|
-| **F0** | Users create/edit site assignment; list by site (needs B0) |
-| **F1** | Header Site dropdown + session; load from **GET `/auth/my-sites/`** (same as mobile) |
-| **F2** | Daily posted-site UI (assign screens); no Site on checkpoint master |
-| **F3** | Dashboard reports use header `site_id` |
-| **F4** | Incident filters/create/export |
-| **F5** | Visitor history / entry / vehicle movement |
-| **F6** | Payslip |
+| Phase | Module | Work |
+|-------|--------|------|
+| **F0** | **Users** | Create/edit site assignment; list by site (needs B0 / user v5) |
+| **F1** | **Foundation** | Header Site dropdown; **GET `/auth/v5/my-sites/`** |
+| **F2** | **Shift assign** | Daily posted-site UI; no Site on checkpoint master |
+| **F3** | **Incident** | Filters/create/export **v5** |
+| **F4** | **Visitor** | History / entry / vehicle movement **v5** |
+| **F5** | **Payslip** | **v5** |
+| **F6** | **Dashboard** | Reports use header `site_id` on **v5** APIs (**last**) |
 
 ---
 

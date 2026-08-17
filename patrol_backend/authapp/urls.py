@@ -14,6 +14,14 @@ from .views import (
     MobileSelfProfileView,
     RefreshTokenView,
 )
+from .views_v5 import (
+    MySitesViewV5,
+    UserByRoleViewV5,
+    UserCreateViewV5,
+    UserDetailViewV5,
+    UserListViewV5,
+    UserUpdateViewV5,
+)
 
 router = DefaultRouter()
 router.register(r'auth/roles', RoleViewSet, basename='roles')
@@ -31,6 +39,12 @@ urlpatterns = [
     path('auth/users/<uuid:id>/toggle-active/', ToggleUserActiveView.as_view(), name='toggle_user_active'), # PATCH
     path('users/by-role/', UserByRoleView.as_view(), name='users-by-role'),
     path('auth/timezones/', TimezoneListView.as_view(), name='list_timezones'),
+    path('auth/v5/users/', UserCreateViewV5.as_view(), name='create_user_v5'),
+    path('auth/v5/users/<uuid:id>/detail/', UserDetailViewV5.as_view(), name='user_detail_v5'),
+    path('auth/v5/users/list/', UserListViewV5.as_view(), name='list_users_v5'),
+    path('auth/v5/users/<uuid:id>/', UserUpdateViewV5.as_view(), name='update_user_v5'),
+    path('users/v5/by-role/', UserByRoleViewV5.as_view(), name='users-by-role-v5'),
+    path('auth/v5/my-sites/', MySitesViewV5.as_view(), name='my_sites_v5'),
     path('', include(router.urls)),
 ]
 

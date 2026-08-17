@@ -47,17 +47,23 @@ Organisation (Location)
 
 ---
 
-## 3. Modules in this work
+## 3. Modules — build order (dependency)
 
-| # | Module | What we will do |
-|---|--------|-----------------|
-| 1 | **Foundation** | User ↔ site assignment; global Site dropdown; login/refresh returns assigned sites |
-| 2 | **Shift assign** | **Do not** store site on Assignment / Shift / Checkpoint. Daily posted site in **`AssignmentDailySite`**. Scan saves site on **`CheckIn`**; attendance already on **`CheckInLog`** |
-| 3 | **Dashboard** | Attendance / check-in / monthly / roll call lists **selected site only** |
-| 4 | **Users** | List users of the **selected site**. **Admin** sees only **their org**. **Super Admin** can see **all orgs**. Other roles see only users of their assigned / selected site |
-| 5 | **Payslip** | Show data only for sites the logged-in user can access |
-| 6 | **Incident** | Site on incident row; list/create/export site-wise; mobile must send `site_id` |
-| 7 | **Visitor** | Site on visitor entry; history / registration / vehicle movement; mobile must send `site_id` |
+Build in this order. Each step needs the one above.
+
+| # | Module | Depends on | Why this order |
+|---|--------|------------|----------------|
+| 1 | **Users** | — | `UserSite` / `all_org_sites` on create, update, list. Nothing else can know who may use which site |
+| 2 | **Foundation** | Users | Login/refresh **v5**, `GET/POST /auth/v5/my-sites/`, `current_site` helper (cache then daily). Header / selected site |
+| 3 | **Shift assign** | Users + Foundation | `AssignmentDailySite` on assign; select/switch before attendance updates daily; after attendance → `GuardSiteCache` |
+| 4 | **Incident** | Foundation | Create/list/export with `site_id` from `current_site` |
+| 5 | **Visitor** | Foundation | Create/list/export with `site_id` from `current_site` |
+| 6 | **Payslip** | Users | Employee lists by `UserSite` (no daily-site table) |
+| 7 | **Dashboard** | Shift assign | Attendance punch, scan, lists, roll call, monthly — **last** (needs posted / current site) |
+
+**Not in this work:** Live Tracking, Settings, Role Management.
+
+**Live vs v5:** same server is used by live users. **Do not change existing URLs.** Copy the API and register a **v5** path. Live keeps working. New site-wise clients call v5 only. Details in the backend plan.
 
 ---
 
@@ -126,7 +132,7 @@ List / Report / Export
     → Backend also enforces user cannot request a site they are not assigned to
 ```
 
-**Web and mobile** both call **`GET /auth/my-sites/`** (JWT) for assigned sites, **today’s posted site** (`AssignmentDailySite` → `current_site`), and visitor SiteSetting (host approval, default purpose, default remarks).
+**Web and mobile** both call **`GET /auth/v5/my-sites/`** (JWT) for assigned sites, **today’s current site** (cache then `AssignmentDailySite`), and visitor SiteSetting.
 
 - Web: fill header dropdown from `assigned_sites`; default select `current_site` when set.
 - Mobile: no global header — use `current_site.id` on create/list when set.
@@ -158,14 +164,15 @@ A user can be on many sites, or “all sites in org”.
 - `all_org_sites`: boolean
 - Visitor SiteSetting keys stay as today (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`)
 
-**Posted / selected site:** not on login. **Web and mobile** use **`GET /auth/my-sites/`** — `current_site` from `AssignmentDailySite` for today, plus assigned sites + visitor SiteSetting (see backend plan §5.8). Web may still persist header `selectedSiteId` in session after that.
+**Posted / selected site:** not on live login. Use **`GET /auth/v5/my-sites/`** — `current_site` = latest `GuardSiteCache` else `AssignmentDailySite`. Web may still persist header `selectedSiteId` in session after that.
 
 ### 6.2 Existing tables — add nullable `site` FK → `LocationSite`
 
 | Table | App | Today | Change |
 |-------|-----|--------|--------|
 | `Assignment` | scheduler | location + shift, date range, no site | **No `site` column.** Daily posted site in new table |
-| `AssignmentDailySite` (new) | scheduler | — | guard + date + site (+ optional assignment FK) |
+| `AssignmentDailySite` (new) | scheduler | — | guard + date + site (roster) |
+| `GuardSiteCache` (new) | scheduler | — | site switches **after attendance** only; many rows OK; return **latest** |
 | `Checkpoint` | scheduler | location only | **No `site`** — create / assign unchanged |
 | `CheckIn` (scan log) | checkin | no site | **Add `site`** when user marks checkpoint scanned |
 | `incidentreport` | incident | location only | Add `site` |
@@ -304,12 +311,12 @@ Login and **refresh-token** already return the same flat `data` shape. We will *
 
 If `assigned_sites` is empty and `all_org_sites` is false → treat as no site access (show message).
 
-Login does **not** include posted site. **Web and mobile** call **`GET /auth/my-sites/`** (JWT) after login (web: layout load; mobile: app open).
+Login **v5** does **not** include posted site. Call **`GET /auth/v5/my-sites/`** after login v5 (web: layout load; mobile: app open). Live login/refresh stay unchanged.
 
 | Field | Meaning |
 |-------|---------|
 | `assigned_sites` / `all_org_sites` | Same as login |
-| `current_site` | `{ id, name, date }` from `AssignmentDailySite` for today, or `null` |
+| `current_site` | `{ id, name, date }` — latest `GuardSiteCache` for today, else `AssignmentDailySite`, else `null` |
 | `is_host_approve_enabled` | Host approval SiteSetting |
 | `visitor_default_purpose_of_visit` | Default purpose SiteSetting |
 | `visitor_default_remarks` | Default remarks SiteSetting |
@@ -342,18 +349,20 @@ Do **not** request a `site_id` the user is not assigned to (403/400).
 
 ## 10. Suggested rollout (phases)
 
-| Phase | Work | Depends on |
-|-------|------|------------|
-| **P0** | `UserSite` + `all_org_sites`; login/refresh sites; user create/edit sites; Users list rules | — |
-| **P1** | Web global Site dropdown | P0 |
-| **P2** | Daily posted-site table + APIs; **GET `/auth/my-sites/`**; scan saves `site` on `CheckIn`; assign UIs write daily site | P0 |
-| **P3** | Dashboard reports filter by `site_id` (attendance already has data) | P1 |
-| **P4** | Incident `site` + APIs + web + mobile create | P0–P1 |
-| **P5** | Visitor `site` + APIs + web + mobile create | P0–P1 |
-| **P6** | Payslip site scope | P0–P1 |
-| **P7** | PDF Site line = real site name | After P3–P5 |
+Same order as modules. **v5 APIs only** — live paths unchanged.
 
-**Transition:** new columns nullable. Old mobile builds without `site_id` keep working until create is required.
+| Phase | Module | Work | Depends on |
+|-------|--------|------|------------|
+| **P0** | Users | `UserSite` + `all_org_sites`; user create/edit/list **v5** | — |
+| **P1** | Foundation | Login/refresh **v5**; `GET/POST /auth/v5/my-sites/`; header Site dropdown | P0 |
+| **P2** | Shift assign | `AssignmentDailySite` + `GuardSiteCache`; assign **v5**; `shift_today_v5` | P0–P1 |
+| **P3** | Incident | Create + filter/export **v5** | P1 |
+| **P4** | Visitor | Create + list/export **v5** | P1 |
+| **P5** | Payslip | Employee scope **v5** | P0 |
+| **P6** | Dashboard | Punch/scan/list/export **v5**; roll call **v5** | P2 |
+| **P7** | PDF | Site line = real site name on v5 PDFs | P6 |
+
+Live builds keep calling old URLs. New builds call **v5**.
 
 ---
 
@@ -365,9 +374,9 @@ Do **not** request a `site_id` the user is not assigned to (403/400).
 | **Org scope** | Admin = **their org only**. Super Admin = **all orgs** |
 | **Users list** | Selected site users. Admin = their org. Super Admin = all orgs |
 | **Header (web)** | Global Site select; drives Dashboard, Users, Payslip, Incident, Visitor |
-| **DB** | User–site access; `AssignmentDailySite`; `site` on **`CheckIn`** (scan), Incident, VisitorEntry; attendance/`CheckInLog` already has site. **Not** on Assignment, Shift, or Checkpoint |
-| **Backend** | Enforce allowed `site_id` on list + create; login/refresh returns assigned sites; GET my-sites returns assigned + posted site + visitor settings |
+| **DB** | User–site access; `AssignmentDailySite` (roster); `GuardSiteCache` (latest selected); `site` on **`CheckIn`** (scan), Incident, VisitorEntry; attendance/`CheckInLog` already has site. **Not** on Assignment, Shift, or Checkpoint |
+| **Backend** | Live APIs unchanged. Site-wise on **v5** copies. Enforce `site_id` on v5 list + create |
 | **Web** | GET my-sites → header dropdown + default site; module filters/creates |
 | **Mobile** | Same GET my-sites; send `site_id` on create and lists |
 
-Implementation starts at **P0 (user–site + login payload)** so web and mobile can integrate against a stable contract.
+Implementation starts at **P0 (Users)** then **P1 (Foundation)**. Live APIs stay; new clients use **v5**.

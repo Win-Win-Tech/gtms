@@ -77,6 +77,10 @@ class User(AbstractBaseUser, PermissionsMixin):
         default='Asia/Kolkata',
         help_text="User's timezone (e.g., 'Asia/Kolkata', 'America/New_York')"
     )
+    all_org_sites = models.BooleanField(
+        default=False,
+        help_text="If true, user can access every site in their organisation (no UserSite rows needed).",
+    )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
 
@@ -170,6 +174,30 @@ class User(AbstractBaseUser, PermissionsMixin):
         ]
 
 
+class UserSite(models.Model):
+    """Which sites this user may access (when all_org_sites is false)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="user_sites",
+    )
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.CASCADE,
+        related_name="user_sites",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "site")
+        indexes = [
+            models.Index(fields=["user", "site"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} → {self.site_id}"
 
 
 @receiver(post_save, sender=Role)
