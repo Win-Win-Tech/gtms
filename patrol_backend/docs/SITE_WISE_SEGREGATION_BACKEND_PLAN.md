@@ -227,10 +227,12 @@ Module order for this section: **Users → Foundation → Shift assign → Incid
 
 ### 4.2 Foundation (auth / current site)
 
+**Do not change live login or refresh-token.** No `/auth/v5/login/` or `/auth/v5/refresh-token/`. Web and mobile call **`GET /auth/v5/my-sites/`** after live login.
+
 | Method | Live (do not change) | v5 |
 |--------|----------------------|-----|
-| POST | `/auth/login/` | `/auth/v5/login/` — `data` adds `assigned_sites: [{ id, name }]`, `all_org_sites`. Visitor keys stay as today. **No** `current_site` |
-| POST | `/auth/refresh-token/` | `/auth/v5/refresh-token/` — same as login v5 |
+| POST | `/auth/login/` | **None — keep live** |
+| POST | `/auth/refresh-token/` | **None — keep live** |
 | GET | — | `/auth/v5/my-sites/` — **new** |
 | POST | — | `/auth/v5/my-sites/` — **new** (select / switch) |
 
@@ -430,7 +432,7 @@ Live URLs stay. All new behaviour is on **v5**.
 | Phase | Module | Work |
 |-------|--------|------|
 | **B0** | Users | `UserSite` + `all_org_sites`; user create/update/list **v5** |
-| **B1** | Foundation | Login/refresh **v5**; `GET/POST /auth/v5/my-sites/` |
+| **B1** | Foundation | **No login/refresh v5.** `GET/POST /auth/v5/my-sites/` |
 | **B2** | Shift assign | `AssignmentDailySite` + `GuardSiteCache`; assign **v5**; `shift_today_v5` |
 | **B3** | Incident | Create + filter/export **v5** |
 | **B4** | Visitor | Create + list/export **v5** |

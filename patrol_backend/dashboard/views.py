@@ -7284,11 +7284,34 @@ def _get_monthly_attendance_summary_data_v2(
             site_names[str(site_id)] = site_obj.name
 
     a_lookup = {}
+    any_site_lookup = {}
     if gids:
-        att_qs = AttendanceCheckin.objects.filter(guard_id__in=gids, shift_date__range=(start_date, end_date))
+        base_att_qs = AttendanceCheckin.objects.filter(
+            guard_id__in=gids,
+            shift_date__range=(start_date, end_date),
+        )
+        for att in base_att_qs.values(
+            'guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time',
+            'checkout_time', 'duration_minutes', 'shift_id', 'modified_on',
+            'checkin_time', 'last_checkin_time', 'site_id'
+        ):
+            key = (str(att['guard_id']), str(att['org_location_id']) if att['org_location_id'] else None, att['shift_date'])
+            existing_any = any_site_lookup.get(key)
+            if existing_any:
+                new_l = att['last_checkout_time'] or att['checkout_time'] or att['modified_on']
+                old_l = existing_any['last_checkout_time'] or existing_any['checkout_time'] or existing_any['modified_on']
+                if new_l and (not old_l or new_l > old_l):
+                    any_site_lookup[key] = att
+            else:
+                any_site_lookup[key] = att
+        att_iter = base_att_qs
         if site_id:
-            att_qs = att_qs.filter(site_id=site_id)
-        for att in att_qs.values('guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time', 'checkout_time', 'duration_minutes', 'shift_id', 'modified_on', 'checkin_time', 'last_checkin_time', 'site_id'):
+            att_iter = base_att_qs.filter(site_id=site_id)
+        for att in att_iter.values(
+            'guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time',
+            'checkout_time', 'duration_minutes', 'shift_id', 'modified_on',
+            'checkin_time', 'last_checkin_time', 'site_id'
+        ):
             key = (str(att['guard_id']), str(att['org_location_id']) if att['org_location_id'] else None, att['shift_date'])
             existing = a_lookup.get(key)
             if existing:
@@ -7309,7 +7332,8 @@ def _get_monthly_attendance_summary_data_v2(
             "employee_code": getattr(guard, "employee_code", None) or "", 
             "designation": (getattr(guard, "role", None) or "").strip(),
             "site_name": site_names.get(str(site_id)) if site_id else "",
-            "site_map": {}
+            "site_map": {},
+            "other_site_map": {},
         }
         for date in date_range:
             k = date.strftime("%d-%b")
@@ -7317,7 +7341,12 @@ def _get_monthly_attendance_summary_data_v2(
             if (sgid, slid, date) in w_lookup: row[k] = "W"; continue
             if not any(a.start_date <= date <= a.end_date for a in data["assignments"]): row[k] = ""; continue
             att = a_lookup.get((sgid, slid, date))
-            if not att: row[k] = ""; continue
+            if not att:
+                any_att = any_site_lookup.get((sgid, slid, date))
+                if site_id and any_att and str(any_att.get("site_id") or "") != str(site_id):
+                    row["other_site_map"][k] = str(any_att["site_id"]) if any_att.get("site_id") else "__unknown__"
+                row[k] = ""
+                continue
             row["site_map"][k] = str(att['site_id']) if att.get('site_id') else None
             if att.get('pa_status'): row[k] = _monthly_normalize_status(att['pa_status'])
             elif att.get('checkout_time') or att.get('last_checkout_time'):

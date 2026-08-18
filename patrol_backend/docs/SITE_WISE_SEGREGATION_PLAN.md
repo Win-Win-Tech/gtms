@@ -7,6 +7,7 @@ This document is a **high-level overview**. Detailed plans:
 
 - Backend: [`SITE_WISE_SEGREGATION_BACKEND_PLAN.md`](./SITE_WISE_SEGREGATION_BACKEND_PLAN.md)
 - Frontend (web): [`SITE_WISE_SEGREGATION_FRONTEND_PLAN.md`](./SITE_WISE_SEGREGATION_FRONTEND_PLAN.md)
+- Implemented v5 APIs (params + responses): [`SITE_WISE_SEGREGATION_V5_API.md`](./SITE_WISE_SEGREGATION_V5_API.md)
 
 This is a **plan only**. It is not API curl or implementation code.
 
@@ -54,7 +55,7 @@ Build in this order. Each step needs the one above.
 | # | Module | Depends on | Why this order |
 |---|--------|------------|----------------|
 | 1 | **Users** | — | `UserSite` / `all_org_sites` on create, update, list. Nothing else can know who may use which site |
-| 2 | **Foundation** | Users | Login/refresh **v5**, `GET/POST /auth/v5/my-sites/`, `current_site` helper (cache then daily). Header / selected site |
+| 2 | **Foundation** | Users | **No login/refresh v5.** Live login + `GET/POST /auth/v5/my-sites/`, `current_site` helper (cache then daily). Header / selected site |
 | 3 | **Shift assign** | Users + Foundation | `AssignmentDailySite` on assign; select/switch before attendance updates daily; after attendance → `GuardSiteCache` |
 | 4 | **Incident** | Foundation | Create/list/export with `site_id` from `current_site` |
 | 5 | **Visitor** | Foundation | Create/list/export with `site_id` from `current_site` |
@@ -132,7 +133,7 @@ List / Report / Export
     → Backend also enforces user cannot request a site they are not assigned to
 ```
 
-**Web and mobile** both call **`GET /auth/v5/my-sites/`** (JWT) for assigned sites, **today’s current site** (cache then `AssignmentDailySite`), and visitor SiteSetting.
+**Web and mobile** both call **`GET /auth/v5/my-sites/`** (JWT) after live login for assigned sites and **today’s current site** (cache then `AssignmentDailySite`). Visitor SiteSetting stays on live login.
 
 - Web: fill header dropdown from `assigned_sites`; default select `current_site` when set.
 - Mobile: no global header — use `current_site.id` on create/list when set.
@@ -158,13 +159,15 @@ A user can be on many sites, or “all sites in org”.
 - Pick sites: one / many / “All sites in this organisation”.
 - Admin of the org and Super Admin can assign sites to users.
 
-**Login / refresh / profile payload:** add
+**Login / refresh:** **do not change.** Visitor SiteSetting keys stay on live login.
+
+**Sites for web and mobile:** **`GET /auth/v5/my-sites/`** after login:
 
 - `assigned_sites`: `[{ id, name }]`
 - `all_org_sites`: boolean
-- Visitor SiteSetting keys stay as today (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`)
+- `current_site` = latest `GuardSiteCache` else `AssignmentDailySite` else `null`
 
-**Posted / selected site:** not on live login. Use **`GET /auth/v5/my-sites/`** — `current_site` = latest `GuardSiteCache` else `AssignmentDailySite`. Web may still persist header `selectedSiteId` in session after that.
+Web may persist header `selectedSiteId` in session after that.
 
 ### 6.2 Existing tables — add nullable `site` FK → `LocationSite`
 
@@ -194,8 +197,8 @@ Nullable first so old data still works. New creates should send `site_id`.
   - Super Admin: all orgs; filter by selected org + `site_id`.  
   - Admin: users in **their org** for the requested `site_id`.  
   - Others: users assigned to that site; caller must be allowed that site.
-- Login + refresh-token: include `assigned_sites` + `all_org_sites` (same wrapper as today: `status`, `message`, `data`).
 - Helper used by all modules: **resolve allowed site IDs for `request.user`**; reject `site_id` if not allowed.
+- **Do not change login or refresh-token.** Web and mobile call **`GET /auth/v5/my-sites/`** after login for `assigned_sites`, `all_org_sites`, `current_site`.
 
 ### 7.2 Scheduler (shift assign + checkpoints)
 
@@ -253,7 +256,7 @@ Same idea as **bulk attendance already assigning site**.
 
 **Behaviour:**
 
-- Load sites from login/refresh payload (or sites API filtered by assignment).
+- Load sites from **`GET /auth/v5/my-sites/`** (not from login).
 - Show **only assigned sites**.
 - Persist `selectedSiteId` in session (like `locationId`).
 - On change: pages refetch. Do not keep a second conflicting Site dropdown on every page (attendance may keep local Site until we switch it to global).
@@ -297,29 +300,19 @@ Same idea as **bulk attendance already assigning site**.
 
 ## 9. Mobile app changes
 
-Login and **refresh-token** already return the same flat `data` shape. We will **add** site fields; we will **not** change the wrapper (`status`, `message`, `data`).
+**Do not change login or refresh-token.** Visitor keys stay on live login as today. After login (and on app open if already logged in), call **`GET /auth/v5/my-sites/`**.
 
-### 9.1 After login / refresh — consume new fields
+### 9.1 After login — `GET /auth/v5/my-sites/`
 
 | Field | Meaning |
 |-------|---------|
 | `assigned_sites` | `[{ "id": "...", "name": "..." }]` — sites this user may use |
 | `all_org_sites` | `true` = all sites in org |
-| `is_host_approve_enabled` | Already on login today — keep |
-| `visitor_default_purpose_of_visit` | Already on login today — keep |
-| `visitor_default_remarks` | Already on login today — keep |
+| `current_site` | `{ id, name, date }` — latest `GuardSiteCache` for today, else `AssignmentDailySite`, else `null` (null until shift-assign tables exist) |
+
+Visitor SiteSetting keys stay on **live login** (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`).
 
 If `assigned_sites` is empty and `all_org_sites` is false → treat as no site access (show message).
-
-Login **v5** does **not** include posted site. Call **`GET /auth/v5/my-sites/`** after login v5 (web: layout load; mobile: app open). Live login/refresh stay unchanged.
-
-| Field | Meaning |
-|-------|---------|
-| `assigned_sites` / `all_org_sites` | Same as login |
-| `current_site` | `{ id, name, date }` — latest `GuardSiteCache` for today, else `AssignmentDailySite`, else `null` |
-| `is_host_approve_enabled` | Host approval SiteSetting |
-| `visitor_default_purpose_of_visit` | Default purpose SiteSetting |
-| `visitor_default_remarks` | Default remarks SiteSetting |
 
 ### 9.2 Site selection in the app
 
@@ -354,7 +347,7 @@ Same order as modules. **v5 APIs only** — live paths unchanged.
 | Phase | Module | Work | Depends on |
 |-------|--------|------|------------|
 | **P0** | Users | `UserSite` + `all_org_sites`; user create/edit/list **v5** | — |
-| **P1** | Foundation | Login/refresh **v5**; `GET/POST /auth/v5/my-sites/`; header Site dropdown | P0 |
+| **P1** | Foundation | **No login/refresh v5.** `GET/POST /auth/v5/my-sites/`; header Site dropdown | P0 |
 | **P2** | Shift assign | `AssignmentDailySite` + `GuardSiteCache`; assign **v5**; `shift_today_v5` | P0–P1 |
 | **P3** | Incident | Create + filter/export **v5** | P1 |
 | **P4** | Visitor | Create + list/export **v5** | P1 |
@@ -379,4 +372,4 @@ Live builds keep calling old URLs. New builds call **v5**.
 | **Web** | GET my-sites → header dropdown + default site; module filters/creates |
 | **Mobile** | Same GET my-sites; send `site_id` on create and lists |
 
-Implementation starts at **P0 (Users)** then **P1 (Foundation)**. Live APIs stay; new clients use **v5**.
+Implementation starts at **P0 (Users)** then **P1 (Foundation)**. Live login/refresh stay; new clients use **v5** for site-wise APIs and **`GET /auth/v5/my-sites/`** after login.

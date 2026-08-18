@@ -99,13 +99,16 @@ Screens:
 
 ## 5. Login / session
 
-After login and refresh **v5**, also call **`GET /auth/v5/my-sites/`**. Store:
+Keep live **`POST /auth/login/`** and **`POST /auth/refresh-token/`**. Do not add login/refresh v5.
+
+After login (web: layout load; mobile: app open), call **`GET /auth/v5/my-sites/`**. Store:
 
 - `assigned_sites`
 - `all_org_sites`
 - `current_site` (latest `GuardSiteCache` for today, else daily roster, or null)
-- visitor SiteSetting keys (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`)
 - `selectedSiteId` — prefer `current_site.id`, else the only assigned site, else last session value if still allowed
+
+Visitor SiteSetting keys stay on **live login** (`is_host_approve_enabled`, `visitor_default_purpose_of_visit`, `visitor_default_remarks`).
 
 If none and not all-org-sites, show no site access.
 

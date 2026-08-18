@@ -10,6 +10,7 @@ from .views import (
     ChecklistItemViewSet,
     ChecklistTemplateViewSet,
 )
+from .views_v5 import AssignmentViewSetV5
 
 router = DefaultRouter()
 router.register('locations', LocationViewSet)
@@ -21,9 +22,9 @@ router.register('checkpoint-templates', CheckpointTemplateViewSet, basename='che
 router.register('checklist-items', ChecklistItemViewSet, basename='checklistitem')
 router.register('checklist-templates', ChecklistTemplateViewSet, basename='checklisttemplate-master')
 
-#router.register('checkpoint-templates/shift/<uuid:shift_id>/', CheckpointTemplateByShiftView, basename='checkpoint-templates-by-shift')
+v5_router = DefaultRouter()
+v5_router.register('assignments', AssignmentViewSetV5, basename='assignments-v5')
 
-#path('checkpoint-templates/shift/<uuid:shift_id>/', CheckpointTemplateByShiftView.as_view(), name='checkpoint-templates-by-shift'),
-
-urlpatterns = router.urls
-
+urlpatterns = router.urls + [
+    path('v5/', include(v5_router.urls)),
+]

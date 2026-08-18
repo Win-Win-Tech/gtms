@@ -297,6 +297,80 @@ class Assignment(models.Model):
     def __str__(self):
         return f"Assignment for {self.guard}"
 
+
+class AssignmentDailySite(models.Model):
+    """Posted site for one guard on one calendar date. Not stored on Assignment."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    guard = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="daily_sites",
+    )
+    date = models.DateField(db_index=True)
+    site = models.ForeignKey(
+        "LocationSite",
+        on_delete=models.CASCADE,
+        related_name="daily_assignments",
+    )
+    location = models.ForeignKey(
+        "Location",
+        on_delete=models.CASCADE,
+        related_name="daily_assignment_sites",
+    )
+    assignment = models.ForeignKey(
+        Assignment,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="daily_sites",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["guard", "date"], name="uniq_daily_site_guard_date"),
+        ]
+        indexes = [
+            models.Index(fields=["guard", "date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.guard} {self.date} {self.site}"
+
+
+class GuardSiteCache(models.Model):
+    """Site switches after attendance is marked that day. Many rows per day; return latest."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    guard = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="site_cache",
+    )
+    date = models.DateField(db_index=True)
+    site = models.ForeignKey(
+        "LocationSite",
+        on_delete=models.CASCADE,
+        related_name="guard_site_cache",
+    )
+    location = models.ForeignKey(
+        "Location",
+        on_delete=models.CASCADE,
+        related_name="guard_site_cache",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["guard", "date", "created_on"]),
+        ]
+        ordering = ["-created_on"]
+
+    def __str__(self):
+        return f"{self.guard} {self.date} cache {self.site}"
+
 class Checkpoint(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     location = models.ForeignKey('Location', on_delete=models.CASCADE)

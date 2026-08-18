@@ -17,7 +17,13 @@ from .site_access import (
     is_org_admin,
     users_queryset_for_site,
 )
-from .views import UserCreateView, UserDetailView, UserListView, UserUpdateView
+from .views import (
+    UserCreateView,
+    UserDetailView,
+    UserListView,
+    UserUpdateView,
+    build_login_client_fields,
+)
 
 
 class UserCreateViewV5(UserCreateView):
@@ -206,9 +212,45 @@ class UserByRoleViewV5(APIView):
 
 
 class MySitesViewV5(APIView):
-    """Assigned sites for the header dropdown. POST (select/switch) comes with shift-assign tables."""
+    """Assigned sites for header/mobile. GET list; POST select/switch for that day."""
 
     permission_classes = [permissions.IsAuthenticated]
+
+    def _on_date(self, request, raw):
+        from datetime import datetime
+
+        from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, get_user_today
+
+        if raw:
+            try:
+                return datetime.strptime(str(raw).strip(), "%Y-%m-%d").date()
+            except ValueError:
+                raise ValidationError({"date": "Use YYYY-MM-DD."})
+        tz = get_user_timezone_from_request(request)
+        return get_user_today(tz)
+
+    def _payload(self, request, caller, location_id, on_date):
+        from scheduler.daily_site import site_ids_payload
+
+        ids = site_ids_payload(caller, on_date)
+        settings = build_login_client_fields(request, caller)
+        return {
+            "sites": header_sites_payload(caller, location_id=location_id),
+            "all_org_sites": bool(
+                caller.is_superuser
+                or is_org_admin(caller)
+                or getattr(caller, "all_org_sites", False)
+            ),
+            "assigned_site_id": ids["assigned_site_id"],
+            "assigned_site_name": ids["assigned_site_name"],
+            "last_selected_site_id": ids["last_selected_site_id"],
+            "last_selected_site_name": ids["last_selected_site_name"],
+            "is_qr_scan_enabled": settings.get("is_qr_scan_enabled"),
+            "is_host_approve_enabled": settings.get("is_host_approve_enabled"),
+            "visitor_default_purpose_of_visit": settings.get("visitor_default_purpose_of_visit"),
+            "visitor_default_remarks": settings.get("visitor_default_remarks"),
+            "visitor_expected_out_hours": settings.get("visitor_expected_out_hours"),
+        }
 
     def get(self, request):
         caller = request.user
@@ -217,17 +259,51 @@ class MySitesViewV5(APIView):
             if location_id and not caller.is_superuser:
                 if not caller.location_id or str(caller.location_id) != str(location_id):
                     raise PermissionDenied("You can only list sites for your organisation.")
-            assigned = header_sites_payload(caller, location_id=location_id)
-            data = {
-                "assigned_sites": assigned,
-                "all_org_sites": bool(
-                    caller.is_superuser
-                    or is_org_admin(caller)
-                    or getattr(caller, "all_org_sites", False)
-                ),
-                "current_site": None,
-            }
+            on_date = self._on_date(request, request.query_params.get("date"))
+            data = self._payload(request, caller, location_id, on_date)
             return Response(api_response("success", "Sites fetched", data, status.HTTP_200_OK))
+        except ValidationError as e:
+            return Response(
+                api_response("error", "Validation failed", e.detail, status.HTTP_400_BAD_REQUEST),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except PermissionDenied as e:
+            return Response(
+                api_response("error", str(e), None, status.HTTP_403_FORBIDDEN),
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except Exception as e:
+            return Response(
+                api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def post(self, request):
+        from scheduler.daily_site import apply_select_site
+
+        caller = request.user
+        site_id = request.data.get("site_id")
+        if not site_id:
+            return Response(
+                api_response("error", "site_id is required", None, status.HTTP_400_BAD_REQUEST),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            on_date = self._on_date(request, request.data.get("date"))
+            apply_select_site(caller, site_id, on_date)
+            location_id = request.data.get("location_id") or request.query_params.get("location_id") or None
+            if caller.is_superuser and not location_id:
+                from scheduler.models import LocationSite
+
+                site = LocationSite.objects.filter(id=site_id).first()
+                location_id = str(site.location_id) if site else None
+            data = self._payload(request, caller, location_id, on_date)
+            return Response(api_response("success", "Site selected", data, status.HTTP_200_OK))
+        except ValidationError as e:
+            return Response(
+                api_response("error", "Validation failed", e.detail, status.HTTP_400_BAD_REQUEST),
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except PermissionDenied as e:
             return Response(
                 api_response("error", str(e), None, status.HTTP_403_FORBIDDEN),

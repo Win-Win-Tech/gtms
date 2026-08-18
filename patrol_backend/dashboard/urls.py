@@ -2,13 +2,7 @@ from .views import *
 from .views import AttendanceCheckinViewSet, AttendanceCheckinListView
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import (
-    AttendanceWeekOffViewSet,
-    DashboardCheckInReportView,
-    DashboardCheckInReportExcelView,
-    MonthlyAttendanceExcelViewSet,
-    MonthlyAttendanceSummaryViewSet,
-)
+from .views_v5 import CreateAssignmentV5, ShiftTodayV5
 
 
 router = DefaultRouter()
@@ -38,6 +32,8 @@ urlpatterns = [
     path("api/attendance/export_v3/", AttendanceCheckinV3ExportView.as_view(), name="attendance-export-api-v3"),
     path("api/attendance/export_v4/", AttendanceCheckinV4ExportView.as_view(), name="attendance-export-api-v4"),
     path("api/attendance/export_v4_pdf/", AttendanceCheckinV4PdfExportView.as_view(), name="attendance-export-api-v4-pdf"),
+    path("attendance/shift_today_v5/", ShiftTodayV5.as_view(), name="shift_today_v5"),
+    path("attendance/create_assignment_v5/", CreateAssignmentV5.as_view(), name="create_assignment_v5"),
 ]
 
 
