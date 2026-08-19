@@ -1,6 +1,6 @@
 # Site-wise Segregation — v5 API Reference
 
-**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign  
+**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign + Incident  
 **Date:** 18 Aug 2026  
 **Auth:** JWT `Authorization: Bearer <access>` unless noted  
 
@@ -55,6 +55,13 @@ All v5 auth APIs use the existing wrapper. HTTP status is on the response; it is
 | Today’s shift (mobile) | `GET /dashboard/attendance/shift_today_v3/` | `GET /dashboard/attendance/shift_today_v5/` |
 | List default shifts (mobile) | `GET /dashboard/attendance/list_default_shifts/` | same live path |
 | Attach checkpoint template (mobile) | `POST /dashboard/attendance/assign-checkpoint-template/` | same live path |
+| Report incident | `POST /incident/report/` | `POST /incident/v5/report/` — **`site_id` required** |
+| Incident list | `GET /incident/dashboard/filter/` | `GET /incident/v5/dashboard/filter/` |
+| Incident Excel | `GET /incident/dashboard/export-excel/` | `GET /incident/v5/dashboard/export-excel/` |
+| Incident PDF | `GET /incident/dashboard/export-pdf/` | `GET /incident/v5/dashboard/export-pdf/` |
+| My tickets Excel | `GET /incident/mytickets/export-excel/` | `GET /incident/v5/mytickets/export-excel/` |
+| Assign incident | `POST /incident/assign/<ticket>/` | `POST /incident/v5/assign/<ticket>/` |
+| Resolve incident | `POST /incident/resolve/<ticket>/` | `POST /incident/v5/resolve/<ticket>/` |
 
 ---
 
@@ -791,6 +798,230 @@ Live `shift_today_v3` and `create_assignment` stay unchanged for old app builds.
 
 ---
 
+## 22. Incident — v5
+
+Live `/incident/...` URLs are unchanged. Site is stored on `incidentreport.site` (nullable FK to `LocationSite`). Old tickets have `site = null`.
+
+List/create/assign/resolve **v5 responses are the incident object (or array of objects)**, same shape as live, **plus** `site_id` and `site_name`. They do **not** use the auth `{ status, message, data }` wrapper.
+
+Twilio WhatsApp + voice and Cloudinary upload on create are the same as live. If Twilio fails, the ticket is still created (`201`).
+
+### Client flow
+
+```
+POST /auth/login/                         (live)
+GET  /auth/v5/my-sites/                   sites[], last_selected_site_id
+        ↓
+Web:  header Location + Site
+      GET /incident/v5/dashboard/filter/?location_id=<org>&site_id=<site|omit>
+Mobile create:
+      POST /incident/v5/report/            site_id required
+```
+
+Mobile should send `last_selected_site_id` from my-sites as `site_id` when reporting.
+
+---
+
+### 22.1 `POST /incident/v5/report/`
+
+Create an incident at a site. Same multipart rules as live, plus **`site_id` required**.
+
+**Auth:** JWT  
+**Content-Type:** `multipart/form-data`
+
+`location` on the row is taken from the selected site’s organisation (not from the caller’s `location` when that would be wrong, e.g. Super Admin).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|--------|
+| `site_id` | UUID | **yes** | Must be allowed for the caller. Inactive / unknown → 400 |
+| `severity` | string | no | `High` / `Medium` / `Low`. Default `Medium` |
+| `incident_description` | string | one of | Text **or** `description_audio` (or both) |
+| `description_audio` | file | one of | Voice note |
+| `photo` | file | no | |
+| `video` | file | no | |
+| `checkpoint` | UUID | no | Master checkpoint (no site on Checkpoint) |
+
+```bash
+curl -X POST "https://your-domain.com/incident/v5/report/" \
+  -H "Authorization: Bearer ACCESS" \
+  -F "site_id=<site-uuid>" \
+  -F "severity=High" \
+  -F "incident_description=Fire alarm near Gate 2" \
+  -F "checkpoint=<checkpoint-uuid-optional>" \
+  -F "photo=@/path/to/photo.jpg"
+```
+
+Audio-only:
+
+```bash
+curl -X POST "https://your-domain.com/incident/v5/report/" \
+  -H "Authorization: Bearer ACCESS" \
+  -F "site_id=<site-uuid>" \
+  -F "severity=Medium" \
+  -F "incident_description=" \
+  -F "description_audio=@/path/to/voice_note.m4a"
+```
+
+### Success — `201`
+
+Incident object. Extra vs live:
+
+| Field | Meaning |
+|-------|---------|
+| `site_id` | UUID of posted site |
+| `site_name` | Site name |
+| `location` | Org UUID (from the site) |
+| `location_name` | Org name |
+| `ticket_number` | Generated |
+| `status` | `Open` on create |
+| `created_on` | Caller / org timezone ISO |
+
+Live `POST /incident/report/` does **not** require or save `site_id`.
+
+### Errors
+
+| HTTP | When |
+|------|------|
+| 400 | Missing `site_id`; unknown / inactive site; no text and no audio |
+| 403 | Caller not allowed that site |
+| 401 | Not authenticated |
+
+Missing `site_id`:
+
+```json
+{ "site_id": ["This field is required."] }
+```
+
+---
+
+### 22.2 `GET /incident/v5/dashboard/filter/`
+
+List incidents. Same filters as live, plus `site_id`. Used by web Incidents and My Tickets (`assigned_to=<self>`).
+
+**Auth:** JWT
+
+| Query | Type | Required | Notes |
+|-------|------|----------|--------|
+| `location_id` | UUID | Super Admin: yes (header org). Others: optional | Org filter |
+| `site_id` | UUID | no | Header one site. **Omit** when header is **All** (`all` is treated as omit) |
+| `date_filter` | string | no | See date table. Default: no date range if omitted / unknown |
+| `start_date` | `YYYY-MM-DD` | with custom | Inclusive |
+| `end_date` | `YYYY-MM-DD` | with custom | Inclusive |
+| `status` | string | no | `Open` / `In-Progress` / `Closed` (web may send `open` / `inprogress` / `close`) |
+| `severity` | string | no | `Low` / `Medium` / `High` |
+| `assigned_to` | UUID | no | My Tickets: current user |
+| `created_by` | UUID | no | |
+| `checkpoint_id` | UUID | no | |
+
+**`date_filter` (v5 only — live still ignores yesterday / last_week / last_month)**
+
+| Value | Range (caller / org timezone) |
+|-------|-------------------------------|
+| `today` | Today |
+| `yesterday` | Yesterday |
+| `this_week` | Mon–Sun of this week |
+| `last_week` | Previous Mon–Sun |
+| `this_month` | 1st–last day of this month |
+| `last_month` | Previous calendar month |
+| `custom` | `start_date` + `end_date` required |
+
+### Site filter (header)
+
+| Header Site | Query | Result |
+|-------------|-------|--------|
+| One site | `site_id=<uuid>` | Only that site. Old tickets with `site = null` are **hidden** |
+| **All** | omit `site_id` | Super Admin / Admin / `all_org_sites`: **all tickets in that org**, including `site = null`. Other roles: allowed sites **or** `site` null, same org |
+
+```
+GET /incident/v5/dashboard/filter/?date_filter=last_month&location_id=<org>
+GET /incident/v5/dashboard/filter/?date_filter=today&location_id=<org>&site_id=<site>&status=Open
+GET /incident/v5/dashboard/filter/?date_filter=custom&start_date=2025-01-19&end_date=2026-08-17&location_id=<org>
+GET /incident/v5/dashboard/filter/?date_filter=today&assigned_to=<user-uuid>
+```
+
+### Success — `200`
+
+JSON **array** of incident objects (`site_id`, `site_name` may be `null` on old rows).
+
+### Errors
+
+| HTTP | When |
+|------|------|
+| 400 | Invalid `site_id`, custom dates not `YYYY-MM-DD`, site not in that org |
+| 403 | Site not allowed |
+| 401 | Not authenticated |
+
+---
+
+### 22.3 Excel / PDF
+
+Same query as list. v5 Excel/PDF add a **Site** column. PDF header **Site** is the real site name when `site_id` is present; **All** uses org name.
+
+| Method | v5 |
+|--------|-----|
+| GET | `/incident/v5/dashboard/export-excel/` |
+| GET | `/incident/v5/dashboard/export-pdf/` |
+| GET | `/incident/v5/mytickets/export-excel/` — same filters, plus assigned to the caller |
+
+My Tickets export also applies the header `site_id` / All rule above.
+
+---
+
+### 22.4 `POST /incident/v5/assign/<ticket_number>/`
+
+Same as live. No new body field. Response includes `site_id` / `site_name`.
+
+**Auth:** JWT  
+**Content-Type:** `application/json`
+
+| Field | Type | Required |
+|-------|------|----------|
+| `assigned_to` | UUID | yes |
+
+```bash
+curl -X POST "https://your-domain.com/incident/v5/assign/A1B2C3D4E5F6/" \
+  -H "Authorization: Bearer ACCESS" \
+  -H "Content-Type: application/json" \
+  -d '{"assigned_to": "<user-uuid>"}'
+```
+
+`200` incident object (`status` → `In-Progress`). `404` if ticket unknown.
+
+Assign user picker on web: `GET /users/v5/by-role/?roles=so&roles=fo&location_id=<org>&site_id=<site|omit>`.
+
+---
+
+### 22.5 `POST /incident/v5/resolve/<ticket_number>/`
+
+Same as live. No new body field. Response includes `site_id` / `site_name`.
+
+**Auth:** JWT  
+**Content-Type:** `application/json`
+
+| Field | Type | Required |
+|-------|------|----------|
+| `closure_description` | string | no |
+
+```bash
+curl -X POST "https://your-domain.com/incident/v5/resolve/A1B2C3D4E5F6/" \
+  -H "Authorization: Bearer ACCESS" \
+  -H "Content-Type: application/json" \
+  -d '{"closure_description": "Issue closed"}'
+```
+
+`200` incident object (`status` → `Closed`). `404` if ticket unknown.
+
+---
+
+### 22.6 Web
+
+- Header **Location** + **Site**. No in-page Organisation / Site dropdown.
+- **All** = omit `site_id` on list and export.
+- One site = pass that UUID.
+- Custom range uses the same MUI date field as attendance reports (`start_date` / `end_date` as `YYYY-MM-DD`).
+
+---
+
 ## 21. Not built yet
 
 Login and refresh-token **v5 will not be built**. Keep `POST /auth/login/` and `POST /auth/refresh-token/`.
@@ -798,4 +1029,4 @@ Login and refresh-token **v5 will not be built**. Keep `POST /auth/login/` and `
 | API | Plan |
 |-----|------|
 | `scan_v5`, `checkin/checkout_v5`, monthly-cell-action_v5 | Later (dashboard / attendance) |
-| Incident / visitor / payslip / dashboard list **v5** | Later modules |
+| Visitor / payslip / dashboard list **v5** | Later modules |

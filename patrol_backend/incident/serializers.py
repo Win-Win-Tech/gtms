@@ -24,7 +24,7 @@ class IncidentSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'ticket_number', 'status', 'created_on', 'assigned_on', 'resolved_on',
             'created_by_name', 'assigned_by_name', 'assigned_to_name', 'resolved_by_name',
-            'location_name', 'checkpoint_name'
+            'location_name', 'checkpoint_name', 'site',
         ]
 
     def get_created_by_name(self, obj):
@@ -48,7 +48,8 @@ class IncidentSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         """Convert UTC datetimes to user timezone before serialization"""
         data = super().to_representation(instance)
-        
+        data.pop("site", None)
+
         # Get user timezone from request context
         request = self.context.get('request')
         if request:

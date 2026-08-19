@@ -2,7 +2,7 @@ from django.db import models
 from django.contrib.auth import get_user_model
 import uuid
 from django.utils import timezone
-from scheduler.models import Checkpoint, Location 
+from scheduler.models import Checkpoint, Location, LocationSite 
 
 User = get_user_model()
 
@@ -68,6 +68,13 @@ class incidentreport(models.Model):
 
     checkpoint = models.ForeignKey(Checkpoint, on_delete=models.SET_NULL, null=True, blank=True, related_name='incidents')
     location = models.ForeignKey(Location, on_delete=models.SET_NULL, null=True, blank=True, related_name='incidents')
+    site = models.ForeignKey(
+        LocationSite,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='incidents',
+    )
 
     def save(self, *args, **kwargs):
         # Generate ticket number if not set

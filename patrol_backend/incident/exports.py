@@ -60,13 +60,13 @@ def _calculate_sla_status(incident):
     return "Met" if hours_taken <= threshold_hours else "Not Met"
 
 
-def _incident_export_row(incident, request):
+def _incident_export_row(incident, request, include_site=False):
     incident_location_id = str(incident.location.id) if incident.location else None
     incident_tz = get_user_timezone_from_request(request, location_id=incident_location_id)
     created_on_tz = to_user_timezone(incident.created_on, incident_tz) if incident.created_on else None
     assigned_on_tz = to_user_timezone(incident.assigned_on, incident_tz) if incident.assigned_on else None
     closed_on_tz = to_user_timezone(incident.resolved_on, incident_tz) if incident.resolved_on else None
-    return [
+    row = [
         incident.ticket_number or "",
         incident.severity or "",
         incident.status or "",
@@ -86,6 +86,40 @@ def _incident_export_row(incident, request):
         incident.closure_description or "",
         _calculate_sla_status(incident),
     ]
+    if include_site:
+        row.insert(4, incident.site.name if incident.site else "")
+    return row
+
+
+def _inclusive_dates_for_filter(date_filter, user_today, start_date=None, end_date=None):
+    """Inclusive local dates for v5 date_filter. None = do not filter by date."""
+    if date_filter == "today":
+        return user_today, user_today
+    if date_filter == "yesterday":
+        day = user_today - timedelta(days=1)
+        return day, day
+    if date_filter == "this_week":
+        start = user_today - timedelta(days=user_today.weekday())
+        return start, start + timedelta(days=6)
+    if date_filter == "last_week":
+        start = user_today - timedelta(days=user_today.weekday() + 7)
+        return start, start + timedelta(days=6)
+    if date_filter == "this_month":
+        start = user_today.replace(day=1)
+        if user_today.month == 12:
+            end = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
+        return start, end
+    if date_filter == "last_month":
+        first_this = user_today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return last_prev.replace(day=1), last_prev
+    if date_filter == "custom" and start_date and end_date:
+        start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+        return start_obj, end_obj
+    return None
 
 
 def get_incident_export_queryset(request, assigned_to_user=None):
@@ -106,6 +140,7 @@ def get_incident_export_queryset(request, assigned_to_user=None):
         "resolved_by",
         "location",
         "checkpoint",
+        "site",
     )
     if assigned_to_user is not None:
         queryset = queryset.filter(assigned_to=assigned_to_user)
@@ -119,33 +154,17 @@ def get_incident_export_queryset(request, assigned_to_user=None):
     user_tz = get_user_timezone_from_request(request, location_id=filter_location_id)
     user_today = get_user_now(user_tz).date()
 
-    if date_filter == "today":
-        start_utc, end_utc = convert_date_range_to_utc(user_today, user_today, user_tz)
+    try:
+        bounds = _inclusive_dates_for_filter(date_filter, user_today, start_date, end_date)
+    except ValueError:
+        return None, Response(
+            {"error": "Invalid date format. Use YYYY-MM-DD."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if bounds:
+        range_start, range_end = bounds
+        start_utc, end_utc = convert_date_range_to_utc(range_start, range_end, user_tz)
         queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-    elif date_filter == "this_week":
-        start_of_week = user_today - timedelta(days=user_today.weekday())
-        end_of_week = start_of_week + timedelta(days=6)
-        start_utc, end_utc = convert_date_range_to_utc(start_of_week, end_of_week, user_tz)
-        queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-    elif date_filter == "this_month":
-        start_of_month = user_today.replace(day=1)
-        if user_today.month == 12:
-            end_of_month = user_today.replace(year=user_today.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end_of_month = user_today.replace(month=user_today.month + 1, day=1) - timedelta(days=1)
-        start_utc, end_utc = convert_date_range_to_utc(start_of_month, end_of_month, user_tz)
-        queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-    elif date_filter == "custom" and start_date and end_date:
-        try:
-            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-            start_utc, end_utc = convert_date_range_to_utc(start_date_obj, end_date_obj, user_tz)
-            queryset = queryset.filter(created_on__gte=start_utc, created_on__lt=end_utc + timedelta(days=1))
-        except ValueError:
-            return None, Response(
-                {"error": "Invalid date format. Use YYYY-MM-DD."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
     if location_id:
         queryset = queryset.filter(location_id=location_id)
@@ -170,13 +189,21 @@ def _export_filename(request, prefix, ext):
     return f"{prefix}_{timezone.now().strftime('%Y%m%d')}.{ext}"
 
 
-def generate_incident_excel(queryset, request, prefix="incident_report"):
+def _headers(include_site=False):
+    headers = list(INCIDENT_HEADERS)
+    if include_site:
+        headers.insert(4, "Site")
+    return headers
+
+
+def generate_incident_excel(queryset, request, prefix="incident_report", include_site=False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Incident Report"
-    ws.append(INCIDENT_HEADERS)
+    headers = _headers(include_site)
+    ws.append(headers)
     for incident in queryset:
-        ws.append(_incident_export_row(incident, request))
+        ws.append(_incident_export_row(incident, request, include_site=include_site))
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -197,20 +224,15 @@ def _resolve_pdf_meta(request):
     user_tz = get_user_timezone_from_request(request, location_id=location_id)
     today = get_user_now(user_tz).date()
     range_start, range_end = today, today
-    if date_filter == "this_week":
-        range_start = today - timedelta(days=today.weekday())
-        range_end = range_start + timedelta(days=6)
-    elif date_filter == "this_month":
-        range_start = today.replace(day=1)
-        range_end = today
-    elif date_filter == "custom" and start_date and end_date:
-        try:
-            range_start = datetime.strptime(start_date, "%Y-%m-%d").date()
-            range_end = datetime.strptime(end_date, "%Y-%m-%d").date()
-        except ValueError:
-            pass
+    try:
+        bounds = _inclusive_dates_for_filter(date_filter, today, start_date, end_date)
+        if bounds:
+            range_start, range_end = bounds
+    except ValueError:
+        pass
 
     org_name = "—"
+    site_name = None
     if location_id and location_id != "All":
         from scheduler.models import Location
 
@@ -220,15 +242,26 @@ def _resolve_pdf_meta(request):
     elif getattr(request.user, "location", None):
         org_name = request.user.location.name or "—"
 
+    site_id = request.query_params.get("site_id")
+    if site_id:
+        from scheduler.models import LocationSite
+
+        site = LocationSite.objects.filter(id=site_id).select_related("location").first()
+        if site:
+            site_name = site.name
+            if org_name == "—" and site.location:
+                org_name = site.location.name
+
     return {
         "org_name": org_name,
+        "site_name": site_name,
         "range_start": range_start,
         "range_end": range_end,
         "printed_at": to_user_timezone(timezone.now(), user_tz),
     }
 
 
-def generate_incident_pdf(queryset, request, prefix="incident_report", title="Incident Report"):
+def generate_incident_pdf(queryset, request, prefix="incident_report", title="Incident Report", include_site=False):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4, landscape
@@ -250,7 +283,7 @@ def generate_incident_pdf(queryset, request, prefix="incident_report", title="In
     )
     doc.report_title = title
     doc.org_name = meta["org_name"]
-    doc.dept_label = meta["org_name"]
+    doc.dept_label = meta.get("site_name") or meta["org_name"]
     doc.range_start = meta["range_start"]
     doc.range_end = meta["range_end"]
     doc.printed_at = meta["printed_at"]
@@ -284,18 +317,19 @@ def generate_incident_pdf(queryset, request, prefix="incident_report", title="In
         leading=7,
     )
 
-    data = [[Paragraph(h, header_style) for h in INCIDENT_HEADERS]]
+    headers = _headers(include_site)
+    data = [[Paragraph(h, header_style) for h in headers]]
     rows = list(queryset)
     for incident in rows:
         data.append(
             [
                 Paragraph(str(v) if v not in (None, "") else "—", cell_style)
-                for v in _incident_export_row(incident, request)
+                for v in _incident_export_row(incident, request, include_site=include_site)
             ]
         )
     if len(data) == 1:
         data.append(
-            [Paragraph("No incidents found", cell_style)] + [""] * (len(INCIDENT_HEADERS) - 1)
+            [Paragraph("No incidents found", cell_style)] + [""] * (len(headers) - 1)
         )
 
     ratios = [
@@ -304,6 +338,8 @@ def generate_incident_pdf(queryset, request, prefix="incident_report", title="In
         0.065, 0.055, 0.055, 0.055, 0.055,
         0.08, 0.07, 0.04,
     ]
+    if include_site:
+        ratios.insert(4, 0.055)
     ratio_sum = sum(ratios)
     col_widths = [doc.width * (r / ratio_sum) for r in ratios]
     table = Table(data, colWidths=col_widths, repeatRows=1)
