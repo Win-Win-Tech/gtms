@@ -60,8 +60,15 @@ Do not keep a second Site dropdown on every report page once the header exists. 
 
 ### 4.2 Dashboard
 
-- Attendance, check-in, monthly attendance, monthly location, roll call: pass header `site_id` into existing APIs.
+- Attendance, check-in, monthly attendance, monthly location: pass header `site_id` into existing APIs.
 - Align bulk attendance Site with header (same selected site).
+
+### 4.2a Roll call (web report)
+
+- List + Excel/PDF use **`/rollcall/v5/...`** (not live).
+- Header **Location** + **Site**; no in-page org dropdown.
+- **All** = omit `site_id`; one site = pass that UUID.
+- Table shows a **Site** column (`site_name`).
 
 ### 4.3 Shift assign — no site on Assignment
 

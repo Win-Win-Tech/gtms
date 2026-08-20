@@ -58,9 +58,10 @@ Build in this order. Each step needs the one above.
 | 2 | **Foundation** | Users | **No login/refresh v5.** Live login + `GET/POST /auth/v5/my-sites/`, `current_site` helper (cache then daily). Header / selected site |
 | 3 | **Shift assign** | Users + Foundation | `AssignmentDailySite` on assign; select/switch before attendance updates daily; after attendance → `GuardSiteCache` |
 | 4 | **Incident** | Foundation | Create/list/export with `site_id` from `current_site` |
-| 5 | **Visitor** | Foundation | Create/list/export with `site_id` from `current_site` |
-| 6 | **Payslip** | Users | Employee lists by `UserSite` (no daily-site table) |
-| 7 | **Dashboard** | Shift assign | Attendance punch, scan, lists, roll call, monthly — **last** (needs posted / current site) |
+| 5 | **Roll call** | Foundation | Mobile start/list/end **v5** with `site_id`; web report list/export **v5** |
+| 6 | **Visitor** | Foundation | Create/list/export with `site_id` from `current_site` |
+| 7 | **Payslip** | Users | Employee lists by `UserSite` (no daily-site table) |
+| 8 | **Dashboard** | Shift assign | Attendance punch, scan, lists, monthly — **last** (needs posted / current site). Roll call pulled out to #5 |
 
 **Not in this work:** Live Tracking, Settings, Role Management.
 
@@ -179,6 +180,7 @@ Web may persist header `selectedSiteId` in session after that.
 | `Checkpoint` | scheduler | location only | **No `site`** — create / assign unchanged |
 | `CheckIn` (scan log) | checkin | no site | **Add `site`** when user marks checkpoint scanned |
 | `incidentreport` | incident | location only | Add `site` |
+| `RollCallSession` | rollcall | location + shift | Add `site` on start |
 | `VisitorEntry` | visitor | location only | Add `site` |
 | `AttendanceCheckin` / `CheckInLog` | dashboard | **already has site** | Set on attendance punch (sent `site_id` or geofence) |
 
@@ -229,6 +231,15 @@ Same idea as **bulk attendance already assigning site**.
 - Create (web + mobile): accept `site_id`, validate, save.
 - Filter / dashboard / my-tickets / Excel / PDF: `site_id`.
 - Serializer: return `site_id` / `site_name`.
+
+### 7.4a Roll call
+
+- **Web:** report only — list + Excel/PDF (same as today, but **v5** + header `site_id`).
+- **Mobile:** start / list open+closed / end — all **v5** with `site_id`.
+- `POST /rollcall/v5/sessions/start/` — **`site_id` required**; save on `RollCallSession.site`; `location` from that site.
+- `GET /rollcall/v5/sessions/` — query `site_id` (header All = omit → org scope, include `site` null).
+- `POST /rollcall/v5/sessions/<id>/end/` — **`site_id` required**; must match session site (legacy null-site: site must be in session org).
+- Live `/rollcall/...` unchanged.
 
 ### 7.5 Visitor
 
@@ -350,9 +361,10 @@ Same order as modules. **v5 APIs only** — live paths unchanged.
 | **P1** | Foundation | **No login/refresh v5.** `GET/POST /auth/v5/my-sites/`; header Site dropdown | P0 |
 | **P2** | Shift assign | `AssignmentDailySite` + `GuardSiteCache`; assign **v5**; `shift_today_v5` | P0–P1 |
 | **P3** | Incident | Create + filter/export **v5** | P1 |
+| **P3a** | Roll call | Start/list/end + report export **v5** (`site_id`) | P1 |
 | **P4** | Visitor | Create + list/export **v5** | P1 |
 | **P5** | Payslip | Employee scope **v5** | P0 |
-| **P6** | Dashboard | Punch/scan/list/export **v5**; roll call **v5** | P2 |
+| **P6** | Dashboard | Punch/scan/list/export **v5** (roll call done in P3a) | P2 |
 | **P7** | PDF | Site line = real site name on v5 PDFs | P6 |
 
 Live builds keep calling old URLs. New builds call **v5**.

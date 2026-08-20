@@ -1,7 +1,7 @@
 # Site-wise Segregation — v5 API Reference
 
-**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign + Incident  
-**Date:** 18 Aug 2026  
+**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign + Incident + Roll call  
+**Date:** 20 Aug 2026  
 **Auth:** JWT `Authorization: Bearer <access>` unless noted  
 
 Live URLs were **not** changed. Site-wise behaviour is on **v5 copies only**. Old clients keep calling live paths.
@@ -62,6 +62,12 @@ All v5 auth APIs use the existing wrapper. HTTP status is on the response; it is
 | My tickets Excel | `GET /incident/mytickets/export-excel/` | `GET /incident/v5/mytickets/export-excel/` |
 | Assign incident | `POST /incident/assign/<ticket>/` | `POST /incident/v5/assign/<ticket>/` |
 | Resolve incident | `POST /incident/resolve/<ticket>/` | `POST /incident/v5/resolve/<ticket>/` |
+| Start roll call | `POST /rollcall/sessions/start/` | `POST /rollcall/v5/sessions/start/` — **`site_id` required** |
+| List roll call | `GET /rollcall/sessions/` | `GET /rollcall/v5/sessions/` |
+| End roll call | `POST /rollcall/sessions/<id>/end/` | `POST /rollcall/v5/sessions/<id>/end/` — **`site_id` required** |
+| Roll call Excel | `GET /rollcall/sessions/export/` | `GET /rollcall/v5/sessions/export/` |
+| Roll call PDF | `GET /rollcall/sessions/export-pdf/` | `GET /rollcall/v5/sessions/export-pdf/` |
+| Roll call dashboard filter | `GET /rollcall/dashboard/filter/` | `GET /rollcall/v5/dashboard/filter/` |
 
 ---
 
@@ -1019,6 +1025,140 @@ curl -X POST "https://your-domain.com/incident/v5/resolve/A1B2C3D4E5F6/" \
 - **All** = omit `site_id` on list and export.
 - One site = pass that UUID.
 - Custom range uses the same MUI date field as attendance reports (`start_date` / `end_date` as `YYYY-MM-DD`).
+
+---
+
+## 23. Roll call — v5
+
+Live `/rollcall/...` URLs are unchanged. Site is stored on `RollCallSession.site` (nullable FK to `LocationSite`). Old sessions have `site = null`.
+
+Web report uses list + Excel/PDF. Mobile uses start / list / end. **v5 responses are the session object (or array)**, same shape as live, **plus** `site_id` and `site_name`. They do **not** use the auth `{ status, message, data }` wrapper.
+
+### Client flow
+
+```
+POST /auth/login/                         (live)
+GET  /auth/v5/my-sites/                   sites[], last_selected_site_id
+        ↓
+Mobile:
+  POST /rollcall/v5/sessions/start/       site_id + shift_id + start_photo
+  GET  /rollcall/v5/sessions/?site_id=…   list open/closed for site
+  POST /rollcall/v5/sessions/<id>/end/    site_id + end_photo
+Web report:
+  GET /rollcall/v5/sessions/?location_id=<org>&site_id=<site|omit>
+  GET /rollcall/v5/sessions/export/       same filters
+  GET /rollcall/v5/sessions/export-pdf/
+```
+
+Mobile should send `last_selected_site_id` (or the site the guard is working) as `site_id`.
+
+**Site filter (list / export)** — same pattern as Incident:
+
+| Header Site | Behaviour |
+|-------------|-----------|
+| One site UUID | Only sessions with that `site_id` |
+| **All** (omit `site_id`) | Org scope: that location’s sessions, **including** legacy `site = null` |
+
+---
+
+### 23.1 `POST /rollcall/v5/sessions/start/`
+
+Start a roll call at a site. Multipart same as live, plus **`site_id` required**.
+
+**Auth:** JWT  
+**Content-Type:** `multipart/form-data`
+
+`location` on the row is taken from the selected site’s organisation. Shift must belong to that organisation.
+
+| Field | Type | Required | Notes |
+|-------|------|----------|--------|
+| `site_id` | UUID | **yes** | Must be allowed for the caller |
+| `shift_id` | UUID | **yes** | Shift in that site’s org |
+| `start_photo` | file | **yes** | Also accepts field name `image` |
+
+```bash
+curl -X POST "https://your-domain.com/rollcall/v5/sessions/start/" \
+  -H "Authorization: Bearer ACCESS" \
+  -F "site_id=<site-uuid>" \
+  -F "shift_id=<shift-uuid>" \
+  -F "start_photo=@start.jpg"
+```
+
+`201` session object with `site_id` / `site_name`. `400` if `site_id` / `shift_id` / photo missing. `403` if site not allowed. `404` if shift not in site’s org.
+
+---
+
+### 23.2 `GET /rollcall/v5/sessions/`
+
+List sessions. Same filters as live (`location_id`, `status`, `date_filter`, `start_date`, `end_date`, `shift_id`, …), plus `site_id`.
+
+Also available as `GET /rollcall/v5/dashboard/filter/` (alias).
+
+```bash
+curl -G "https://your-domain.com/rollcall/v5/sessions/" \
+  -H "Authorization: Bearer ACCESS" \
+  -d "location_id=<org-uuid>" \
+  -d "site_id=<site-uuid>" \
+  -d "date_filter=today" \
+  -d "status=all"
+```
+
+Omit `site_id` for header **All** (org + null-site rows).
+
+Response: array of sessions with `site_id` / `site_name`.
+
+---
+
+### 23.3 `POST /rollcall/v5/sessions/<session_id>/end/`
+
+Close an open session. Multipart same as live, plus **`site_id` required**.
+
+| Field | Type | Required | Notes |
+|-------|------|----------|--------|
+| `site_id` | UUID | **yes** | Must match session’s site |
+| `end_photo` | file | **yes** | Also accepts field name `image` |
+
+**Rules**
+
+- If session has `site`: posted `site_id` must equal `session.site_id`.
+- If session has `site = null` (legacy): site must belong to `session.location`; on success the session’s `site` is set to that site.
+- Session must be `open`.
+
+```bash
+curl -X POST "https://your-domain.com/rollcall/v5/sessions/<session-uuid>/end/" \
+  -H "Authorization: Bearer ACCESS" \
+  -F "site_id=<site-uuid>" \
+  -F "end_photo=@end.jpg"
+```
+
+`200` closed session. `400` already closed / missing photo. `403` site mismatch. `404` unknown session.
+
+---
+
+### 23.4 Excel / PDF
+
+| Method | Path |
+|--------|------|
+| GET | `/rollcall/v5/sessions/export/` |
+| GET | `/rollcall/v5/sessions/export-pdf/` |
+
+Same query params as list (`location_id`, `site_id`, date filters, `status`). Excel/PDF include a **Site** column. PDF header dept line uses the selected site name when `site_id` is set.
+
+```bash
+curl -G "https://your-domain.com/rollcall/v5/sessions/export/" \
+  -H "Authorization: Bearer ACCESS" \
+  -d "location_id=<org-uuid>" \
+  -d "site_id=<site-uuid>" \
+  -d "date_filter=this_month" \
+  -o rollcall.xlsx
+```
+
+---
+
+### 23.5 Web / mobile
+
+- **Web (done):** `GTMS_NEw` Roll Call report uses `/rollcall/v5/sessions/` (+ export). Header Location + Site; no in-page org dropdown; **All** = omit `site_id`; table **Site** column.
+- **Mobile:** start / list / end via v5 with `site_id` on every write; list with selected site (or omit only if product wants org-wide list).
 
 ---
 

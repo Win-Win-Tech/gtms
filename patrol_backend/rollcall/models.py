@@ -19,6 +19,13 @@ class RollCallSession(models.Model):
         on_delete=models.CASCADE,
         related_name="rollcall_sessions",
     )
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rollcall_sessions",
+    )
     shift = models.ForeignKey(
         "scheduler.Shift",
         on_delete=models.CASCADE,

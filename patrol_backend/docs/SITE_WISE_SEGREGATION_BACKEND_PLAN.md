@@ -362,11 +362,29 @@ Filter to that site. Enforce allowed. PDF header **Site** = real site name. Live
 | `/scheduler/assignments/v2/monthly-location-summary-excel/...` | `/scheduler/assignments/v5/monthly-location-summary-excel/...` |
 | `/dashboard/attendance/bulk-entry-candidates/` | `/dashboard/attendance/bulk-entry-candidates_v5/` |
 | `/dashboard/attendance/v2/bulk-entry-candidates/` | `/dashboard/attendance/v5/bulk-entry-candidates/` |
-| `/rollcall/sessions/` | `/rollcall/v5/sessions/` |
-| `/rollcall/dashboard/filter/` | `/rollcall/v5/dashboard/filter/` |
-| `/rollcall/sessions/start/` | `/rollcall/v5/sessions/start/` |
-| `/rollcall/sessions/export/` | `/rollcall/v5/sessions/export/` |
-| `/rollcall/sessions/export-pdf/` | `/rollcall/v5/sessions/export-pdf/` |
+
+Roll call is its own module (before Visitor). See §4.8a.
+
+---
+
+### 4.8a Roll call — v5
+
+Live `/rollcall/...` **unchanged**. Nullable `site` on `RollCallSession`.
+
+| Method | Live (do not change) | v5 |
+|--------|----------------------|-----|
+| GET | `/rollcall/sessions/` | `/rollcall/v5/sessions/` — query `site_id` |
+| GET | `/rollcall/dashboard/filter/` | `/rollcall/v5/dashboard/filter/` |
+| POST | `/rollcall/sessions/start/` | `/rollcall/v5/sessions/start/` — **`site_id` required** |
+| POST | `/rollcall/sessions/<id>/end/` | `/rollcall/v5/sessions/<id>/end/` — **`site_id` required** |
+| GET | `/rollcall/sessions/export/` | `/rollcall/v5/sessions/export/` |
+| GET | `/rollcall/sessions/export-pdf/` | `/rollcall/v5/sessions/export-pdf/` |
+
+**Start:** multipart `shift_id`, `start_photo`, `site_id`. Shift must belong to the site’s org. Save `site` + `location` from site.
+
+**List / export:** header Site = `site_id`. Header All = omit (Admin / Super Admin: all sessions in org including `site` null).
+
+**End:** multipart `end_photo`, `site_id`. Session must match that site (legacy: `site` null → site’s org = session location).
 
 ---
 
@@ -435,9 +453,10 @@ Live URLs stay. All new behaviour is on **v5**.
 | **B1** | Foundation | **No login/refresh v5.** `GET/POST /auth/v5/my-sites/` |
 | **B2** | Shift assign | `AssignmentDailySite` + `GuardSiteCache`; assign **v5**; `shift_today_v5` |
 | **B3** | Incident | Create + filter/export **v5** |
+| **B3a** | Roll call | Start/list/end + export **v5**; `RollCallSession.site` |
 | **B4** | Visitor | Create + list/export **v5** |
 | **B5** | Payslip | Employee scope **v5** |
-| **B6** | Dashboard | `checkin_v5` / `scan_v5` / list+export **v5**; roll call **v5** |
+| **B6** | Dashboard | `checkin_v5` / `scan_v5` / list+export **v5** |
 | **B7** | PDF | Site name on v5 PDFs (with Dashboard) |
 
 New columns nullable. Live clients never required to send `site_id`.
@@ -447,7 +466,7 @@ New columns nullable. Live clients never required to send `site_id`.
 ## 6. Short rules
 
 1. **Do not change live APIs.** Copy and add **v5**.
-2. Build order: **Users → Foundation → Shift assign → Incident → Visitor → Payslip → Dashboard (last)**.
+2. Build order: **Users → Foundation → Shift assign → Incident → Roll call → Visitor → Payslip → Dashboard (last)**.
 3. **Assignment / Shift / Checkpoint master** = **no `site_id`**.
 4. **`AssignmentDailySite`** = assign, or select when no row, or switch **before** attendance.
 5. **`GuardSiteCache`** = every site **switch after attendance**. Return **latest**.
