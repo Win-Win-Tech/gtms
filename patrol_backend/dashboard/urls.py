@@ -19,7 +19,6 @@ urlpatterns = [
     path('stats/', TourStatsView.as_view()),
     path('export/csv/', ExportTourLogsCSV.as_view()),
     path('routes/<uuid:guard_id>/', PatrolRouteView.as_view()),
-    path('', include(router.urls)),
     path('dashboard-checkin-report/', DashboardCheckInReportView.as_view(), name='dashboard-checkin-report'),
     path('dashboard-checkin-report/v2/', DashboardCheckInReportViewV2.as_view(), name='dashboard-checkin-report-v2'),
     path("api/attendance/", AttendanceCheckinListView.as_view(), name="attendance-api"),
@@ -34,6 +33,7 @@ urlpatterns = [
     path("api/attendance/export_v4_pdf/", AttendanceCheckinV4PdfExportView.as_view(), name="attendance-export-api-v4-pdf"),
     path("attendance/shift_today_v5/", ShiftTodayV5.as_view(), name="shift_today_v5"),
     path("attendance/create_assignment_v5/", CreateAssignmentV5.as_view(), name="create_assignment_v5"),
+    path('', include(router.urls)),
 ]
 
 
