@@ -35,6 +35,16 @@ HEADERS = [
     "Remarks",
 ]
 
+
+def _headers(include_site=False):
+    headers = list(HEADERS)
+    if include_site:
+        # After Location
+        loc_idx = headers.index("Location")
+        headers.insert(loc_idx + 1, "Site")
+    return headers
+
+
 # Same columns as Excel (landscape PDF)
 PDF_HEADERS = list(HEADERS)
 
@@ -68,12 +78,12 @@ def _status_label(status):
     return (status or "").replace("_", " ").title()
 
 
-def _entry_export_row(entry, request):
+def _entry_export_row(entry, request, include_site=False):
     """Shared row values for Excel and PDF (same columns / order)."""
     location_id = str(entry.location_id) if entry.location_id else None
     user_tz = get_user_timezone_from_request(request, location_id=location_id)
     visitor = entry.visitor
-    return [
+    row = [
         _fmt_date(entry.visit_date),
         visitor.ic_passport_number if visitor else "",
         visitor.visitor_name if visitor else "",
@@ -92,14 +102,18 @@ def _entry_export_row(entry, request):
         entry.purpose_of_visit or "",
         entry.remarks or "",
     ]
+    if include_site:
+        loc_idx = 9  # Location column index in base row
+        row.insert(loc_idx + 1, entry.site.name if entry.site else "")
+    return row
 
 
-def _entry_excel_row(entry, request):
-    return _entry_export_row(entry, request)
+def _entry_excel_row(entry, request, include_site=False):
+    return _entry_export_row(entry, request, include_site=include_site)
 
 
-def _entry_pdf_row(entry, request):
-    return _entry_export_row(entry, request)
+def _entry_pdf_row(entry, request, include_site=False):
+    return _entry_export_row(entry, request, include_site=include_site)
 
 
 def _resolve_export_meta(request):
@@ -139,6 +153,7 @@ def _resolve_export_meta(request):
         range_end = None
 
     org_name = "—"
+    site_name = None
     if location_id and location_id != "All":
         from scheduler.models import Location
 
@@ -147,6 +162,16 @@ def _resolve_export_meta(request):
             org_name = loc.name
     elif getattr(request.user, "location", None):
         org_name = request.user.location.name or "—"
+
+    site_id = request.query_params.get("site_id")
+    if site_id and str(site_id).lower() not in ("all", "null", "undefined"):
+        from scheduler.models import LocationSite
+
+        site = LocationSite.objects.filter(id=site_id).select_related("location").first()
+        if site:
+            site_name = site.name
+            if org_name == "—" and site.location:
+                org_name = site.location.name
 
     status_filter = (request.query_params.get("status") or "all").strip().lower()
     visitor_type = (
@@ -158,7 +183,7 @@ def _resolve_export_meta(request):
 
     return {
         "org_name": org_name,
-        "dept_label": org_name,
+        "dept_label": site_name or org_name,
         "range_start": range_start,
         "range_end": range_end,
         "printed_at": printed_at,
@@ -168,16 +193,17 @@ def _resolve_export_meta(request):
     }
 
 
-def generate_visitor_excel(queryset, request):
+def generate_visitor_excel(queryset, request, include_site=False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Visitor Entries"
-    ws.append(HEADERS)
+    headers = _headers(include_site)
+    ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
     for entry in queryset:
-        ws.append(_entry_excel_row(entry, request))
+        ws.append(_entry_excel_row(entry, request, include_site=include_site))
 
     buf = BytesIO()
     wb.save(buf)
@@ -311,7 +337,7 @@ def _draw_visitor_pdf_header_and_footer(canvas, doc):
     canvas.restoreState()
 
 
-def generate_visitor_pdf(queryset, request):
+def generate_visitor_pdf(queryset, request, include_site=False):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4, landscape
@@ -321,6 +347,7 @@ def generate_visitor_pdf(queryset, request):
 
     meta = _resolve_export_meta(request)
     entries = list(queryset)
+    headers = _headers(include_site)
 
     buffer = BytesIO()
     left_margin = 0.15 * inch
@@ -401,15 +428,15 @@ def generate_visitor_pdf(queryset, request):
     )
     story.append(Spacer(1, 6))
 
-    header_row = [Paragraph(h, header_cell_style) for h in PDF_HEADERS]
+    header_row = [Paragraph(h, header_cell_style) for h in headers]
     data = [header_row]
     for entry in entries:
-        row = _entry_pdf_row(entry, request)
+        row = _entry_pdf_row(entry, request, include_site=include_site)
         data.append([Paragraph(str(v) if v else "—", cell_style) for v in row])
 
     if len(data) == 1:
         empty = [Paragraph("No visitor entries found", cell_style)] + [""] * (
-            len(PDF_HEADERS) - 1
+            len(headers) - 1
         )
         data.append(empty)
 
@@ -433,6 +460,8 @@ def generate_visitor_pdf(queryset, request):
         0.06,   # Purpose
         0.065,  # Remarks
     ]
+    if include_site:
+        col_ratios.insert(10, 0.05)  # Site after Location
     ratio_sum = sum(col_ratios)
     col_widths = [content_width * (r / ratio_sum) for r in col_ratios]
 

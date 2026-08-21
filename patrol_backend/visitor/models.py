@@ -116,6 +116,13 @@ class VisitorEntry(models.Model):
         on_delete=models.CASCADE,
         related_name="visitor_entries",
     )
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="visitor_entries",
+    )
     entry_source = models.CharField(
         max_length=16,
         choices=ENTRY_SOURCE_CHOICES,

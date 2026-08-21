@@ -95,8 +95,10 @@ Screens:
 
 ### 4.5 Visitor
 
-- History, manual entry, vehicle movement: `site_id` on list and create.
+- History, manual entry, vehicle movement: **`/visitors/v5/...`** + header `site_id` (**done**).
+- Create (walk-in / invite): header `site_id` required (not All).
 - Export uses same site.
+- No in-page Organisation dropdown.
 
 ### 4.6 Payslip
 

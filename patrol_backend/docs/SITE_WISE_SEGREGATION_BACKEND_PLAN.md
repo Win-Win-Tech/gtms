@@ -404,24 +404,30 @@ Live `/rollcall/...` **unchanged**. Nullable `site` on `RollCallSession`.
 
 ### 4.10 Visitor — v5
 
+Live `/visitors/...` **unchanged**. Nullable `site` on `VisitorEntry` only (`Visitor` master stays org-scoped).
+
 | Method | Live (do not change) | v5 |
 |--------|----------------------|-----|
 | POST | `/visitors/entries/checkin/` | `/visitors/v5/entries/checkin/` — **`site_id` required** |
 | POST | `/visitors/entries/invite/` | `/visitors/v5/entries/invite/` — **`site_id` required** |
-| POST | `/visitors/entries/<id>/complete-invite/` | `/visitors/v5/entries/<id>/complete-invite/` |
+| POST | `/visitors/entries/<id>/complete-invite/` | `/visitors/v5/entries/<id>/complete-invite/` — set site if legacy null |
 | GET | `/visitors/entries/` | `/visitors/v5/entries/` — query `site_id` |
+| GET | `/visitors/entries/<id>/` | `/visitors/v5/entries/<id>/` |
 | GET | `/visitors/entries/export/` | `/visitors/v5/entries/export/` |
 | GET | `/visitors/entries/export-pdf/` | `/visitors/v5/entries/export-pdf/` |
-| GET | `/visitors/search/` | `/visitors/v5/search/` |
-| GET | `/visitors/qr-scan/` | `/visitors/v5/qr-scan/` |
+| GET | `/visitors/search/` | `/visitors/v5/search/` — optional `site_id` (forces org) |
+| POST | `/visitors/qr-scan/` | `/visitors/v5/qr-scan/` |
 | GET | `/visitors/reports/vehicle-movement/` | `/visitors/v5/reports/vehicle-movement/` |
 | GET | `/visitors/reports/vehicle-movement/export/` | `/visitors/v5/reports/vehicle-movement/export/` |
 | GET | `/visitors/reports/vehicle-movement/export-pdf/` | `/visitors/v5/reports/vehicle-movement/export-pdf/` |
-| POST | `/visitors/entries/<id>/approve/` | Live OK or `/visitors/v5/entries/<id>/approve/` |
-| POST | `/visitors/entries/<id>/checkout/` | Same pattern |
-| POST | `/visitors/entries/<id>/cancel/` | Same |
-| POST | `/visitors/entries/<id>/revert/` | Same |
-| POST | `/visitors/entries/<id>/reschedule/` | Keep same `site_id` on the row |
+| POST | `/visitors/entries/<id>/approve/` | `/visitors/v5/entries/<id>/approve/` |
+| POST | `/visitors/entries/<id>/checkout/` | `/visitors/v5/entries/<id>/checkout/` |
+| POST | `/visitors/entries/<id>/cancel/` | `/visitors/v5/entries/<id>/cancel/` |
+| POST | `/visitors/entries/<id>/revert/` | `/visitors/v5/entries/<id>/revert/` |
+| POST | `/visitors/entries/<id>/reschedule/` | `/visitors/v5/entries/<id>/reschedule/` — keeps row `site` |
+| GET | `/visitors/entries/<id>/pass/` | `/visitors/v5/entries/<id>/pass/` |
+
+AI extract stays live (`/visitors/ai/extract-v2/`) — no site on OCR.
 
 ---
 

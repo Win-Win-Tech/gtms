@@ -243,10 +243,12 @@ Same idea as **bulk attendance already assigning site**.
 
 ### 7.5 Visitor
 
-- Create walk-in / invite / check-in: accept `site_id`.
-- Entry list, export Excel/PDF, vehicle movement report: filter by `site_id`.
-- Serializer: return `site_id` / `site_name`.
-- Mobile visitor APIs: same.
+- **Web:** History, manual entry, invite, vehicle movement — list/export **v5** + header `site_id`.
+- **Mobile:** walk-in checkin, invite, complete-invite, QR scan, host approve/revert/cancel/reschedule, checkout, detail, list (`mine=true`) — all **v5**.
+- `POST /visitors/v5/entries/checkin/` / `invite/` — **`site_id` required**; save on `VisitorEntry.site`; `location` from that site.
+- `GET /visitors/v5/entries/` — query `site_id` (header All = omit → org scope, include `site` null).
+- Lifecycle actions return entry with `site_id` / `site_name`; keep existing site on the row.
+- Live `/visitors/...` unchanged. SiteSetting visitor keys stay on live login.
 
 ### 7.6 Payslip
 

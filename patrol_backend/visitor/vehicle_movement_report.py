@@ -173,12 +173,15 @@ def resolve_vehicle_movement_window(
     }
 
 
-def _vehicle_base_qs(location_id):
-    return (
+def _vehicle_base_qs(location_id, site_id=None):
+    qs = (
         VisitorEntry.objects.filter(is_deleted=False, location_id=location_id)
         .exclude(status__in=[VisitorEntry.STATUS_CANCELLED, VisitorEntry.STATUS_REVERTED])
         .exclude(Q(vehicle_type__isnull=True) | Q(vehicle_type__exact=""))
     )
+    if site_id:
+        qs = qs.filter(site_id=site_id)
+    return qs
 
 
 def build_vehicle_movement_report(
@@ -189,10 +192,12 @@ def build_vehicle_movement_report(
     end_date_str=None,
     start_time_str=None,
     end_time_str=None,
+    site_id=None,
 ):
     """
     In = check_in_time in window; Out = check_out_time in window.
     Grouped by vehicle_type for one location + date/time range.
+    Optional site_id scopes to that site only.
     """
     from scheduler.models import Location
 
@@ -211,7 +216,7 @@ def build_vehicle_movement_report(
     loc = Location.objects.filter(id=location_id, is_deleted=False).first()
     location_name = loc.name if loc else "—"
 
-    base = _vehicle_base_qs(location_id)
+    base = _vehicle_base_qs(location_id, site_id=site_id)
 
     in_filters = Q()
     out_filters = Q()

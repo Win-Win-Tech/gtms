@@ -44,7 +44,15 @@ def _base_entry_qs():
     return (
         VisitorEntry.objects.filter(is_deleted=False)
         .select_related(
-            "visitor", "host", "location", "created_by", "approved_by", "scanned_by", "checked_in_by", "checked_out_by"
+            "visitor",
+            "host",
+            "location",
+            "site",
+            "created_by",
+            "approved_by",
+            "scanned_by",
+            "checked_in_by",
+            "checked_out_by",
         )
         .prefetch_related("assets")
     )

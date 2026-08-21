@@ -1,7 +1,7 @@
 # Site-wise Segregation — v5 API Reference
 
-**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign + Incident + Roll call  
-**Date:** 20 Aug 2026  
+**Status:** Implemented for Users + Foundation (GET/POST my-sites) + Shift assign + Incident + Roll call + Visitor  
+**Date:** 21 Aug 2026  
 **Auth:** JWT `Authorization: Bearer <access>` unless noted  
 
 Live URLs were **not** changed. Site-wise behaviour is on **v5 copies only**. Old clients keep calling live paths.
@@ -68,6 +68,16 @@ All v5 auth APIs use the existing wrapper. HTTP status is on the response; it is
 | Roll call Excel | `GET /rollcall/sessions/export/` | `GET /rollcall/v5/sessions/export/` |
 | Roll call PDF | `GET /rollcall/sessions/export-pdf/` | `GET /rollcall/v5/sessions/export-pdf/` |
 | Roll call dashboard filter | `GET /rollcall/dashboard/filter/` | `GET /rollcall/v5/dashboard/filter/` |
+| Walk-in check-in | `POST /visitors/entries/checkin/` | `POST /visitors/v5/entries/checkin/` — **`site_id` required** |
+| Invite create | `POST /visitors/entries/invite/` | `POST /visitors/v5/entries/invite/` — **`site_id` required** |
+| Complete invite | `POST /visitors/entries/<id>/complete-invite/` | `POST /visitors/v5/entries/<id>/complete-invite/` |
+| Visitor list | `GET /visitors/entries/` | `GET /visitors/v5/entries/` |
+| Visitor detail | `GET /visitors/entries/<id>/` | `GET /visitors/v5/entries/<id>/` |
+| Visitor Excel / PDF | `GET /visitors/entries/export/` … | `GET /visitors/v5/entries/export/` … |
+| Visitor search | `GET /visitors/search/` | `GET /visitors/v5/search/` |
+| QR scan | `POST /visitors/qr-scan/` | `POST /visitors/v5/qr-scan/` |
+| Approve / revert / cancel / reschedule / checkout / pass | live `/visitors/entries/<id>/…` | `/visitors/v5/entries/<id>/…` |
+| Vehicle movement | `GET /visitors/reports/vehicle-movement/` | `GET /visitors/v5/reports/vehicle-movement/` |
 
 ---
 
@@ -1162,6 +1172,158 @@ curl -G "https://your-domain.com/rollcall/v5/sessions/export/" \
 
 ---
 
+## 24. Visitor — v5
+
+Live `/visitors/...` URLs are unchanged. Site is stored on `VisitorEntry.site` (nullable FK to `LocationSite`). Old entries have `site = null`. The people master `Visitor` stays org-scoped (IC unique per location).
+
+**v5 responses are the entry object (or array / QR action wrapper)**, same shape as live, **plus** `site_id` and `site_name`. They do **not** use the auth `{ status, message, data }` wrapper.
+
+Visitor SiteSetting keys (`is_host_approve_enabled`, defaults) stay on **live login** — not per physical site.
+
+### Client flow
+
+```
+POST /auth/login/                         (live)
+GET  /auth/v5/my-sites/                   sites[], last_selected_site_id
+        ↓
+Mobile walk-in:
+  POST /visitors/v5/entries/checkin/      site_id + IC + name + photos…
+Mobile invite:
+  POST /visitors/v5/entries/invite/       site_id + host_id + visit_date…
+  POST /visitors/v5/entries/<id>/complete-invite/
+  POST /visitors/v5/qr-scan/              { qr_token }
+Host:
+  GET  /visitors/v5/entries/?mine=true&site_id=…
+  POST /visitors/v5/entries/<id>/approve|revert|cancel|reschedule/
+Guard checkout:
+  POST /visitors/v5/entries/<id>/checkout/
+Web:
+  GET /visitors/v5/entries/?location_id=<org>&site_id=<site|omit>
+  GET /visitors/v5/entries/export/ …
+  GET /visitors/v5/reports/vehicle-movement/?site_id=…
+```
+
+Mobile should send `last_selected_site_id` (or working site) as `site_id` on create.
+
+**Site filter (list / export / vehicle)** — same pattern as Incident / Roll call:
+
+| Header Site | Behaviour |
+|-------------|-----------|
+| One site UUID | Only entries with that `site_id` |
+| **All** (omit `site_id`) | Org scope: that location’s entries, **including** legacy `site = null` |
+
+---
+
+### 24.1 `POST /visitors/v5/entries/checkin/`
+
+Walk-in create (or resubmit after revert). Same multipart rules as live, plus **`site_id` required**.
+
+**Auth:** JWT · **Content-Type:** `multipart/form-data`
+
+`location` on the row is taken from the selected site’s organisation (client `location_id` is overwritten).
+
+| Field | Type | Required | Notes |
+|-------|------|----------|--------|
+| `site_id` | UUID | **yes** | Must be allowed for the caller |
+| `ic_passport_number` | string | **yes** | Also `ic_number` |
+| `visitor_name` | string | **yes** | |
+| `host_id` | UUID | if host-approve on | Same location as site’s org |
+| `visitor_photo` / `id_proof` | file | **yes*** | Or prior-visit reuse |
+| Other | — | no | Same as live (`purpose_of_visit`, vehicle_*, `entry_id` for resubmit, …) |
+
+```bash
+curl -X POST "https://your-domain.com/visitors/v5/entries/checkin/" \
+  -H "Authorization: Bearer ACCESS" \
+  -F "site_id=<site-uuid>" \
+  -F "ic_passport_number=S1234567A" \
+  -F "visitor_name=Jane Doe" \
+  -F "host_id=<host-uuid>" \
+  -F "visitor_photo=@face.jpg" \
+  -F "id_proof=@ic.jpg"
+```
+
+`201` entry object with `site_id` / `site_name` (+ `returning_visitor` flag). `400` missing site / fields. `403` site not allowed.
+
+---
+
+### 24.2 `POST /visitors/v5/entries/invite/`
+
+Pre-registration. **`site_id` required**. Photos optional at invite time.
+
+| Field | Type | Required |
+|-------|------|----------|
+| `site_id` | UUID | **yes** |
+| `ic_passport_number` | string | **yes** |
+| `visitor_name` | string | **yes** |
+| `host_id` | UUID | **yes** |
+| `visit_date` | `YYYY-MM-DD` | **yes** |
+
+`201` scheduled entry with `site_id` / `site_name`.
+
+---
+
+### 24.3 `POST /visitors/v5/entries/<id>/complete-invite/`
+
+Same as live. If entry already has `site`, optional `site_id` must match. If legacy `site = null`, **`site_id` required** and must be in the entry’s org (then saved on the row).
+
+---
+
+### 24.4 `GET /visitors/v5/entries/`
+
+Same query params as live (`location_id`, `date_filter`, `status`, `mine`, `visitor_type`, `search`, `has_vehicle`, …) plus `site_id`.
+
+```bash
+curl -G "https://your-domain.com/visitors/v5/entries/" \
+  -H "Authorization: Bearer ACCESS" \
+  -d "location_id=<org-uuid>" \
+  -d "site_id=<site-uuid>" \
+  -d "date_filter=today" \
+  -d "mine=true"
+```
+
+Response: array of entries with `site_id` / `site_name`.
+
+---
+
+### 24.5 Detail / search / QR / lifecycle
+
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/visitors/v5/entries/<id>/` | FCM deep-link; site access (host always OK) |
+| GET | `/visitors/v5/search/?ic_number=&site_id=` | Optional `site_id` → search in that site’s org |
+| POST | `/visitors/v5/qr-scan/` | Body `{ "qr_token" }`; `entry` includes `site_id` / `site_name` |
+| POST | `/visitors/v5/entries/<id>/approve/` | Same as live; response has site fields |
+| POST | `/visitors/v5/entries/<id>/revert/` | |
+| POST | `/visitors/v5/entries/<id>/cancel/` | |
+| POST | `/visitors/v5/entries/<id>/reschedule/` | Keeps existing `site` |
+| POST | `/visitors/v5/entries/<id>/checkout/` | multipart `exit_photo` |
+| GET | `/visitors/v5/entries/<id>/pass/` | Pass PNG |
+
+---
+
+### 24.6 Excel / PDF / vehicle movement
+
+| Method | Path |
+|--------|------|
+| GET | `/visitors/v5/entries/export/` |
+| GET | `/visitors/v5/entries/export-pdf/` |
+| GET | `/visitors/v5/reports/vehicle-movement/` |
+| GET | `/visitors/v5/reports/vehicle-movement/export/` |
+| GET | `/visitors/v5/reports/vehicle-movement/export-pdf/` |
+
+Same filters as list (+ vehicle report date/time params). Entry exports add a **Site** column. Vehicle report JSON includes `site_id` / `site_name` when filtered.
+
+---
+
+### 24.7 Web / mobile
+
+- **Web (done):** History / Manual entry / Vehicle movement use `/visitors/v5/...`. Header Location + Site; no in-page org dropdown; **All** = omit `site_id` on list/export; registration requires a concrete site (not All); table **Site** column.
+- **Mobile:** all create/list/lifecycle paths above; send `site_id` on checkin & invite.
+
+AI OCR stays on live: `POST /visitors/ai/extract-v2/` (no site).
+
+---
+
 ## 21. Not built yet
 
 Login and refresh-token **v5 will not be built**. Keep `POST /auth/login/` and `POST /auth/refresh-token/`.
@@ -1169,4 +1331,4 @@ Login and refresh-token **v5 will not be built**. Keep `POST /auth/login/` and `
 | API | Plan |
 |-----|------|
 | `scan_v5`, `checkin/checkout_v5`, monthly-cell-action_v5 | Later (dashboard / attendance) |
-| Visitor / payslip / dashboard list **v5** | Later modules |
+| Payslip / dashboard list **v5** | Later modules |
