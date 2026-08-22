@@ -99,6 +99,7 @@ def build_hourly_wage_summary_excel_bytes(context):
     ws.title = "Quick Pay Report"
 
     org_name = context.get("org_name") or ""
+    site_name = context.get("site_name") or ""
     period_label = context.get("period_label") or ""
     hourly_rows = context.get("hourly_rows") or []
     monthly_rows = context.get("monthly_rows") or []
@@ -118,7 +119,8 @@ def build_hourly_wage_summary_excel_bytes(context):
     styles = (section_font, header_font, cell_font, border, center, left)
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
-    ws.cell(row=1, column=1, value=f"Quick Pay Report — {org_name} — {period_label}")
+    title_parts = ["Quick Pay Report", org_name, site_name, period_label]
+    ws.cell(row=1, column=1, value=" — ".join(part for part in title_parts if part))
     ws.cell(row=1, column=1).font = title_font
     ws.cell(row=1, column=1).alignment = center
 

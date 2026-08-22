@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 from datetime import date
 
 
-def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None, user_id=None):
+def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None, user_id=None, site_id=None, site_guard_ids=None):
     """
     Optimized helper to fetch monthly assignment summary for a location.
     Uses .values() to minimize DB load and object instantiation.
@@ -61,7 +61,18 @@ def _get_monthly_location_summary_data_v2(location_id, year, month, search=None,
     )
     if user_id:
         aq = aq.filter(guard_id=user_id)
-    
+
+    if site_guard_ids is not None:
+        aq = aq.filter(guard_id__in=site_guard_ids)
+    elif site_id:
+        from scheduler.models import AssignmentDailySite
+
+        guard_ids_at_site = AssignmentDailySite.objects.filter(
+            site_id=site_id,
+            date__gte=m_start,
+            date__lte=m_end,
+        ).values_list("guard_id", flat=True).distinct()
+        aq = aq.filter(guard_id__in=guard_ids_at_site)
 
     
     if search and str(search).strip():

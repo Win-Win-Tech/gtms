@@ -133,6 +133,7 @@ def gather_attendance_v4_export_context(
     search=None,
     role=None,
     site_id=None,
+    site_scope_extra_q=None,
     apply_status_filter_fn=None,
 ):
     """Return filtered attendance rows + metadata for export."""
@@ -191,7 +192,9 @@ def gather_attendance_v4_export_context(
         queryset = queryset.filter(guard__role__iexact=str(role).strip().lower())
     if location_id:
         queryset = queryset.filter(org_location_id=location_id)
-    if site_id:
+    if site_scope_extra_q is not None:
+        queryset = queryset.filter(site_scope_extra_q)
+    elif site_id:
         queryset = queryset.filter(site_id=site_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)

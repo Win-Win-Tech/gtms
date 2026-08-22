@@ -432,6 +432,7 @@ def generate_attendance_v4_pdf_report_internal(
     search=None,
     role=None,
     site_id=None,
+    site_scope_extra_q=None,
 ):
     context = gather_attendance_v4_export_context(
         date_filter=date_filter,
@@ -446,6 +447,7 @@ def generate_attendance_v4_pdf_report_internal(
         search=search,
         role=role,
         site_id=site_id,
+        site_scope_extra_q=site_scope_extra_q,
     )
     employee_groups = group_detail_rows_by_employee(context["detail_rows"])
     pdf_bytes = build_daily_attendance_detail_pdf_bytes(context, employee_groups)

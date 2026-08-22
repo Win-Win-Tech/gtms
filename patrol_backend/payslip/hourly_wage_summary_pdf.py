@@ -144,14 +144,18 @@ def build_hourly_wage_summary_pdf_bytes(context):
     )
 
     org_name = context.get("org_name") or ""
+    site_name = context.get("site_name") or ""
     period_label = context.get("period_label") or ""
     hourly_rows = context.get("hourly_rows") or []
     monthly_rows = context.get("monthly_rows") or []
 
     story = []
+    title_line = " — ".join(
+        part for part in ("Quick Pay Report", org_name, site_name) if part
+    )
     story.append(
         Paragraph(
-            f"Quick Pay Report — {org_name}<br/>{period_label}",
+            f"{title_line}<br/>{period_label}",
             title_style,
         )
     )

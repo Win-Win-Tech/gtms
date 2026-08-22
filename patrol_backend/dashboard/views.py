@@ -6366,6 +6366,7 @@ def generate_attendance_v4_excel_report_internal(
     search=None,
     role=None,
     site_id=None,
+    site_scope_extra_q=None,
 ):
     """
     V4 attendance export helper: Optimized by bulk-fetching CheckInLogs.
@@ -6413,7 +6414,9 @@ def generate_attendance_v4_excel_report_internal(
         queryset = queryset.filter(guard__role__iexact=str(role).strip().lower())
     if location_id:
         queryset = queryset.filter(org_location_id=location_id)
-    if site_id:
+    if site_scope_extra_q is not None:
+        queryset = queryset.filter(site_scope_extra_q)
+    elif site_id:
         queryset = queryset.filter(site_id=site_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
@@ -7234,6 +7237,7 @@ def generate_monthly_attendance_summary_excel_internal(
 
 def _get_monthly_attendance_summary_data_v2(
     month=None, start_date_str=None, end_date_str=None, location_id=None, site_id=None, user_id=None, search=None, role=None, request=None,
+    site_scope_extra_q=None,
 ):
     if month:
         try:
@@ -7305,7 +7309,9 @@ def _get_monthly_attendance_summary_data_v2(
             else:
                 any_site_lookup[key] = att
         att_iter = base_att_qs
-        if site_id:
+        if site_scope_extra_q is not None:
+            att_iter = base_att_qs.filter(site_scope_extra_q)
+        elif site_id:
             att_iter = base_att_qs.filter(site_id=site_id)
         for att in att_iter.values(
             'guard_id', 'org_location_id', 'shift_date', 'pa_status', 'last_checkout_time',
@@ -7369,8 +7375,20 @@ def _get_monthly_attendance_summary_data_v2(
 
 def generate_monthly_attendance_summary_excel_internal_v2(
     month=None, start_date_str=None, end_date_str=None, location_id=None, site_id=None, user_id=None, search=None, role=None, request=None, include_location_column=None,
+    site_scope_extra_q=None,
 ):
-    result = _get_monthly_attendance_summary_data_v2(month=month, start_date_str=start_date_str, end_date_str=end_date_str, location_id=location_id, site_id=site_id, user_id=user_id, search=search, role=role, request=request)
+    result = _get_monthly_attendance_summary_data_v2(
+        month=month,
+        start_date_str=start_date_str,
+        end_date_str=end_date_str,
+        location_id=location_id,
+        site_id=site_id,
+        user_id=user_id,
+        search=search,
+        role=role,
+        request=request,
+        site_scope_extra_q=site_scope_extra_q,
+    )
     summary_data, date_range, start_date, end_date = result['summary_data'], result['date_range'], result['start_date'], result['end_date']
     if include_location_column is None: include_location_column = bool(request and getattr(request.user, "is_superuser", False))
     wb = Workbook(); ws = wb.active; ws.title = "Monthly Attendance Summary"
@@ -8381,6 +8399,7 @@ def _get_checkin_report_data_v2(
     search=None,
     role=None,
     site_id=None,
+    assignment_site_q=None,
 ):
     from django.utils.timezone import now as django_now
     allowed_delay = _get_site_setting_int('time', location_id=location_id, default_value=15)
@@ -8437,7 +8456,9 @@ def _get_checkin_report_data_v2(
     if not user_id and role and str(role).strip().lower() not in ('', 'all'):
         assignments = assignments.filter(guard__role__iexact=str(role).strip().lower())
     
-    if site_id:
+    if assignment_site_q is not None:
+        assignments = assignments.filter(assignment_site_q).distinct()
+    elif site_id:
         # Assignments don't have direct 'site' field.
         # Filter assignments that have at least one attendance record associated with this site.
         assignments = assignments.filter(attendance_records__site_id=site_id).distinct()
