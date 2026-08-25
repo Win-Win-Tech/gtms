@@ -580,6 +580,7 @@ class CheckInReportSerializer(serializers.Serializer):
     shift_name = serializers.CharField()
     checkpoint_id = serializers.UUIDField()
     checkpoint_name = serializers.CharField()
+    site_name = serializers.CharField(allow_blank=True, required=False)
     expected_time = serializers.DateTimeField()
     actual_checkin_time = serializers.DateTimeField(allow_null=True)
     status = serializers.CharField()

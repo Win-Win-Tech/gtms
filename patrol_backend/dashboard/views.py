@@ -8680,6 +8680,9 @@ def _get_checkin_report_data_v2(
                     'shift_name': shift.name if shift else "",
                     'checkpoint_id': str(checkpoint_id),
                     'checkpoint_name': checkpoint_name,
+                    'site_name': attendance_site_map.get(
+                        (str(guard.id), str(check_date), str(shift.id)), ""
+                    ),
                     'expected_time': expected_time_display,
                     'actual_checkin_time': actual_time_display,
                     'status': status,

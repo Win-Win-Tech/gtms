@@ -1,555 +1,313 @@
-# reports/tasks.py
+"""
+Celery tasks for automatic org report emails.
+
+Primary task: dispatch_org_report_emails (every 15 minutes).
+Legacy tasks remain as thin wrappers / deprecated.
+"""
+
+from __future__ import annotations
+
+import logging
+
 from celery import shared_task
-from django.core.mail import EmailMessage
-from django.conf import settings
 from django.db import close_old_connections
 from django.utils import timezone as django_timezone
-import os
-import django
-import pytz
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "patrol_backend.settings")
-django.setup()
-
-# Import the internal helper functions that the endpoint uses
-from dashboard.views import (
-    generate_checkin_excel_report_internal, 
-    generate_attendance_excel_report_internal,
-    generate_monthly_attendance_summary_excel_internal
+from reports.models import LocationReportEmailConfig, LocationReportEmailItem, ReportEmailLog
+from reports.services.email_sender import send_report_email
+from reports.services.report_generator import report_generate
+from reports.services.schedule_utils import (
+    build_schedule_key,
+    get_location_admin_user,
+    get_location_timezone,
+    local_now,
+    resolve_period,
+    schedule_matches_today,
+    send_time_matches,
 )
-from scheduler.models import Location
-from authapp.models import User
-from datetime import datetime, timedelta
+from scheduler.models import LocationSite
+
+logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
+    location = config.location
+    recipients = config.recipient_list()
+    if not recipients:
+        logger.warning("Org %s has no recipients — skip", location.name)
+        return {"skipped": True, "reason": "no_recipients"}
 
-def send_location_report_email(location, subject, body_sections, attachments, recipients=None):
-    """
-    Reusable email sender for location-based reports.
-    Handles dynamic number of attachments with smart formatting.
-    
-    Args:
-        location: Location object with name and address
-        subject: Email subject line
-        body_sections: Dict with:
-            - 'intro': Introduction text
-            - 'period': Period/date information
-            - 'additional': Optional additional info (legend, notes, etc.)
-        attachments: List of dicts, each containing:
-            {
-                'file_path': str (path to file),
-                'filename': str (attachment filename),
-                'display_name': str (e.g., 'Check-In Report'),
-                'row_count': int or None (number of records),
-                'download_url': str (optional download link)
-            }
-        recipients: List of email addresses (defaults to settings email)
-    
-    Returns:
-        dict: {'sent': bool, 'attachments_count': int}
-    """
-    if not attachments:
-        print(f"  No attachments to send for {location.name}")
-        return {'sent': False, 'attachments_count': 0}
-    
-    # Build email body
-    email_body = f"""Hello,
+    location_tz = get_location_timezone(location)
+    now_local = local_now(location_tz)
 
-{body_sections.get('intro', '')}
+    if not force and not send_time_matches(now_local, config.send_time):
+        return {"skipped": True, "reason": "time_mismatch"}
 
-Location: {location.name}
-Address: {location.address if location.address else 'N/A'}
-{body_sections.get('period', '')}
+    admin_user = get_location_admin_user(location)
+    if not admin_user:
+        logger.warning("Org %s has no admin user — skip", location.name)
+        return {"skipped": True, "reason": "no_admin"}
 
-Reports:"""
-    
-    # Add attachment details to body
-    for idx, att in enumerate(attachments, 1):
-        display_name = att.get('display_name', 'Report')
-        row_count = att.get('row_count')
-        download_url = att.get('download_url')
-        
-        email_body += f"\n  {idx}. {display_name}:"
-        if row_count is not None and row_count > 0:
-            email_body += f" Attached ({row_count} records)"
-        elif row_count == 0:
-            email_body += " No data available"
-        else:
-            email_body += " Attached"
-        
-        if download_url:
-            email_body += f"\n     Download: {download_url}"
-    
-    # Add additional info (legend, notes, etc.)
-    if body_sections.get('additional'):
-        email_body += f"\n\n{body_sections['additional']}"
-    
-    email_body += f"""
+    items = list(config.items.filter(is_enabled=True))
+    if not items:
+        return {"skipped": True, "reason": "no_items"}
 
-Best regards,
-Guard Management System
-"""
-    
-    # Create email
-    email = EmailMessage(
-        subject=subject,
-        body=email_body,
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        to=recipients or ["sales@cloudgentechnologies.com"]
-    )
-    
-    # Attach all files that have data
-    attached_count = 0
-    for att in attachments:
-        file_path = att.get('file_path')
-        filename = att.get('filename')
-        has_data = att.get('has_data', True)  # Default to True if not specified
-        
-        if not has_data:
-            continue  # Skip attachments without data
-        
-        if file_path and os.path.exists(file_path):
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            email.attach(
-                filename,
-                content,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    attachments = []
+    logs_to_create = []
+    updated_items = []
+
+    try:
+        active_sites = list(LocationSite.objects.filter(location=location, is_active=True))
+    except Exception:
+        active_sites = []
+
+    for item in items:
+        if not force and not schedule_matches_today(item.schedule_type, now_local):
+            continue
+
+        schedule_key = build_schedule_key(now_local.date(), item.schedule_type)
+        if not force and item.last_sent_schedule_key == schedule_key:
+            continue
+
+        try:
+            period = resolve_period(item.schedule_type, item.daily_period, now_local)
+        except Exception as exc:
+            logger.exception("period resolve failed: %s", exc)
+            logs_to_create.append(
+                ReportEmailLog(
+                    location=location,
+                    report_code=item.report_code,
+                    schedule_key=schedule_key,
+                    status=ReportEmailLog.STATUS_ERROR,
+                    error=str(exc),
+                )
             )
-            attached_count += 1
-            print(f"    ✓ Attached: {att.get('display_name', filename)}")
-    
-    # Only send if we have attachments
-    if attached_count == 0:
-        print(f"  No valid attachments - email not sent")
-        return {'sent': False, 'attachments_count': 0}
-    
-    # Send email
-    email.send()
-    
-    return {
-        'sent': True,
-        'attachments_count': attached_count
-    }
+            continue
+
+        scopes = []
+        if item.site_wise:
+            if active_sites:
+                scopes = [(site.id, site.name) for site in active_sites]
+            else:
+                scopes = [(None, location.name)]  # fallback org-wide
+        else:
+            scopes = [(None, location.name)]
+
+        report_attachments = []
+        for site_id, site_label in scopes:
+            try:
+                atts = report_generate(
+                    item.report_code,
+                    location,
+                    period,
+                    site_id=site_id,
+                    site_name=site_label,
+                    user=admin_user,
+                    send_pdf=item.send_pdf,
+                    send_excel=item.send_excel,
+                )
+                for att in atts:
+                    att["report_code"] = item.report_code
+                    att["site_id"] = site_id
+                    att["period_label"] = period.get("label", "")
+                report_attachments.extend(atts)
+            except Exception as exc:
+                logger.exception(
+                    "generate failed %s site=%s: %s", item.report_code, site_id, exc
+                )
+                logs_to_create.append(
+                    ReportEmailLog(
+                        location=location,
+                        report_code=item.report_code,
+                        site_id=site_id,
+                        schedule_key=schedule_key,
+                        period_label=period.get("label", ""),
+                        status=ReportEmailLog.STATUS_ERROR,
+                        error=str(exc),
+                    )
+                )
+
+        if not report_attachments:
+            logs_to_create.append(
+                ReportEmailLog(
+                    location=location,
+                    report_code=item.report_code,
+                    schedule_key=schedule_key,
+                    period_label=period.get("label", ""),
+                    status=ReportEmailLog.STATUS_SKIPPED,
+                    error="no_data",
+                )
+            )
+            # Still mark as processed for this schedule key so we don't retry empty all day
+            item.last_sent_schedule_key = schedule_key
+            updated_items.append(item)
+            continue
+
+        attachments.extend(report_attachments)
+        formats = ",".join(sorted({a["format"] for a in report_attachments}))
+        row_count = sum(a.get("row_count") or 0 for a in report_attachments)
+        logs_to_create.append(
+            ReportEmailLog(
+                location=location,
+                report_code=item.report_code,
+                schedule_key=schedule_key,
+                period_label=period.get("label", ""),
+                formats=formats,
+                row_count=row_count,
+                status=ReportEmailLog.STATUS_SENT,
+            )
+        )
+        item.last_sent_schedule_key = schedule_key
+        updated_items.append(item)
+
+    if not attachments:
+        if logs_to_create:
+            ReportEmailLog.objects.bulk_create(logs_to_create)
+        if updated_items:
+            LocationReportEmailItem.objects.bulk_update(updated_items, ["last_sent_schedule_key"])
+        return {"skipped": True, "reason": "no_attachments", "logs": len(logs_to_create)}
+
+    subject = f"Reports - {location.name} ({now_local.date().isoformat()})"
+    result = send_report_email(
+        location=location,
+        subject=subject,
+        body_lines=[],
+        attachments=attachments,
+        recipients=recipients,
+    )
+
+    if result.get("sent"):
+        ReportEmailLog.objects.bulk_create(logs_to_create)
+        if updated_items:
+            LocationReportEmailItem.objects.bulk_update(updated_items, ["last_sent_schedule_key"])
+        return {
+            "sent": True,
+            "attachments_count": result["attachments_count"],
+            "reports": len(updated_items),
+        }
+
+    # Email failed — mark errors
+    for log in logs_to_create:
+        if log.status == ReportEmailLog.STATUS_SENT:
+            log.status = ReportEmailLog.STATUS_ERROR
+            log.error = result.get("reason") or "email_send_failed"
+    ReportEmailLog.objects.bulk_create(logs_to_create)
+    return {"sent": False, "reason": result.get("reason")}
 
 
-# ============================================================================
-# CELERY TASKS
-# ============================================================================
+@shared_task(name="reports.tasks.dispatch_org_report_emails")
+def dispatch_org_report_emails():
+    """
+    Poll every 15 minutes. For each enabled org whose local clock matches send_time,
+    generate only reports whose schedule matches today and that have data.
+    """
+    close_old_connections()
+    configs = (
+        LocationReportEmailConfig.objects.filter(is_enabled=True)
+        .select_related("location")
+        .prefetch_related("items")
+    )
+    summary = {"orgs": 0, "sent": 0, "skipped": 0, "errors": []}
+    for config in configs:
+        summary["orgs"] += 1
+        try:
+            result = _process_org_config(config, force=False)
+            if result.get("sent"):
+                summary["sent"] += 1
+            else:
+                summary["skipped"] += 1
+        except Exception as exc:
+            logger.exception("dispatch failed for config %s", config.id)
+            summary["errors"].append(str(exc))
+    logger.info("dispatch_org_report_emails summary: %s", summary)
+    return summary
 
+
+@shared_task(name="reports.tasks.send_org_report_email_now")
+def send_org_report_email_now(config_id: str):
+    """Manual/test send — ignores send_time window and schedule-day gates? force=True still respects schedule match for items..."""
+    close_old_connections()
+    config = (
+        LocationReportEmailConfig.objects.filter(id=config_id)
+        .select_related("location")
+        .prefetch_related("items")
+        .first()
+    )
+    if not config:
+        return {"error": "config_not_found"}
+    # Force: ignore send_time; still only enabled items that match today OR all enabled for test.
+    # For test-send we process all enabled items regardless of schedule day.
+    return _process_org_config_force_all(config)
+
+
+def _process_org_config_force_all(config: LocationReportEmailConfig):
+    """Test send: all enabled items, ignore schedule day and send_time and dedup."""
+    location = config.location
+    recipients = config.recipient_list()
+    if not recipients:
+        return {"skipped": True, "reason": "no_recipients"}
+
+    location_tz = get_location_timezone(location)
+    now_local = local_now(location_tz)
+    admin_user = get_location_admin_user(location)
+    if not admin_user:
+        return {"skipped": True, "reason": "no_admin"}
+
+    items = list(config.items.filter(is_enabled=True))
+    attachments = []
+    try:
+        active_sites = list(LocationSite.objects.filter(location=location, is_active=True))
+    except Exception:
+        active_sites = []
+
+    for item in items:
+        period = resolve_period(item.schedule_type, item.daily_period, now_local)
+        scopes = (
+            [(s.id, s.name) for s in active_sites]
+            if item.site_wise and active_sites
+            else [(None, location.name)]
+        )
+        for site_id, site_label in scopes:
+            try:
+                atts = report_generate(
+                    item.report_code,
+                    location,
+                    period,
+                    site_id=site_id,
+                    site_name=site_label,
+                    user=admin_user,
+                    send_pdf=item.send_pdf,
+                    send_excel=item.send_excel,
+                )
+                attachments.extend(atts)
+            except Exception as exc:
+                logger.exception("test generate failed: %s", exc)
+
+    if not attachments:
+        return {"skipped": True, "reason": "no_attachments"}
+
+    subject = f"[TEST] Reports - {location.name} ({now_local.date().isoformat()})"
+    return send_report_email(
+        location=location,
+        subject=subject,
+        body_lines=["", "(This is a manual test send.)"],
+        attachments=attachments,
+        recipients=recipients,
+    )
+
+
+# Keep legacy task names so old beat entries / manual calls do not crash.
 @shared_task
 def email_daily_checkin_report():
-    """
-    Celery task to generate and email daily check-in reports per location/organization.
-    
-    For each location:
-    - Generates a separate report filtered by location_id
-    - Only sends email if there are results for that location today
-    - Includes the location/organization name in the subject and body
-    
-    This solves the problem of:
-    - Django being single-threaded and blocking on self-requests
-    - Avoiding HTTP overhead
-    - Directly accessing the business logic
-    - Sending location-specific reports to respective recipients
-    
-    The endpoint at /dashboard/dashboard-checkin-report-excel/ still works for frontend!
-    """
-    try:
-        print("Starting daily check-in report generation per location...")
-        
-        # Close old database connections to avoid stale connection issues
-        close_old_connections()
-        
-        # Get all active locations (organizations)
-        locations = Location.objects.all()
-        
-        if not locations.exists():
-            print("No locations found in the system.")
-            return {"status": "no_locations", "message": "No locations to process"}
-        
-        print(f"Found {locations.count()} locations to process")
-        
-        # Track results
-        results = {
-            "total_locations": locations.count(),
-            "emails_sent": 0,
-            "skipped": 0,
-            "errors": []
-        }
-        
-        # Process each location
-        for location in locations:
-            try:
-                print(f"\nProcessing location: {location.name} (ID: {location.id})")
-                
-                # Generate CHECKIN report for this specific location
-                print(f"  Generating check-in report...")
-                checkin_result = generate_checkin_excel_report_internal(
-            filter_type='today',
-            start_date=None,
-            end_date=None,
-            user_id=None,
-                    location_id=str(location.id)  # Filter by location
-                )
-                
-                checkin_file_path = checkin_result.get('file_path')
-                checkin_filename = checkin_result.get('filename')
-                checkin_row_count = checkin_result.get('row_count', 0)  # Get actual row count
-                
-                # Generate ATTENDANCE report for this specific location
-                print(f"  Generating attendance report...")
-                attendance_result = generate_attendance_excel_report_internal(
-                    date_filter='today',
-                    start_date=None,
-                    end_date=None,
-                    guard_id=None,
-                    location_id=str(location.id),  # Filter by location
-                    shift_id=None,
-                    status_filter=None,
-                    defaulters=False
-                )
-                
-                attendance_file_path = attendance_result.get('file_path')
-                attendance_filename = attendance_result.get('filename')
-                attendance_row_count = attendance_result.get('row_count', 0)  # Get actual row count
-                
-                # Determine which reports have data
-                has_checkin_data = checkin_row_count > 0
-                has_attendance_data = attendance_row_count > 0
-                
-                print(f"  Check-in report: {checkin_row_count} rows")
-                print(f"  Attendance report: {attendance_row_count} rows")
-                
-                # If no data in either report, skip email and clean up files
-                if not has_checkin_data and not has_attendance_data:
-                    print(f"  No data for location {location.name} today. Skipping email.")
-                    # Clean up empty files
-                    if checkin_file_path and os.path.exists(checkin_file_path):
-                        os.remove(checkin_file_path)
-                    if attendance_file_path and os.path.exists(attendance_file_path):
-                        os.remove(attendance_file_path)
-                    results["skipped"] += 1
-                    continue
-                
-                # Clean up files that have no data
-                if not has_checkin_data and checkin_file_path and os.path.exists(checkin_file_path):
-                    print(f"  Check-in report has no data - removing file")
-                    os.remove(checkin_file_path)
-                    checkin_file_path = None
-                
-                if not has_attendance_data and attendance_file_path and os.path.exists(attendance_file_path):
-                    print(f"  Attendance report has no data - removing file")
-                    os.remove(attendance_file_path)
-                    attendance_file_path = None
-                
-                print(f"  Reports generated successfully for {location.name}")
-                print(f"    - Check-in report: {'Yes' if has_checkin_data else 'No'}")
-                print(f"    - Attendance report: {'Yes' if has_attendance_data else 'No'}")
-                
-                # Get current date for email in location's timezone
-                # Find location admin to get timezone
-                location_admin = User.objects.filter(
-                    location=location,
-                    role='admin',
-                    is_deleted=False,
-                    is_active=True
-                ).first()
-                
-                if location_admin and location_admin.timezone:
-                    location_tz = pytz.timezone(location_admin.timezone)
-                else:
-                    # Fallback to any user's timezone in this location
-                    location_user = User.objects.filter(
-                        location=location,
-                        is_deleted=False,
-                        timezone__isnull=False
-                    ).exclude(timezone='').first()
-                    if location_user and location_user.timezone:
-                        location_tz = pytz.timezone(location_user.timezone)
-                    else:
-                        # Default to UTC if no timezone found
-                        location_tz = pytz.UTC
-                
-                # Get current datetime in location timezone
-                location_now = django_timezone.now().astimezone(location_tz)
-                today_date = location_now.strftime('%Y-%m-%d')
-                
-                # Prepare attachments list
-                attachments = []
-                
-                if has_checkin_data and checkin_file_path:
-                    attachments.append({
-                        'file_path': checkin_file_path,
-                        'filename': f"checkin_report_{location.name.replace(' ', '_')}_{today_date}.xlsx",
-                        'display_name': 'Check-In Report',
-                        'row_count': checkin_row_count,
-                        'download_url': f"http://127.0.0.1:8000{settings.MEDIA_URL}{checkin_filename}",
-                        'has_data': True
-                    })
-                else:
-                    attachments.append({
-                        'file_path': None,
-                        'filename': None,
-                        'display_name': 'Check-In Report',
-                        'row_count': 0,
-                        'download_url': None,
-                        'has_data': False
-                    })
-                
-                if has_attendance_data and attendance_file_path:
-                    attachments.append({
-                        'file_path': attendance_file_path,
-                        'filename': f"attendance_report_{location.name.replace(' ', '_')}_{today_date}.xlsx",
-                        'display_name': 'Attendance Report',
-                        'row_count': attendance_row_count,
-                        'download_url': f"http://127.0.0.1:8000{settings.MEDIA_URL}{attendance_filename}",
-                        'has_data': True
-                    })
-                else:
-                    attachments.append({
-                        'file_path': None,
-                        'filename': None,
-                        'display_name': 'Attendance Report',
-                        'row_count': 0,
-                        'download_url': None,
-                        'has_data': False
-                    })
-                
-                # Send email using helper function
-                email_result = send_location_report_email(
-                    location=location,
-                    subject=f"Daily Reports - {location.name} ({today_date})",
-                    body_sections={
-                        'intro': f"Please find the daily reports for {location.name}.",
-                        'period': f"Date: {today_date}"
-                    },
-                    attachments=attachments
-                )
-                
-                if email_result['sent']:
-                    print(f"  Email sent successfully for {location.name}!")
-                    results["emails_sent"] += 1
-                else:
-                    print(f"  Email not sent (no valid attachments)")
-                    results["skipped"] += 1
-                
-            except Exception as e:
-                error_msg = f"Failed to process location {location.name}: {str(e)}"
-                print(error_msg)
-                results["errors"].append(error_msg)
-                import traceback
-                traceback.print_exc()
-                # Continue with next location even if one fails
-                continue
-        
-        # Summary
-        print("\n" + "="*50)
-        print("SUMMARY:")
-        print(f"Total locations: {results['total_locations']}")
-        print(f"Emails sent: {results['emails_sent']}")
-        print(f"Skipped (no data): {results['skipped']}")
-        print(f"Errors: {len(results['errors'])}")
-        print("="*50)
-        
-        return {
-            "status": "success",
-            "results": results
-        }
-        
-    except Exception as e:
-        print(f"Failed to send daily reports: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    logger.warning(
+        "email_daily_checkin_report is deprecated; use dispatch_org_report_emails"
+    )
+    return dispatch_org_report_emails()
 
 
 @shared_task
 def email_monthly_attendance_summary():
-    """
-    Celery task to generate and email monthly attendance summary reports per location.
-    
-    This task should be scheduled to run at the end of each month.
-    
-    For each location:
-    - Generates a monthly attendance summary Excel report
-    - Shows Present (P), Absent (A), or No Assignment (-) for each day
-    - Only sends email if there are results for that location
-    - Includes the location/organization name in the subject and body
-    
-    Report Format:
-    - Calendar view with dates as columns
-    - Each row shows a guard's attendance for the month
-    - Easy to see attendance patterns at a glance
-    """
-    try:
-        print("Starting monthly attendance summary report generation per location...")
-        
-        # Close old database connections to avoid stale connection issues
-        close_old_connections()
-        
-        # Get all active locations (organizations)
-        locations = Location.objects.all()
-        
-        if not locations.exists():
-            print("No locations found in the system.")
-            return {"status": "no_locations", "message": "No locations to process"}
-        
-        print(f"Found {locations.count()} locations to process")
-        
-        # Determine the month to report (previous month) using UTC
-        # We'll calculate per location using their timezone
-        utc_now = django_timezone.now()
-        utc_today = utc_now.date()
-        # Get last day of previous month in UTC
-        first_day_this_month = utc_today.replace(day=1)
-        last_day_prev_month = first_day_this_month - timedelta(days=1)
-        year = last_day_prev_month.year
-        month = last_day_prev_month.month
-        month_str = f"{year}-{month:02d}"
-        
-        print(f"Generating reports for: {last_day_prev_month.strftime('%B %Y')} ({month_str})")
-        
-        # Track results
-        results = {
-            "total_locations": locations.count(),
-            "emails_sent": 0,
-            "skipped": 0,
-            "errors": []
-        }
-        
-        # Process each location
-        for location in locations:
-            try:
-                print(f"\nProcessing location: {location.name} (ID: {location.id})")
-                
-                # Generate monthly attendance summary Excel for this specific location
-                print(f"  Generating monthly attendance summary...")
-                monthly_result = generate_monthly_attendance_summary_excel_internal(
-                    month=month_str,
-                    start_date_str=None,
-                    end_date_str=None,
-                    location_id=str(location.id),
-                    user_id=None
-                )
-                
-                file_path = monthly_result.get('file_path')
-                filename = monthly_result.get('filename')
-                row_count = monthly_result.get('row_count', 0)
-                start_date = monthly_result.get('start_date')
-                end_date = monthly_result.get('end_date')
-                
-                # Check if there's any data for this location
-                if row_count == 0:
-                    print(f"  No attendance data for location {location.name}. Skipping email.")
-                    # Clean up empty file
-                    if file_path and os.path.exists(file_path):
-                        os.remove(file_path)
-                    results["skipped"] += 1
-                    continue
-                
-                print(f"  Report generated: {row_count} guards with attendance records")
-                
-                if not file_path or not os.path.exists(file_path):
-                    print(f"  Report file not generated for {location.name}")
-                    results["skipped"] += 1
-                    continue
-                
-                print(f"  Report file created: {file_path}")
-                
-                # Get location timezone for date formatting
-                location_admin = User.objects.filter(
-                    location=location,
-                    role='admin',
-                    is_deleted=False,
-                    is_active=True
-                ).first()
-                
-                if location_admin and location_admin.timezone:
-                    location_tz = pytz.timezone(location_admin.timezone)
-                else:
-                    # Fallback to any user's timezone in this location
-                    location_user = User.objects.filter(
-                        location=location,
-                        is_deleted=False,
-                        timezone__isnull=False
-                    ).exclude(timezone='').first()
-                    if location_user and location_user.timezone:
-                        location_tz = pytz.timezone(location_user.timezone)
-                    else:
-                        # Default to UTC if no timezone found
-                        location_tz = pytz.UTC
-                
-                # Format month name for email using location timezone
-                # Convert last_day_prev_month to location timezone for display
-                location_date = location_tz.localize(datetime.combine(last_day_prev_month, datetime.min.time()))
-                month_name = location_date.strftime('%B %Y')
-                
-                # Build download URL
-                download_url = f"http://127.0.0.1:8000{settings.MEDIA_URL}{filename}"
-                
-                # Prepare attachments list
-                attachments = [{
-                    'file_path': file_path,
-                    'filename': filename,
-                    'display_name': 'Monthly Attendance Summary',
-                    'row_count': row_count,
-                    'download_url': download_url,
-                    'has_data': True
-                }]
-                
-                # Send email using helper function
-                email_result = send_location_report_email(
-                    location=location,
-                    subject=f"Monthly Attendance Summary - {location.name} ({month_name})",
-                    body_sections={
-                        'intro': f"Attached is the monthly attendance summary report for {location.name}.",
-                        'period': f"Month: {month_name}\nPeriod: {start_date.strftime('%d %B %Y')} to {end_date.strftime('%d %B %Y')}",
-                        'additional': """Legend:
-  P = Present (checked in)
-  A = Absent (no check-in)
-  - = No assignment for that day"""
-                    },
-                    attachments=attachments
-                )
-                
-                if email_result['sent']:
-                    print(f"  Email sent successfully for {location.name}!")
-                    results["emails_sent"] += 1
-                else:
-                    print(f"  Email not sent (no valid attachments)")
-                    results["skipped"] += 1
-                
-            except Exception as e:
-                error_msg = f"Failed to process location {location.name}: {str(e)}"
-                print(error_msg)
-                results["errors"].append(error_msg)
-                import traceback
-                traceback.print_exc()
-                # Continue with next location even if one fails
-                continue
-        
-        # Summary
-        print("\n" + "="*50)
-        print("MONTHLY SUMMARY REPORT - SUMMARY:")
-        print(f"Month: {month_name}")
-        print(f"Total locations: {results['total_locations']}")
-        print(f"Emails sent: {results['emails_sent']}")
-        print(f"Skipped (no data): {results['skipped']}")
-        print(f"Errors: {len(results['errors'])}")
-        print("="*50)
-        
-        return {
-            "status": "success",
-            "month": month_str,
-            "results": results
-        }
-        
-    except Exception as e:
-        print(f"Failed to send monthly reports: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    logger.warning(
+        "email_monthly_attendance_summary is deprecated; use dispatch_org_report_emails"
+    )
+    return dispatch_org_report_emails()
