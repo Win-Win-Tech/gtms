@@ -11,7 +11,6 @@ import logging
 
 from celery import shared_task
 from django.db import close_old_connections
-from django.utils import timezone as django_timezone
 
 from reports.models import LocationReportEmailConfig, LocationReportEmailItem, ReportEmailLog
 from reports.services.email_sender import send_report_email
@@ -21,8 +20,8 @@ from reports.services.schedule_utils import (
     get_location_admin_user,
     get_location_timezone,
     local_now,
+    matching_schedule_types,
     resolve_period,
-    schedule_matches_today,
     send_time_matches,
 )
 from scheduler.models import LocationSite
@@ -62,109 +61,124 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
         active_sites = []
 
     for item in items:
-        if not force and not schedule_matches_today(item.schedule_type, now_local):
+        schedule_types = item.get_schedule_types()
+        matching = matching_schedule_types(schedule_types, now_local) if not force else schedule_types
+        if not matching:
             continue
 
-        schedule_key = build_schedule_key(now_local.date(), item.schedule_type)
-        if not force and item.last_sent_schedule_key == schedule_key:
-            continue
+        sent_keys = dict(item.last_sent_keys or {})
+        # Legacy single key fallback
+        if not sent_keys and item.last_sent_schedule_key and item.schedule_type:
+            sent_keys[item.schedule_type] = item.last_sent_schedule_key
 
-        try:
-            period = resolve_period(item.schedule_type, item.daily_period, now_local)
-        except Exception as exc:
-            logger.exception("period resolve failed: %s", exc)
-            logs_to_create.append(
-                ReportEmailLog(
-                    location=location,
-                    report_code=item.report_code,
-                    schedule_key=schedule_key,
-                    status=ReportEmailLog.STATUS_ERROR,
-                    error=str(exc),
-                )
-            )
-            continue
+        item_touched = False
 
-        scopes = []
-        if item.site_wise:
-            if active_sites:
-                scopes = [(site.id, site.name) for site in active_sites]
-            else:
-                scopes = [(None, location.name)]  # fallback org-wide
-        else:
-            scopes = [(None, location.name)]
+        for schedule_type in matching:
+            schedule_key = build_schedule_key(now_local.date(), schedule_type)
+            if not force and sent_keys.get(schedule_type) == schedule_key:
+                continue
 
-        report_attachments = []
-        for site_id, site_label in scopes:
             try:
-                atts = report_generate(
-                    item.report_code,
-                    location,
-                    period,
-                    site_id=site_id,
-                    site_name=site_label,
-                    user=admin_user,
-                    send_pdf=item.send_pdf,
-                    send_excel=item.send_excel,
-                )
-                for att in atts:
-                    att["report_code"] = item.report_code
-                    att["site_id"] = site_id
-                    att["period_label"] = period.get("label", "")
-                report_attachments.extend(atts)
+                period = resolve_period(schedule_type, item.daily_period, now_local)
             except Exception as exc:
-                logger.exception(
-                    "generate failed %s site=%s: %s", item.report_code, site_id, exc
-                )
+                logger.exception("period resolve failed: %s", exc)
                 logs_to_create.append(
                     ReportEmailLog(
                         location=location,
                         report_code=item.report_code,
-                        site_id=site_id,
                         schedule_key=schedule_key,
-                        period_label=period.get("label", ""),
                         status=ReportEmailLog.STATUS_ERROR,
                         error=str(exc),
                     )
                 )
+                continue
 
-        if not report_attachments:
+            if item.site_wise and active_sites:
+                scopes = [(site.id, site.name) for site in active_sites]
+            else:
+                scopes = [(None, location.name)]
+
+            report_attachments = []
+            for site_id, site_label in scopes:
+                try:
+                    atts = report_generate(
+                        item.report_code,
+                        location,
+                        period,
+                        site_id=site_id,
+                        site_name=site_label,
+                        user=admin_user,
+                        send_pdf=item.send_pdf,
+                        send_excel=item.send_excel,
+                    )
+                    for att in atts:
+                        att["report_code"] = item.report_code
+                        att["site_id"] = site_id
+                        att["period_label"] = period.get("label", "")
+                        att["schedule_type"] = schedule_type
+                    report_attachments.extend(atts)
+                except Exception as exc:
+                    logger.exception(
+                        "generate failed %s site=%s: %s", item.report_code, site_id, exc
+                    )
+                    logs_to_create.append(
+                        ReportEmailLog(
+                            location=location,
+                            report_code=item.report_code,
+                            site_id=site_id,
+                            schedule_key=schedule_key,
+                            period_label=period.get("label", ""),
+                            status=ReportEmailLog.STATUS_ERROR,
+                            error=str(exc),
+                        )
+                    )
+
+            if not report_attachments:
+                logs_to_create.append(
+                    ReportEmailLog(
+                        location=location,
+                        report_code=item.report_code,
+                        schedule_key=schedule_key,
+                        period_label=period.get("label", ""),
+                        status=ReportEmailLog.STATUS_SKIPPED,
+                        error="no_data",
+                    )
+                )
+                sent_keys[schedule_type] = schedule_key
+                item_touched = True
+                continue
+
+            attachments.extend(report_attachments)
+            formats = ",".join(sorted({a["format"] for a in report_attachments}))
+            row_count = sum(a.get("row_count") or 0 for a in report_attachments)
             logs_to_create.append(
                 ReportEmailLog(
                     location=location,
                     report_code=item.report_code,
                     schedule_key=schedule_key,
                     period_label=period.get("label", ""),
-                    status=ReportEmailLog.STATUS_SKIPPED,
-                    error="no_data",
+                    formats=formats,
+                    row_count=row_count,
+                    status=ReportEmailLog.STATUS_SENT,
                 )
             )
-            # Still mark as processed for this schedule key so we don't retry empty all day
-            item.last_sent_schedule_key = schedule_key
-            updated_items.append(item)
-            continue
+            sent_keys[schedule_type] = schedule_key
+            item_touched = True
 
-        attachments.extend(report_attachments)
-        formats = ",".join(sorted({a["format"] for a in report_attachments}))
-        row_count = sum(a.get("row_count") or 0 for a in report_attachments)
-        logs_to_create.append(
-            ReportEmailLog(
-                location=location,
-                report_code=item.report_code,
-                schedule_key=schedule_key,
-                period_label=period.get("label", ""),
-                formats=formats,
-                row_count=row_count,
-                status=ReportEmailLog.STATUS_SENT,
+        if item_touched:
+            item.last_sent_keys = sent_keys
+            item.last_sent_schedule_key = sent_keys.get(
+                item.schedule_type, next(iter(sent_keys.values()), "")
             )
-        )
-        item.last_sent_schedule_key = schedule_key
-        updated_items.append(item)
+            updated_items.append(item)
 
     if not attachments:
         if logs_to_create:
             ReportEmailLog.objects.bulk_create(logs_to_create)
         if updated_items:
-            LocationReportEmailItem.objects.bulk_update(updated_items, ["last_sent_schedule_key"])
+            LocationReportEmailItem.objects.bulk_update(
+                updated_items, ["last_sent_schedule_key", "last_sent_keys"]
+            )
         return {"skipped": True, "reason": "no_attachments", "logs": len(logs_to_create)}
 
     subject = f"Reports - {location.name} ({now_local.date().isoformat()})"
@@ -179,14 +193,16 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
     if result.get("sent"):
         ReportEmailLog.objects.bulk_create(logs_to_create)
         if updated_items:
-            LocationReportEmailItem.objects.bulk_update(updated_items, ["last_sent_schedule_key"])
+            LocationReportEmailItem.objects.bulk_update(
+                updated_items, ["last_sent_schedule_key", "last_sent_keys"]
+            )
         return {
             "sent": True,
             "attachments_count": result["attachments_count"],
+            "recipients_count": len(result.get("recipients") or []),
             "reports": len(updated_items),
         }
 
-    # Email failed — mark errors
     for log in logs_to_create:
         if log.status == ReportEmailLog.STATUS_SENT:
             log.status = ReportEmailLog.STATUS_ERROR
@@ -216,6 +232,11 @@ def dispatch_org_report_emails():
                 summary["sent"] += 1
             else:
                 summary["skipped"] += 1
+                logger.info(
+                    "Org %s skipped: %s",
+                    config.location.name,
+                    result.get("reason"),
+                )
         except Exception as exc:
             logger.exception("dispatch failed for config %s", config.id)
             summary["errors"].append(str(exc))
@@ -225,7 +246,7 @@ def dispatch_org_report_emails():
 
 @shared_task(name="reports.tasks.send_org_report_email_now")
 def send_org_report_email_now(config_id: str):
-    """Manual/test send — ignores send_time window and schedule-day gates? force=True still respects schedule match for items..."""
+    """Manual/test send — ignores send_time and schedule-day gates."""
     close_old_connections()
     config = (
         LocationReportEmailConfig.objects.filter(id=config_id)
@@ -235,8 +256,6 @@ def send_org_report_email_now(config_id: str):
     )
     if not config:
         return {"error": "config_not_found"}
-    # Force: ignore send_time; still only enabled items that match today OR all enabled for test.
-    # For test-send we process all enabled items regardless of schedule day.
     return _process_org_config_force_all(config)
 
 
@@ -261,7 +280,14 @@ def _process_org_config_force_all(config: LocationReportEmailConfig):
         active_sites = []
 
     for item in items:
-        period = resolve_period(item.schedule_type, item.daily_period, now_local)
+        # Prefer daily period for test when daily is selected; else first schedule type
+        types = item.get_schedule_types()
+        schedule_type = (
+            LocationReportEmailItem.SCHEDULE_DAILY
+            if LocationReportEmailItem.SCHEDULE_DAILY in types
+            else types[0]
+        )
+        period = resolve_period(schedule_type, item.daily_period, now_local)
         scopes = (
             [(s.id, s.name) for s in active_sites]
             if item.site_wise and active_sites
@@ -296,7 +322,6 @@ def _process_org_config_force_all(config: LocationReportEmailConfig):
     )
 
 
-# Keep legacy task names so old beat entries / manual calls do not crash.
 @shared_task
 def email_daily_checkin_report():
     logger.warning(

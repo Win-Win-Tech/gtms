@@ -439,6 +439,13 @@ class SiteSetting(models.Model):
     value = models.TextField(blank=True)
     unit = models.CharField(max_length=10, null=True, blank=True)
     location = models.ForeignKey('Location', on_delete=models.CASCADE, null=True, blank=True, related_name="site_settings")
+    propagate_to_orgs = models.BooleanField(
+        default=True,
+        help_text=(
+            "If True (and location is NULL), this global key is copied to each organisation. "
+            "If False, the key stays global-only (e.g. app_version / force_update)."
+        ),
+    )
     is_deleted = models.BooleanField(default=False)
 
     class Meta:

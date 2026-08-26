@@ -38,8 +38,9 @@ class LocationReportEmailConfig(models.Model):
         return f"ReportEmailConfig<{self.location_id}> enabled={self.is_enabled}"
 
     def recipient_list(self):
-        parts = [p.strip() for p in (self.recipients or "").replace(";", ",").split(",")]
-        return [p for p in parts if p]
+        from reports.services.email_sender import parse_recipients
+
+        return parse_recipients(self.recipients or "")
 
 
 class LocationReportEmailItem(models.Model):
@@ -92,12 +93,18 @@ class LocationReportEmailItem(models.Model):
         max_length=32,
         choices=SCHEDULE_CHOICES,
         default=SCHEDULE_DAILY,
+        help_text="Legacy primary schedule; prefer schedule_types",
+    )
+    schedule_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='List of schedule types, e.g. ["daily","weekly_sunday"]',
     )
     daily_period = models.CharField(
         max_length=32,
         choices=DAILY_PERIOD_CHOICES,
         default=PERIOD_PREVIOUS_DAY,
-        help_text="Used only when schedule_type=daily",
+        help_text="Used only when daily is among schedule_types",
     )
     send_pdf = models.BooleanField(default=True)
     send_excel = models.BooleanField(default=False)
@@ -106,6 +113,11 @@ class LocationReportEmailItem(models.Model):
         help_text="If true, generate one attachment set per active site",
     )
     last_sent_schedule_key = models.CharField(max_length=64, blank=True, default="")
+    last_sent_keys = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Per-schedule last sent keys, e.g. {"daily":"2026-08-25-daily"}',
+    )
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)
 
@@ -115,7 +127,40 @@ class LocationReportEmailItem(models.Model):
         verbose_name_plural = "Location report email items"
 
     def __str__(self):
-        return f"{self.report_code} ({self.schedule_type}) enabled={self.is_enabled}"
+        types = self.get_schedule_types()
+        return f"{self.report_code} ({','.join(types)}) enabled={self.is_enabled}"
+
+    def get_schedule_types(self):
+        """Normalized list of schedule types (supports legacy schedule_type)."""
+        raw = self.schedule_types
+        if isinstance(raw, list) and raw:
+            cleaned = []
+            for t in raw:
+                if t in {
+                    self.SCHEDULE_DAILY,
+                    self.SCHEDULE_WEEKLY_SUNDAY,
+                    self.SCHEDULE_MONTHLY_START,
+                } and t not in cleaned:
+                    cleaned.append(t)
+            if cleaned:
+                return cleaned
+        if self.schedule_type:
+            return [self.schedule_type]
+        return [self.SCHEDULE_DAILY]
+
+    def set_schedule_types(self, types):
+        cleaned = []
+        for t in types or []:
+            if t in {
+                self.SCHEDULE_DAILY,
+                self.SCHEDULE_WEEKLY_SUNDAY,
+                self.SCHEDULE_MONTHLY_START,
+            } and t not in cleaned:
+                cleaned.append(t)
+        if not cleaned:
+            cleaned = [self.SCHEDULE_DAILY]
+        self.schedule_types = cleaned
+        self.schedule_type = cleaned[0]
 
 
 class ReportEmailLog(models.Model):

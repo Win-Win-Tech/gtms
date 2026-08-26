@@ -1,9 +1,17 @@
+from datetime import time as dt_time
+
 from rest_framework import serializers
 
 from reports.constants import REPORT_CATALOG, REPORT_CATALOG_BY_CODE
 from reports.models import LocationReportEmailConfig, LocationReportEmailItem, ReportEmailLog
 from reports.services.email_sender import parse_recipients
-from reports.services.schedule_utils import get_location_timezone
+from reports.services.schedule_utils import get_location_timezone, snap_send_time
+
+VALID_SCHEDULES = {
+    LocationReportEmailItem.SCHEDULE_DAILY,
+    LocationReportEmailItem.SCHEDULE_WEEKLY_SUNDAY,
+    LocationReportEmailItem.SCHEDULE_MONTHLY_START,
+}
 
 
 class LocationReportEmailItemSerializer(serializers.ModelSerializer):
@@ -11,6 +19,11 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
     supports_pdf = serializers.SerializerMethodField()
     supports_excel = serializers.SerializerMethodField()
     supports_site_wise = serializers.SerializerMethodField()
+    schedule_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=list(VALID_SCHEDULES)),
+        required=False,
+        allow_empty=False,
+    )
 
     class Meta:
         model = LocationReportEmailItem
@@ -20,6 +33,7 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
             "label",
             "is_enabled",
             "schedule_type",
+            "schedule_types",
             "daily_period",
             "send_pdf",
             "send_excel",
@@ -29,7 +43,13 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
             "supports_site_wise",
             "last_sent_schedule_key",
         )
-        read_only_fields = ("id", "last_sent_schedule_key")
+        read_only_fields = ("id", "last_sent_schedule_key", "schedule_type")
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["schedule_types"] = instance.get_schedule_types()
+        data["schedule_type"] = data["schedule_types"][0]
+        return data
 
     def get_label(self, obj):
         meta = REPORT_CATALOG_BY_CODE.get(obj.report_code) or {}
@@ -43,6 +63,15 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
 
     def get_supports_site_wise(self, obj):
         return bool((REPORT_CATALOG_BY_CODE.get(obj.report_code) or {}).get("supports_site_wise"))
+
+    def validate_schedule_types(self, value):
+        cleaned = []
+        for t in value or []:
+            if t in VALID_SCHEDULES and t not in cleaned:
+                cleaned.append(t)
+        if not cleaned:
+            raise serializers.ValidationError("Select at least one schedule type.")
+        return cleaned
 
     def validate(self, attrs):
         send_pdf = attrs.get("send_pdf", getattr(self.instance, "send_pdf", False))
@@ -60,6 +89,9 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     "Enabled reports must have PDF and/or Excel selected."
                 )
+        # Back-compat: if only schedule_type sent, fold into schedule_types
+        if "schedule_types" not in attrs and "schedule_type" in attrs and attrs["schedule_type"]:
+            attrs["schedule_types"] = [attrs["schedule_type"]]
         return attrs
 
 
@@ -92,11 +124,21 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
 
     def validate_recipients(self, value):
         emails = parse_recipients(value or "")
-        if self.initial_data.get("is_enabled") or (self.instance and self.instance.is_enabled):
-            enabled = self.initial_data.get("is_enabled", getattr(self.instance, "is_enabled", False))
-            if enabled and not emails:
-                raise serializers.ValidationError("At least one valid recipient email is required when enabled.")
-        return ", ".join(emails) if emails else (value or "")
+        enabled = self.initial_data.get("is_enabled")
+        if enabled is None and self.instance:
+            enabled = self.instance.is_enabled
+        if enabled and not emails:
+            raise serializers.ValidationError(
+                "At least one valid recipient email is required when enabled."
+            )
+        # Always persist as comma-space joined so multi-recipient is unambiguous
+        return ", ".join(emails)
+
+    def validate_send_time(self, value):
+        if isinstance(value, str):
+            parts = value.split(":")
+            value = dt_time(int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        return snap_send_time(value)
 
     def update(self, instance, validated_data):
         items_data = validated_data.pop("items", None)
@@ -109,16 +151,15 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                 report_code = item_data.get("report_code")
                 if not report_code:
                     continue
+                default_schedule = (REPORT_CATALOG_BY_CODE.get(report_code) or {}).get(
+                    "default_schedule", LocationReportEmailItem.SCHEDULE_DAILY
+                )
                 item, _created = LocationReportEmailItem.objects.get_or_create(
                     config=instance,
                     report_code=report_code,
                     defaults={
-                        "schedule_type": item_data.get(
-                            "schedule_type",
-                            (REPORT_CATALOG_BY_CODE.get(report_code) or {}).get(
-                                "default_schedule", LocationReportEmailItem.SCHEDULE_DAILY
-                            ),
-                        ),
+                        "schedule_type": default_schedule,
+                        "schedule_types": [default_schedule],
                         "daily_period": LocationReportEmailItem.PERIOD_PREVIOUS_DAY,
                         "send_pdf": (REPORT_CATALOG_BY_CODE.get(report_code) or {}).get(
                             "supports_pdf", False
@@ -130,7 +171,6 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                 )
                 for field in (
                     "is_enabled",
-                    "schedule_type",
                     "daily_period",
                     "send_pdf",
                     "send_excel",
@@ -138,6 +178,12 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                 ):
                     if field in item_data:
                         setattr(item, field, item_data[field])
+
+                if "schedule_types" in item_data:
+                    item.set_schedule_types(item_data["schedule_types"])
+                elif "schedule_type" in item_data:
+                    item.set_schedule_types([item_data["schedule_type"]])
+
                 meta = REPORT_CATALOG_BY_CODE.get(report_code) or {}
                 if item.send_pdf and not meta.get("supports_pdf"):
                     item.send_pdf = False
@@ -179,12 +225,14 @@ def ensure_default_items(config: LocationReportEmailConfig):
         code = meta["code"]
         if code in existing:
             continue
+        default_schedule = meta.get("default_schedule") or LocationReportEmailItem.SCHEDULE_DAILY
         to_create.append(
             LocationReportEmailItem(
                 config=config,
                 report_code=code,
                 is_enabled=False,
-                schedule_type=meta.get("default_schedule") or LocationReportEmailItem.SCHEDULE_DAILY,
+                schedule_type=default_schedule,
+                schedule_types=[default_schedule],
                 daily_period=LocationReportEmailItem.PERIOD_PREVIOUS_DAY,
                 send_pdf=bool(meta.get("supports_pdf")),
                 send_excel=bool(meta.get("supports_excel")),

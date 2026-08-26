@@ -9,6 +9,7 @@ from .views import (
     CheckpointTemplateViewSet,
     ChecklistItemViewSet,
     ChecklistTemplateViewSet,
+    AppVersionCheckView,
 )
 from .views_v5 import AssignmentViewSetV5
 
@@ -26,5 +27,6 @@ v5_router = DefaultRouter()
 v5_router.register('assignments', AssignmentViewSetV5, basename='assignments-v5')
 
 urlpatterns = router.urls + [
+    path('app-version-check/', AppVersionCheckView.as_view(), name='app-version-check'),
     path('v5/', include(v5_router.urls)),
 ]

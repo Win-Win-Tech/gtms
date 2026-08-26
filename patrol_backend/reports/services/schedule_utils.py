@@ -66,11 +66,22 @@ def send_time_matches(local_dt, send_time: time, window_minutes: int = 15) -> bo
     """True if local clock is in the same window_minutes slot as send_time."""
     if not send_time:
         return False
+    # Snap configured time to the cron window so :37 still maps to the :30 slot.
     send_mins = send_time.hour * 60 + send_time.minute
+    send_mins = (send_mins // window_minutes) * window_minutes
     now_mins = local_dt.hour * 60 + local_dt.minute
     send_slot = send_mins // window_minutes
     now_slot = now_mins // window_minutes
     return now_slot == send_slot
+
+
+def snap_send_time(send_time: time, window_minutes: int = 15) -> time:
+    """Snap a clock time down to the nearest window boundary (e.g. 11:37 → 11:30)."""
+    if not send_time:
+        return time(8, 0)
+    total = send_time.hour * 60 + send_time.minute
+    snapped = (total // window_minutes) * window_minutes
+    return time(hour=snapped // 60, minute=snapped % 60)
 
 
 def schedule_matches_today(schedule_type: str, local_dt: datetime) -> bool:
@@ -81,6 +92,14 @@ def schedule_matches_today(schedule_type: str, local_dt: datetime) -> bool:
     if schedule_type == Item.SCHEDULE_MONTHLY_START:
         return local_dt.day == 1
     return False
+
+
+def matching_schedule_types(schedule_types, local_dt: datetime) -> list:
+    """Return which of the configured schedule types match today."""
+    types = schedule_types or []
+    if isinstance(types, str):
+        types = [types]
+    return [t for t in types if schedule_matches_today(t, local_dt)]
 
 
 def build_schedule_key(local_date: date, schedule_type: str) -> str:

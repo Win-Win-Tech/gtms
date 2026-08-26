@@ -14,6 +14,8 @@ from .serializers import (
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny
 from django.utils.timezone import now, make_aware
 from rest_framework.exceptions import ValidationError
 from datetime import datetime, timedelta
@@ -21,7 +23,6 @@ import pytz
 import logging
 from calendar import monthrange
 from collections import defaultdict
-from rest_framework.decorators import action
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from django.http import HttpResponse
@@ -36,6 +37,99 @@ from patrol_backend.utils.timezone_utils import (
 
 logger = logging.getLogger(__name__)
 from datetime import date
+
+
+def _parse_version_tuple(raw):
+    """Parse '1.2.3' / '1.2' / 'v1.0.0' into a comparable int tuple."""
+    s = str(raw or "").strip().lstrip("vV")
+    if not s:
+        return None
+    parts = []
+    for piece in s.split("."):
+        num = ""
+        for ch in piece:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            return None
+        parts.append(int(num))
+    return tuple(parts) if parts else None
+
+
+def _truthy_setting(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class AppVersionCheckView(APIView):
+    """
+    Public (no auth) app version check for mobile clients.
+
+    GET/POST ?app_version=1.0.0  (or JSON body { "app_version": "1.0.0" })
+
+    Compares client version with global SiteSetting key `app_version`.
+    Also returns global `force_update` true/false.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return self._check(request)
+
+    def post(self, request):
+        return self._check(request)
+
+    def _check(self, request):
+        client_version = (
+            request.query_params.get("app_version")
+            or request.data.get("app_version")
+            or ""
+        )
+        client_version = str(client_version).strip()
+        if not client_version:
+            return Response(
+                {"error": "app_version is required"},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        latest_raw = SiteSetting.get_setting("app_version", location_id=None, default_value="")
+        force_raw = SiteSetting.get_setting("force_update", location_id=None, default_value="false")
+        force_update = _truthy_setting(force_raw)
+
+        client_tuple = _parse_version_tuple(client_version)
+        latest_tuple = _parse_version_tuple(latest_raw)
+
+        if client_tuple is None:
+            return Response(
+                {"error": "Invalid app_version format. Use like 1.0.0"},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        if latest_tuple is None:
+            return Response(
+                {
+                    "error": "Server app_version is not configured",
+                    "latest_version": latest_raw or None,
+                    "force_update": force_update,
+                },
+                status=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # Client below server version → update needed
+        update_required = client_tuple < latest_tuple
+        up_to_date = client_tuple >= latest_tuple
+
+        return Response(
+            {
+                "client_version": client_version,
+                "latest_version": str(latest_raw).strip(),
+                "update_required": update_required,
+                "up_to_date": up_to_date,
+                "force_update": force_update,
+            },
+            status=http_status.HTTP_200_OK,
+        )
 
 
 def _get_monthly_location_summary_data_v2(location_id, year, month, search=None, role=None, request=None, user_id=None, site_id=None, site_guard_ids=None):
@@ -923,19 +1017,18 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
         return super().list(request, *args, **kwargs)
 
     def _sync_settings(self, location_id, user):
-        """Ensures location has overrides for every global key."""
-        # Find global keys that don't have a local counterpart
-        # Optimization: Use a subquery to find missing keys
+        """Ensures location has overrides for every propagatable global key."""
         from django.db.models import Exists, OuterRef
-        
+
         missing_settings = SiteSetting.objects.filter(
-            location__isnull=True, 
-            is_deleted=False
+            location__isnull=True,
+            is_deleted=False,
+            propagate_to_orgs=True,
         ).exclude(
             Exists(
                 SiteSetting.objects.filter(
-                    key=OuterRef('key'), 
-                    location_id=location_id, 
+                    key=OuterRef('key'),
+                    location_id=location_id,
                     is_deleted=False
                 )
             )
@@ -948,9 +1041,10 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
                 value=g_set.value,
                 unit=g_set.unit,
                 location_id=location_id,
+                propagate_to_orgs=False,  # org copies are not templates
                 created_by=user
             ))
-        
+
         if to_create:
             SiteSetting.objects.bulk_create(to_create, ignore_conflicts=True)
 
@@ -961,13 +1055,45 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
-        # Only Super Admin (no location) can create new keys/settings
-        # 1. Permission check: Only Super Admin can create new setting keys
         if not user.is_superuser:
-             raise ValidationError("Only Super Admin can create new setting keys.")
-        
-        # Super admin creations are global (location=NULL)
-        serializer.save(created_by=user, location=None)
+            raise ValidationError("Only Super Admin can create new setting keys.")
+
+        # Scope from request: "global_only" | "all_orgs" (default all_orgs for back-compat)
+        scope = (self.request.data.get("create_scope") or "all_orgs").strip().lower()
+        propagate = scope != "global_only"
+
+        instance = serializer.save(
+            created_by=user,
+            location=None,
+            propagate_to_orgs=propagate,
+        )
+
+        # Eagerly copy to every organisation when "All organisations" is selected
+        if propagate:
+            from scheduler.models import Location
+
+            locs = Location.objects.all()
+            existing_loc_ids = set(
+                SiteSetting.objects.filter(
+                    key=instance.key,
+                    is_deleted=False,
+                    location__isnull=False,
+                ).values_list("location_id", flat=True)
+            )
+            to_create = [
+                SiteSetting(
+                    key=instance.key,
+                    value=instance.value,
+                    unit=instance.unit,
+                    location=loc,
+                    propagate_to_orgs=False,
+                    created_by=user,
+                )
+                for loc in locs
+                if loc.id not in existing_loc_ids
+            ]
+            if to_create:
+                SiteSetting.objects.bulk_create(to_create, ignore_conflicts=True)
 
     def perform_update(self, serializer):
         instance = self.get_object()

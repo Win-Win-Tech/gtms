@@ -10,9 +10,11 @@ from django.test import SimpleTestCase
 from reports.models import LocationReportEmailItem as Item
 from reports.services.schedule_utils import (
     build_schedule_key,
+    matching_schedule_types,
     resolve_period,
     schedule_matches_today,
     send_time_matches,
+    snap_send_time,
 )
 
 
@@ -22,6 +24,24 @@ class ScheduleUtilsTests(SimpleTestCase):
         local = tz.localize(datetime(2026, 8, 25, 8, 7))
         self.assertTrue(send_time_matches(local, time(8, 0)))
         self.assertFalse(send_time_matches(local, time(9, 0)))
+        # 11:37 snaps into the 11:30 slot
+        local_1130 = tz.localize(datetime(2026, 8, 25, 11, 30))
+        self.assertTrue(send_time_matches(local_1130, time(11, 37)))
+        local_1145 = tz.localize(datetime(2026, 8, 25, 11, 45))
+        self.assertFalse(send_time_matches(local_1145, time(11, 37)))
+
+    def test_snap_send_time(self):
+        self.assertEqual(snap_send_time(time(11, 37)), time(11, 30))
+        self.assertEqual(snap_send_time(time(11, 45)), time(11, 45))
+        self.assertEqual(snap_send_time(time(8, 0)), time(8, 0))
+
+    def test_matching_schedule_types_multi(self):
+        sunday = datetime(2026, 8, 23, 8, 0)
+        matched = matching_schedule_types(
+            [Item.SCHEDULE_DAILY, Item.SCHEDULE_WEEKLY_SUNDAY, Item.SCHEDULE_MONTHLY_START],
+            sunday,
+        )
+        self.assertEqual(matched, [Item.SCHEDULE_DAILY, Item.SCHEDULE_WEEKLY_SUNDAY])
 
     def test_schedule_matches_daily_always(self):
         local = datetime(2026, 8, 25, 8, 0)  # Monday
