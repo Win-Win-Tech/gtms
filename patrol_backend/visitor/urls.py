@@ -1,4 +1,5 @@
-from django.urls import path
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
 
 from .views import (
     VisitorApproveView,
@@ -41,6 +42,10 @@ from .views_v5 import (
     VisitorRevertViewV5,
     VisitorSearchViewV5,
 )
+from .views_lookup import VisitorLookupOptionViewSet
+
+router = DefaultRouter()
+router.register(r"lookup-options", VisitorLookupOptionViewSet, basename="visitor-lookup-options")
 
 urlpatterns = [
     path("search/", VisitorSearchView.as_view(), name="visitor-search"),
@@ -190,4 +195,5 @@ urlpatterns = [
         VehicleMovementReportExportPdfViewV5.as_view(),
         name="visitor-vehicle-movement-export-pdf-v5",
     ),
+    path("", include(router.urls)),
 ]

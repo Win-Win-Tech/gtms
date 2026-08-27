@@ -5,7 +5,7 @@ from .models import LocationReportEmailItem as Item
 REPORT_CATALOG = [
     {
         "code": Item.REPORT_CHECKIN,
-        "label": "Check-in Report",
+        "label": "QR Scan Patrol Report",
         "supports_pdf": True,
         "supports_excel": True,
         "supports_site_wise": True,
@@ -57,7 +57,7 @@ REPORT_CATALOG = [
         "supports_pdf": False,
         "supports_excel": True,
         "supports_site_wise": True,
-        "default_schedule": Item.SCHEDULE_MONTHLY_START,
+        "default_schedule": Item.SCHEDULE_MONTHLY,
     },
     {
         "code": Item.REPORT_MONTHLY_LOCATION,
@@ -65,7 +65,7 @@ REPORT_CATALOG = [
         "supports_pdf": False,
         "supports_excel": True,
         "supports_site_wise": True,
-        "default_schedule": Item.SCHEDULE_MONTHLY_START,
+        "default_schedule": Item.SCHEDULE_MONTHLY,
     },
 ]
 

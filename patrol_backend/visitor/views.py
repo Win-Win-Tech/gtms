@@ -20,7 +20,12 @@ from notifications.services import notify_visitor_host_action, notify_visitor_pe
 from scheduler.models import Location
 
 from .exports import generate_visitor_excel, generate_visitor_pdf
-from .models import Visitor, VisitorAsset, VisitorEntry
+from .lookup_options import (
+    get_valid_codes,
+    normalize_vehicle_type,
+    normalize_visitor_type,
+)
+from .models import Visitor, VisitorAsset, VisitorEntry, VisitorLookupOption
 from .serializers import VisitorAssetSerializer, VisitorEntrySerializer, VisitorSerializer
 from .vehicle_movement_report import (
     build_vehicle_movement_report,
@@ -209,13 +214,9 @@ def _parse_expected_out_time(value, user_tz=None):
     return _parse_dt(text, user_tz)
 
 
-def _normalize_vehicle_type(value):
-    """Return valid vehicle_type or empty string."""
-    text = (value or "").strip().lower()
-    if not text:
-        return ""
-    valid = {c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES}
-    return text if text in valid else None
+def _valid_codes_message(location_id, kind):
+    codes = sorted(get_valid_codes(location_id, kind))
+    return ", ".join(codes)
 
 
 def _parse_date(value):
@@ -352,13 +353,12 @@ def _filtered_entries(request):
         or ""
     ).strip().lower()
     if visitor_type and visitor_type != "all":
-        valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
-        if visitor_type not in valid_types:
+        if visitor_type not in get_valid_codes(location_id, VisitorLookupOption.KIND_VISITOR_TYPE):
             return None, Response(
                 {
                     "error": (
                         "Invalid visitor_type. Choose from: "
-                        f"{', '.join(sorted(valid_types))}"
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VISITOR_TYPE)}"
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -384,10 +384,14 @@ def _filtered_entries(request):
     # Vehicle type filter
     vtype_filter = (request.query_params.get("vehicle_type") or "").strip().lower()
     if vtype_filter and vtype_filter != "all":
-        valid_vtypes = {c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES}
-        if vtype_filter not in valid_vtypes:
+        if vtype_filter not in get_valid_codes(location_id, VisitorLookupOption.KIND_VEHICLE_TYPE):
             return None, Response(
-                {"error": f"Invalid vehicle_type filter. Choose from: {', '.join(sorted(valid_vtypes))}"},
+                {
+                    "error": (
+                        "Invalid vehicle_type filter. Choose from: "
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VEHICLE_TYPE)}"
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
         qs = qs.filter(vehicle_type=vtype_filter)
@@ -536,11 +540,16 @@ class VisitorCheckInView(APIView):
                 {"error": "visitor_name is required"}, status=status.HTTP_400_BAD_REQUEST
             )
 
-        visitor_type = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
-        valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
-        if visitor_type not in valid_types:
+        visitor_type_raw = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
+        visitor_type = normalize_visitor_type(visitor_type_raw, location_id)
+        if visitor_type is None:
             return Response(
-                {"error": f"Invalid visitor_type. Choose from: {', '.join(sorted(valid_types))}"},
+                {
+                    "error": (
+                        "Invalid visitor_type. Choose from: "
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VISITOR_TYPE)}"
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -551,13 +560,13 @@ class VisitorCheckInView(APIView):
         phone_number = (data.get("phone_number") or "").strip()
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
-        vehicle_type = _normalize_vehicle_type(data.get("vehicle_type"))
+        vehicle_type = normalize_vehicle_type(data.get("vehicle_type"), location_id)
         if vehicle_type is None:
             return Response(
                 {
                     "error": (
                         "Invalid vehicle_type. Choose from: "
-                        + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VEHICLE_TYPE)}"
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1289,24 +1298,29 @@ class VisitorInviteCreateView(APIView):
         if val_err:
             return Response({"error": val_err}, status=status.HTTP_400_BAD_REQUEST)
 
-        visitor_type = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
-        valid_types = {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}
-        if visitor_type not in valid_types:
+        visitor_type_raw = (data.get("visitor_type") or VisitorEntry.TYPE_GUEST).strip()
+        visitor_type = normalize_visitor_type(visitor_type_raw, location_id)
+        if visitor_type is None:
             return Response(
-                {"error": f"Invalid visitor_type. Choose from: {', '.join(sorted(valid_types))}"},
+                {
+                    "error": (
+                        "Invalid visitor_type. Choose from: "
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VISITOR_TYPE)}"
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         phone_number = (data.get("phone_number") or "").strip()
         purpose = (data.get("purpose_of_visit") or "").strip()
         vehicle_number = (data.get("vehicle_number") or "").strip()
-        vehicle_type = _normalize_vehicle_type(data.get("vehicle_type"))
+        vehicle_type = normalize_vehicle_type(data.get("vehicle_type"), location_id)
         if vehicle_type is None:
             return Response(
                 {
                     "error": (
                         "Invalid vehicle_type. Choose from: "
-                        + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                        f"{_valid_codes_message(location_id, VisitorLookupOption.KIND_VEHICLE_TYPE)}"
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1402,9 +1416,18 @@ class VisitorCompleteInviteView(APIView):
         if data.get("purpose_of_visit") is not None:
             entry.purpose_of_visit = data.get("purpose_of_visit").strip()
         if data.get("visitor_type"):
-            vtype = data.get("visitor_type").strip()
-            if vtype in {c[0] for c in VisitorEntry.VISITOR_TYPE_CHOICES}:
-                entry.visitor_type = vtype
+            vtype = normalize_visitor_type(data.get("visitor_type"), entry.location_id)
+            if vtype is None:
+                return Response(
+                    {
+                        "error": (
+                            "Invalid visitor_type. Choose from: "
+                            f"{_valid_codes_message(entry.location_id, VisitorLookupOption.KIND_VISITOR_TYPE)}"
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            entry.visitor_type = vtype
         if data.get("remarks") is not None:
             entry.remarks = data.get("remarks").strip()
 
@@ -1412,13 +1435,13 @@ class VisitorCompleteInviteView(APIView):
         if vehicle_num:
             entry.vehicle_number = vehicle_num
         if "vehicle_type" in data:
-            vtype = _normalize_vehicle_type(data.get("vehicle_type"))
+            vtype = normalize_vehicle_type(data.get("vehicle_type"), entry.location_id)
             if vtype is None:
                 return Response(
                     {
                         "error": (
                             "Invalid vehicle_type. Choose from: "
-                            + ", ".join(sorted(c[0] for c in VisitorEntry.VEHICLE_TYPE_CHOICES))
+                            f"{_valid_codes_message(entry.location_id, VisitorLookupOption.KIND_VEHICLE_TYPE)}"
                         )
                     },
                     status=status.HTTP_400_BAD_REQUEST,

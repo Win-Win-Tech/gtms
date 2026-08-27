@@ -2,6 +2,8 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 
 
 class Visitor(models.Model):
@@ -131,7 +133,6 @@ class VisitorEntry(models.Model):
     )
     visitor_type = models.CharField(
         max_length=32,
-        choices=VISITOR_TYPE_CHOICES,
         default=TYPE_GUEST,
     )
     status = models.CharField(
@@ -144,7 +145,6 @@ class VisitorEntry(models.Model):
     vehicle_number = models.CharField(max_length=64, blank=True, default="")
     vehicle_type = models.CharField(
         max_length=32,
-        choices=VEHICLE_TYPE_CHOICES,
         blank=True,
         default="",
     )
@@ -285,3 +285,71 @@ class VisitorAsset(models.Model):
 
     def __str__(self):
         return f"{self.asset_type} for {self.visitor_entry_id}"
+
+
+class VisitorLookupOption(models.Model):
+    """Global templates (location=NULL) and org-specific visitor/vehicle type options."""
+
+    KIND_VISITOR_TYPE = "visitor_type"
+    KIND_VEHICLE_TYPE = "vehicle_type"
+    KIND_CHOICES = [
+        (KIND_VISITOR_TYPE, "Visitor Type"),
+        (KIND_VEHICLE_TYPE, "Vehicle Type"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES, db_index=True)
+    code = models.CharField(max_length=32, db_index=True)
+    label = models.CharField(max_length=64)
+    location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="visitor_lookup_options",
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text="True for seeded system types; org custom types are False.",
+    )
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["sort_order", "label"]
+        unique_together = ("kind", "code", "location")
+        indexes = [
+            models.Index(fields=["kind", "location", "is_active"]),
+        ]
+
+    def __str__(self):
+        scope = self.location.name if self.location else "Global"
+        return f"{self.kind}:{self.code} ({scope})"
+
+    def save(self, *args, **kwargs):
+        if self.code:
+            self.code = self.code.lower().strip()
+        if self.label:
+            self.label = self.label.strip()
+        super().save(*args, **kwargs)
+
+
+@receiver(post_save, sender=VisitorLookupOption)
+def propagate_new_global_lookup_option(sender, instance, created, **kwargs):
+    """When a global template is created, copy it to all existing locations."""
+    if not created or instance.location is not None:
+        return
+    from scheduler.models import Location
+
+    for loc in Location.objects.filter(is_deleted=False):
+        VisitorLookupOption.objects.get_or_create(
+            kind=instance.kind,
+            code=instance.code,
+            location=loc,
+            defaults={
+                "label": instance.label,
+                "is_default": instance.is_default,
+                "sort_order": instance.sort_order,
+                "is_active": instance.is_active,
+            },
+        )

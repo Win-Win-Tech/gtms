@@ -359,7 +359,7 @@ class DashboardCheckInReportExcelViewV5(DashboardCheckInReportExcelViewV2):
 
             wb = Workbook()
             ws = wb.active
-            ws.title = "Check-In Report"
+            ws.title = "QR Scan Patrol Report"
 
             def format_checklist_cell(report_item):
                 answers = report_item.get("checklist_answers")

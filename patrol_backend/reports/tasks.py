@@ -62,14 +62,22 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
 
     for item in items:
         schedule_types = item.get_schedule_types()
-        matching = matching_schedule_types(schedule_types, now_local) if not force else schedule_types
+        matching = (
+            matching_schedule_types(schedule_types, now_local, item)
+            if not force
+            else [
+                LocationReportEmailItem.normalize_schedule_type(t)
+                for t in schedule_types
+            ]
+        )
         if not matching:
             continue
 
         sent_keys = dict(item.last_sent_keys or {})
-        # Legacy single key fallback
+        # Legacy single key fallback (normalize weekly_sunday / monthly_start keys)
         if not sent_keys and item.last_sent_schedule_key and item.schedule_type:
-            sent_keys[item.schedule_type] = item.last_sent_schedule_key
+            legacy_type = LocationReportEmailItem.normalize_schedule_type(item.schedule_type)
+            sent_keys[legacy_type] = item.last_sent_schedule_key
 
         item_touched = False
 
@@ -79,7 +87,7 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
                 continue
 
             try:
-                period = resolve_period(schedule_type, item.daily_period, now_local)
+                period = resolve_period(schedule_type, item.daily_period, now_local, item)
             except Exception as exc:
                 logger.exception("period resolve failed: %s", exc)
                 logs_to_create.append(
@@ -287,7 +295,7 @@ def _process_org_config_force_all(config: LocationReportEmailConfig):
             if LocationReportEmailItem.SCHEDULE_DAILY in types
             else types[0]
         )
-        period = resolve_period(schedule_type, item.daily_period, now_local)
+        period = resolve_period(schedule_type, item.daily_period, now_local, item)
         scopes = (
             [(s.id, s.name) for s in active_sites]
             if item.site_wise and active_sites

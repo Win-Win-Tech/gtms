@@ -5643,7 +5643,7 @@ def generate_checkin_excel_report_internal(
     # Create Excel workbook
     wb = Workbook()
     ws = wb.active
-    ws.title = "Check-In Report"
+    ws.title = "QR Scan Patrol Report"
 
     def format_checklist_cell(report_item):
         answers = report_item.get('checklist_answers')
@@ -5751,7 +5751,7 @@ class DashboardCheckInReportExcelView(APIView):
             # Create Excel workbook
             wb = Workbook()
             ws = wb.active
-            ws.title = "Check-In Report"
+            ws.title = "QR Scan Patrol Report"
 
             def format_checklist_cell(report_item):
                 answers = report_item.get('checklist_answers')
@@ -8803,7 +8803,7 @@ class DashboardCheckInReportExcelViewV2(APIView):
             # Create Excel workbook
             wb = Workbook()
             ws = wb.active
-            ws.title = "Check-In Report"
+            ws.title = "QR Scan Patrol Report"
 
             def format_checklist_cell(report_item):
                 answers = report_item.get('checklist_answers')

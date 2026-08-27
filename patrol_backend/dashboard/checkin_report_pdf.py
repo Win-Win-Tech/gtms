@@ -122,7 +122,7 @@ def generate_checkin_report_pdf(report_data, request, filter_type, start_date, e
         topMargin=1.2 * inch,
         bottomMargin=0.35 * inch,
     )
-    doc.report_title = "Check-in Report"
+    doc.report_title = "QR Scan Patrol Report"
     doc.org_name = org_name
     doc.dept_label = org_name
     doc.range_start = range_start

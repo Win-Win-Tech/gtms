@@ -80,13 +80,13 @@ def _checkin_generate(location_id, period, site_id, request, send_pdf, send_exce
 
     start, end = _period_dates(period)
     attachments = []
-    base = f"checkin_{_safe_name(label)}_{start}"
+    base = f"qr_scan_patrol_{_safe_name(label)}_{start}"
 
     if send_excel:
         # Prefer v2 data path: build workbook from already-fetched data
         wb = Workbook()
         ws = wb.active
-        ws.title = "Check-In Report"
+        ws.title = "QR Scan Patrol Report"
         headers = [
             "Shift Date",
             "Name",
@@ -128,7 +128,7 @@ def _checkin_generate(location_id, period, site_id, request, send_pdf, send_exce
                 "mime": MIME_XLSX,
                 "format": "excel",
                 "row_count": len(data),
-                "display_name": f"Check-In ({label})",
+                "display_name": f"QR Scan Patrol ({label})",
             }
         )
 
@@ -143,7 +143,7 @@ def _checkin_generate(location_id, period, site_id, request, send_pdf, send_exce
                 "mime": MIME_PDF,
                 "format": "pdf",
                 "row_count": len(data),
-                "display_name": f"Check-In ({label})",
+                "display_name": f"QR Scan Patrol ({label})",
             }
         )
 

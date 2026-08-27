@@ -9,9 +9,46 @@ from reports.services.schedule_utils import get_location_timezone, snap_send_tim
 
 VALID_SCHEDULES = {
     LocationReportEmailItem.SCHEDULE_DAILY,
+    LocationReportEmailItem.SCHEDULE_WEEKLY,
+    LocationReportEmailItem.SCHEDULE_MONTHLY,
+    LocationReportEmailItem.SCHEDULE_LAST_N_DAYS,
+    # Legacy aliases accepted on write
     LocationReportEmailItem.SCHEDULE_WEEKLY_SUNDAY,
     LocationReportEmailItem.SCHEDULE_MONTHLY_START,
 }
+
+ITEM_PERIOD_FIELDS = (
+    "daily_period",
+    "weekly_weekday",
+    "weekly_include_current_day",
+    "monthly_send_days",
+    "last_n_days_count",
+    "last_n_days_send_days",
+    "last_n_days_include_current_day",
+    "send_pdf",
+    "send_excel",
+    "site_wise",
+    "is_enabled",
+)
+
+
+def _clean_dom_list(value, field_label="send days"):
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise serializers.ValidationError(f"{field_label} must be a list of day numbers.")
+    cleaned = []
+    for raw in value:
+        try:
+            day = int(raw)
+        except (TypeError, ValueError):
+            raise serializers.ValidationError(f"{field_label} must be integers between 1 and 31.")
+        if day < 1 or day > 31:
+            raise serializers.ValidationError(f"{field_label} must be integers between 1 and 31.")
+        if day not in cleaned:
+            cleaned.append(day)
+    cleaned.sort()
+    return cleaned
 
 
 class LocationReportEmailItemSerializer(serializers.ModelSerializer):
@@ -35,6 +72,12 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
             "schedule_type",
             "schedule_types",
             "daily_period",
+            "weekly_weekday",
+            "weekly_include_current_day",
+            "monthly_send_days",
+            "last_n_days_count",
+            "last_n_days_send_days",
+            "last_n_days_include_current_day",
             "send_pdf",
             "send_excel",
             "site_wise",
@@ -49,6 +92,10 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         data["schedule_types"] = instance.get_schedule_types()
         data["schedule_type"] = data["schedule_types"][0]
+        if not isinstance(data.get("monthly_send_days"), list) or not data["monthly_send_days"]:
+            data["monthly_send_days"] = [1]
+        if not isinstance(data.get("last_n_days_send_days"), list) or not data["last_n_days_send_days"]:
+            data["last_n_days_send_days"] = [7, 14, 21, 28]
         return data
 
     def get_label(self, obj):
@@ -67,11 +114,45 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
     def validate_schedule_types(self, value):
         cleaned = []
         for t in value or []:
-            if t in VALID_SCHEDULES and t not in cleaned:
-                cleaned.append(t)
+            nt = LocationReportEmailItem.normalize_schedule_type(t)
+            if nt in {
+                LocationReportEmailItem.SCHEDULE_DAILY,
+                LocationReportEmailItem.SCHEDULE_WEEKLY,
+                LocationReportEmailItem.SCHEDULE_MONTHLY,
+                LocationReportEmailItem.SCHEDULE_LAST_N_DAYS,
+            } and nt not in cleaned:
+                cleaned.append(nt)
         if not cleaned:
             raise serializers.ValidationError("Select at least one schedule type.")
         return cleaned
+
+    def validate_weekly_weekday(self, value):
+        if value is None:
+            return 6
+        try:
+            day = int(value)
+        except (TypeError, ValueError):
+            raise serializers.ValidationError("weekday must be an integer 0–6.")
+        if day < 0 or day > 6:
+            raise serializers.ValidationError("weekday must be 0 (Mon) through 6 (Sun).")
+        return day
+
+    def validate_last_n_days_count(self, value):
+        if value is None:
+            return 7
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            raise serializers.ValidationError("N must be an integer between 1 and 90.")
+        if n < 1 or n > 90:
+            raise serializers.ValidationError("N must be between 1 and 90.")
+        return n
+
+    def validate_monthly_send_days(self, value):
+        return _clean_dom_list(value, "monthly send days")
+
+    def validate_last_n_days_send_days(self, value):
+        return _clean_dom_list(value, "last N days send days")
 
     def validate(self, attrs):
         send_pdf = attrs.get("send_pdf", getattr(self.instance, "send_pdf", False))
@@ -91,7 +172,37 @@ class LocationReportEmailItemSerializer(serializers.ModelSerializer):
                 )
         # Back-compat: if only schedule_type sent, fold into schedule_types
         if "schedule_types" not in attrs and "schedule_type" in attrs and attrs["schedule_type"]:
-            attrs["schedule_types"] = [attrs["schedule_type"]]
+            attrs["schedule_types"] = [
+                LocationReportEmailItem.normalize_schedule_type(attrs["schedule_type"])
+            ]
+
+        types = attrs.get("schedule_types")
+        if types is None and self.instance is not None:
+            types = self.instance.get_schedule_types()
+        types = types or []
+
+        if LocationReportEmailItem.SCHEDULE_MONTHLY in types:
+            days = attrs.get("monthly_send_days")
+            if days is None and self.instance is not None:
+                days = self.instance.monthly_send_days
+            if not days:
+                raise serializers.ValidationError(
+                    {"monthly_send_days": "Select at least one day of month for Monthly."}
+                )
+
+        if LocationReportEmailItem.SCHEDULE_LAST_N_DAYS in types:
+            days = attrs.get("last_n_days_send_days")
+            if days is None and self.instance is not None:
+                days = self.instance.last_n_days_send_days
+            if not days:
+                raise serializers.ValidationError(
+                    {
+                        "last_n_days_send_days": (
+                            "Select at least one day of month for Last N days."
+                        )
+                    }
+                )
+
         return attrs
 
 
@@ -169,13 +280,7 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                         ),
                     },
                 )
-                for field in (
-                    "is_enabled",
-                    "daily_period",
-                    "send_pdf",
-                    "send_excel",
-                    "site_wise",
-                ):
+                for field in ITEM_PERIOD_FIELDS:
                     if field in item_data:
                         setattr(item, field, item_data[field])
 
@@ -189,6 +294,10 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                     item.send_pdf = False
                 if not meta.get("supports_site_wise"):
                     item.site_wise = False
+                if not item.monthly_send_days:
+                    item.monthly_send_days = [1]
+                if not item.last_n_days_send_days:
+                    item.last_n_days_send_days = [7, 14, 21, 28]
                 item.save()
 
         return instance

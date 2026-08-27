@@ -9,7 +9,8 @@ from rest_framework.test import APIClient
 
 from notifications.models import NotificationLog
 from scheduler.models import Location
-from visitor.models import Visitor, VisitorAsset, VisitorEntry
+from visitor.models import Visitor, VisitorAsset, VisitorEntry, VisitorLookupOption
+from visitor.lookup_options import get_valid_codes, get_options_for_location
 
 User = get_user_model()
 
@@ -163,3 +164,104 @@ class VisitorInviteTestCase(TestCase):
         self.assertEqual(resched_res.status_code, status.HTTP_200_OK)
         self.assertEqual(resched_res.data["status"], "scheduled")
         self.assertEqual(resched_res.data["visit_date"], future_date.isoformat())
+
+
+class VisitorLookupOptionTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.location = Location.objects.create(name="Lookup HQ", timezone="Asia/Kolkata")
+        self.other_location = Location.objects.create(name="Other HQ", timezone="Asia/Kolkata")
+        self.admin = User.objects.create_user(
+            email="admin@example.com",
+            password="Password123!",
+            name="Admin User",
+            location=self.location,
+            role="admin",
+        )
+        self.guard = User.objects.create_user(
+            email="guard2@example.com",
+            password="Password123!",
+            name="Guard User",
+            location=self.location,
+            role="guard",
+        )
+
+    def test_list_returns_seeded_org_options(self):
+        self.client.force_authenticate(user=self.guard)
+        res = self.client.get(
+            f"/visitors/lookup-options/?location_id={self.location.id}&kind=visitor_type"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data.get("results", res.data)
+        codes = {row["code"] for row in data}
+        self.assertIn("guest", codes)
+
+    def test_fallback_to_global_when_org_has_no_rows(self):
+        VisitorLookupOption.objects.filter(location=self.other_location).delete()
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get(
+            f"/visitors/lookup-options/?location_id={self.other_location.id}&kind=visitor_type"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        data = res.data.get("results", res.data)
+        self.assertTrue(any(row["code"] == "guest" for row in data))
+
+    def test_org_admin_can_create_custom_visitor_type(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(
+            "/visitors/lookup-options/",
+            {
+                "kind": "visitor_type",
+                "label": "Vendor",
+                "sort_order": 10,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        row = VisitorLookupOption.objects.get(code="vendor", location=self.location)
+        self.assertFalse(row.is_default)
+
+    def test_checkin_rejects_invalid_visitor_type(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(
+            "/visitors/entries/checkin/",
+            {
+                "location_id": str(self.location.id),
+                "ic_passport_number": "IC001",
+                "visitor_name": "Test Visitor",
+                "visitor_type": "not_a_real_type",
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid visitor_type", res.data["error"])
+
+    def test_cannot_delete_default_type(self):
+        default_row = VisitorLookupOption.objects.filter(
+            location=self.location,
+            kind=VisitorLookupOption.KIND_VISITOR_TYPE,
+            code="guest",
+        ).first()
+        self.assertIsNotNone(default_row)
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(f"/visitors/lookup-options/{default_row.id}/")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_get_valid_codes_uses_org_rows(self):
+        VisitorLookupOption.objects.create(
+            kind=VisitorLookupOption.KIND_VISITOR_TYPE,
+            code="vendor",
+            label="Vendor",
+            location=self.location,
+            is_default=False,
+            sort_order=99,
+        )
+        codes = get_valid_codes(self.location.id, VisitorLookupOption.KIND_VISITOR_TYPE)
+        self.assertIn("vendor", codes)
+        self.assertIn("guest", codes)
+
+    def test_get_options_for_location_fallback(self):
+        VisitorLookupOption.objects.filter(location=self.other_location).delete()
+        qs = get_options_for_location(self.other_location.id, VisitorLookupOption.KIND_VEHICLE_TYPE)
+        self.assertTrue(qs.filter(code="car", location__isnull=True).exists())
+

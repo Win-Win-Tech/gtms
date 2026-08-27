@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from datetime import date, datetime, time, timedelta
 from types import SimpleNamespace
 
@@ -84,35 +85,93 @@ def snap_send_time(send_time: time, window_minutes: int = 15) -> time:
     return time(hour=snapped // 60, minute=snapped % 60)
 
 
-def schedule_matches_today(schedule_type: str, local_dt: datetime) -> bool:
-    if schedule_type == Item.SCHEDULE_DAILY:
-        return True
-    if schedule_type == Item.SCHEDULE_WEEKLY_SUNDAY:
-        return local_dt.weekday() == 6  # Sunday
-    if schedule_type == Item.SCHEDULE_MONTHLY_START:
-        return local_dt.day == 1
+def day_of_month_matches(local_date: date, days_list) -> bool:
+    """
+    True if local_date.day matches any configured day-of-month.
+
+    Days greater than the length of the month are clamped to the last day
+    (e.g. configured 30 in February matches Feb 28/29).
+    """
+    if not days_list:
+        return False
+    last_day = calendar.monthrange(local_date.year, local_date.month)[1]
+    for raw in days_list:
+        try:
+            configured = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if configured < 1:
+            continue
+        if local_date.day == min(configured, last_day):
+            return True
     return False
 
 
-def matching_schedule_types(schedule_types, local_dt: datetime) -> list:
+def _item_attr(item, name, default=None):
+    if item is None:
+        return default
+    return getattr(item, name, default)
+
+
+def schedule_matches_today(schedule_type: str, local_dt: datetime, item=None) -> bool:
+    st = Item.normalize_schedule_type(schedule_type)
+    today = local_dt.date()
+
+    if st == Item.SCHEDULE_DAILY:
+        return True
+
+    if st == Item.SCHEDULE_WEEKLY:
+        raw_weekday = _item_attr(item, "weekly_weekday", 6)
+        try:
+            weekday = int(6 if raw_weekday is None else raw_weekday)
+        except (TypeError, ValueError):
+            weekday = 6
+        if weekday < 0 or weekday > 6:
+            weekday = 6
+        return local_dt.weekday() == weekday
+
+    if st == Item.SCHEDULE_MONTHLY:
+        days = _item_attr(item, "monthly_send_days", None)
+        if not days:
+            days = [1]
+        return day_of_month_matches(today, days)
+
+    if st == Item.SCHEDULE_LAST_N_DAYS:
+        days = _item_attr(item, "last_n_days_send_days", None)
+        if not days:
+            days = [7, 14, 21, 28]
+        return day_of_month_matches(today, days)
+
+    return False
+
+
+def matching_schedule_types(schedule_types, local_dt: datetime, item=None) -> list:
     """Return which of the configured schedule types match today."""
     types = schedule_types or []
     if isinstance(types, str):
         types = [types]
-    return [t for t in types if schedule_matches_today(t, local_dt)]
+    matched = []
+    for t in types:
+        nt = Item.normalize_schedule_type(t)
+        if nt in matched:
+            continue
+        if schedule_matches_today(nt, local_dt, item):
+            matched.append(nt)
+    return matched
 
 
 def build_schedule_key(local_date: date, schedule_type: str) -> str:
-    return f"{local_date.isoformat()}-{schedule_type}"
+    return f"{local_date.isoformat()}-{Item.normalize_schedule_type(schedule_type)}"
 
 
-def resolve_period(schedule_type: str, daily_period: str, local_dt: datetime):
+def resolve_period(schedule_type: str, daily_period: str, local_dt: datetime, item=None):
     """
     Return dict describing the data window for a report.
     """
     today = local_dt.date()
+    st = Item.normalize_schedule_type(schedule_type)
 
-    if schedule_type == Item.SCHEDULE_DAILY:
+    if st == Item.SCHEDULE_DAILY:
         if daily_period == Item.PERIOD_TODAY:
             target = today
             label = f"Today ({target.isoformat()})"
@@ -131,9 +190,9 @@ def resolve_period(schedule_type: str, daily_period: str, local_dt: datetime):
             "date_filter": "custom",
         }
 
-    if schedule_type == Item.SCHEDULE_WEEKLY_SUNDAY:
-        # On Sunday, previous week = last Mon .. last Sun (yesterday).
-        end = today - timedelta(days=1)
+    if st == Item.SCHEDULE_WEEKLY:
+        include = bool(_item_attr(item, "weekly_include_current_day", False))
+        end = today if include else today - timedelta(days=1)
         start = end - timedelta(days=6)
         return {
             "kind": "range",
@@ -147,7 +206,7 @@ def resolve_period(schedule_type: str, daily_period: str, local_dt: datetime):
             "date_filter": "custom",
         }
 
-    if schedule_type == Item.SCHEDULE_MONTHLY_START:
+    if st == Item.SCHEDULE_MONTHLY:
         first_this = today.replace(day=1)
         last_prev = first_this - timedelta(days=1)
         start = last_prev.replace(day=1)
@@ -160,6 +219,28 @@ def resolve_period(schedule_type: str, daily_period: str, local_dt: datetime):
             "year": start.year,
             "month": start.month,
             "label": start.strftime("%B %Y"),
+            "filter_type": "custom",
+            "date_filter": "custom",
+        }
+
+    if st == Item.SCHEDULE_LAST_N_DAYS:
+        raw_n = _item_attr(item, "last_n_days_count", 7)
+        try:
+            n = int(7 if raw_n is None else raw_n)
+        except (TypeError, ValueError):
+            n = 7
+        n = max(1, min(90, n))
+        include = bool(_item_attr(item, "last_n_days_include_current_day", False))
+        end = today if include else today - timedelta(days=1)
+        start = end - timedelta(days=n - 1)
+        return {
+            "kind": "range",
+            "start_date": start,
+            "end_date": end,
+            "month_str": None,
+            "year": None,
+            "month": None,
+            "label": f"Last {n} days {start.isoformat()} to {end.isoformat()}",
             "filter_type": "custom",
             "date_filter": "custom",
         }

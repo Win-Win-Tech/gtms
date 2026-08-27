@@ -15,9 +15,10 @@ from patrol_backend.utils.timezone_utils import (
     to_user_timezone,
 )
 
+from .lookup_options import get_vehicle_report_order, resolve_label
 from .models import VisitorEntry
 
-# Display order for report rows (uses existing vehicle_type choices only)
+# Display order for report rows comes from org lookup options (fallback: global templates)
 VEHICLE_REPORT_ORDER = [
     "car",
     "truck",
@@ -28,11 +29,11 @@ VEHICLE_REPORT_ORDER = [
 ]
 
 
-def _vehicle_label(code):
-    for value, label in VisitorEntry.VEHICLE_TYPE_CHOICES:
-        if value == code:
-            return label
-    return (code or "").replace("_", " ").title() or "—"
+def _vehicle_label(code, location_id=None):
+    if location_id:
+        return resolve_label(location_id, "vehicle_type", code)
+    text = (code or "").replace("_", " ").title()
+    return text or "—"
 
 
 def _parse_report_date(value):
@@ -243,13 +244,15 @@ def build_vehicle_movement_report(
 
     all_types = set(in_map) | set(out_map)
 
+    report_order = get_vehicle_report_order(location_id) or VEHICLE_REPORT_ORDER
+
     rows = []
     total_in = 0
     total_out = 0
-    for code in VEHICLE_REPORT_ORDER:
+    for code in report_order:
         count_in = in_map.get(code, 0)
         count_out = out_map.get(code, 0)
-        label = _vehicle_label(code)
+        label = _vehicle_label(code, location_id)
         rows.append(
             {
                 "vehicle_type": code,
@@ -262,14 +265,14 @@ def build_vehicle_movement_report(
         total_out += count_out
     # Any extra types not in the default order
     for code in sorted(all_types):
-        if code in VEHICLE_REPORT_ORDER:
+        if code in report_order:
             continue
         count_in = in_map.get(code, 0)
         count_out = out_map.get(code, 0)
         rows.append(
             {
                 "vehicle_type": code,
-                "label": _vehicle_label(code),
+                "label": _vehicle_label(code, location_id),
                 "in": count_in,
                 "out": count_out,
             }
