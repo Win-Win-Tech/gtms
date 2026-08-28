@@ -3,10 +3,11 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import ValidationError
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
-from scheduler.models import SiteSetting
+from scheduler.models import SiteSetting, Location
 from django.db.models import Q, F
 from .models import User, Role
 from .serializers import (
@@ -473,28 +474,63 @@ class TimezoneListView(APIView):
 class RoleViewSet(viewsets.ModelViewSet):
     """
     CRUD endpoint for Roles. Filters by the token's user.location or Global (superadmin).
+    Superadmin: omit location_id (or location_id=all) for global templates; pass location_id for org-scoped roles.
     """
     serializer_class = RoleSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    @staticmethod
+    def _normalize_location_id(raw):
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s or s.lower() == 'all':
+            return None
+        return s
+
+    @classmethod
+    def _ensure_location_roles(cls, location_id):
+        """Copy global role templates to an org when it has no role rows yet."""
+        if not location_id:
+            return
+        if Role.objects.filter(location_id=location_id).exists():
+            return
+        loc = Location.objects.filter(id=location_id, is_deleted=False).first()
+        if not loc:
+            return
+        global_roles = Role.objects.filter(location__isnull=True)
+        if not global_roles.exists():
+            return
+        for g_role in global_roles:
+            Role.objects.get_or_create(
+                name=g_role.name,
+                location=loc,
+                defaults={
+                    'is_default': g_role.is_default,
+                    'is_allow_webapp': g_role.is_allow_webapp,
+                    'is_allow_edit': g_role.is_allow_edit,
+                    'is_allow_create': g_role.is_allow_create,
+                    'pages': g_role.pages or [],
+                },
+            )
+
     def get_queryset(self):
         user = self.request.user
-        location_id = self.request.query_params.get('location_id')
+        location_id = self._normalize_location_id(self.request.query_params.get('location_id'))
 
         if location_id:
             # Security: Non-superadmins should only fetch for their own location
             if user.location and str(user.location.id) != location_id and not user.is_superuser:
                 return Role.objects.none()
-            loc_qs = Role.objects.filter(location_id=location_id)
-            # If this location has no Role rows yet (populate_roles not run), expose global templates
-            queryset = loc_qs if loc_qs.exists() else Role.objects.filter(location__isnull=True)
+            self._ensure_location_roles(location_id)
+            queryset = Role.objects.filter(location_id=location_id)
         elif user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
             # Superuser or Global admin: See global roles by default if no location specified
             queryset = Role.objects.filter(location__isnull=True)
         else:
-            # Org admin: own location's roles, else global templates (same as login resolution)
-            loc_qs = Role.objects.filter(location=user.location)
-            queryset = loc_qs if loc_qs.exists() else Role.objects.filter(location__isnull=True)
+            # Org admin: own location's roles only (auto-seed from global templates if missing)
+            self._ensure_location_roles(user.location_id)
+            queryset = Role.objects.filter(location=user.location)
 
         # Admin restriction: Only superusers can see Admin role
         if not user.is_superuser:
@@ -502,14 +538,27 @@ class RoleViewSet(viewsets.ModelViewSet):
         
         return queryset
 
+    def _resolve_create_location(self, user):
+        """Return Location instance for org-scoped create, or None for global template."""
+        location_id = self._normalize_location_id(self.request.query_params.get('location_id'))
+        if location_id:
+            if not user.is_superuser:
+                if not user.location or str(user.location.id) != location_id:
+                    return None
+            return Location.objects.filter(id=location_id, is_deleted=False).first()
+        if user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
+            return None
+        return user.location
+
     def perform_create(self, serializer):
         user = self.request.user
-        if user.is_superuser or not user.location or (user.role and user.role.lower() == 'superadmin'):
-            # Superadmin creates global default roles
+        loc = self._resolve_create_location(user)
+        if loc is None and self._normalize_location_id(self.request.query_params.get('location_id')):
+            raise ValidationError({'location_id': 'Invalid organisation for role create.'})
+        if loc is None:
             serializer.save(location=None, is_default=True)
         else:
-            # Org admin creates organization-specific role (override or custom)
-            serializer.save(location=user.location, is_default=False)
+            serializer.save(location=loc, is_default=False)
             
     def perform_update(self, serializer):
         user = self.request.user
@@ -559,7 +608,9 @@ class RoleViewSet(viewsets.ModelViewSet):
         # 2. USER SYNC: If the role name changed, update the string field in the User model
         if old_name.lower() != new_name.lower():
             qs = User.objects.filter(role__iexact=old_name)
-            if user.location:
+            if updated.location_id:
+                qs = qs.filter(location_id=updated.location_id)
+            elif user.location and not user.is_superuser:
                 qs = qs.filter(location=user.location)
             qs.update(role=new_name)
 
