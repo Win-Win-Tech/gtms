@@ -9,7 +9,10 @@ logger = logging.getLogger(__name__)
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Role
-        fields = ['id', 'name', 'location', 'is_default', 'is_allow_webapp', 'pages']
+        fields = [
+            'id', 'name', 'location', 'is_default', 'is_allow_webapp',
+            'is_allow_edit', 'is_allow_create', 'pages',
+        ]
         read_only_fields = ['id', 'location', 'is_default']
 
 class UserSerializer(serializers.ModelSerializer):

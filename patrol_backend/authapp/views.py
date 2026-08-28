@@ -61,11 +61,15 @@ def build_login_client_fields(request, user):
     """Permissions and flags that login repeats at the top level of `data`."""
     role_permissions = []
     is_allow_webapp = False
+    is_allow_edit = False
+    is_allow_create = False
 
     role_obj = resolve_role_for_user(user)
     if role_obj:
         role_permissions = list(role_obj.pages or [])
         is_allow_webapp = bool(role_obj.is_allow_webapp)
+        is_allow_edit = bool(role_obj.is_allow_edit)
+        is_allow_create = bool(role_obj.is_allow_create)
 
     if user.is_superuser and not role_permissions:
         role_permissions = [
@@ -79,6 +83,10 @@ def build_login_client_fields(request, user):
             "Role Management",
         ]
         is_allow_webapp = True
+
+    if user.is_superuser:
+        is_allow_edit = True
+        is_allow_create = True
 
     is_qr_scan_enabled = getattr(user.location, "is_qr_scan_enable", False) if user.location else False
 
@@ -124,6 +132,8 @@ def build_login_client_fields(request, user):
         "user_id": str(user.id),
         "role": user.role,
         "is_allow_webapp": is_allow_webapp,
+        "is_allow_edit": is_allow_edit,
+        "is_allow_create": is_allow_create,
         "permissions": role_permissions,
         "is_superuser": user.is_superuser,
         "location_id": str(user.location.id) if user.location else None,
@@ -506,11 +516,15 @@ class RoleViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         old_name = instance.name
         old_pages = instance.pages or []
+        old_is_allow_edit = bool(instance.is_allow_edit)
+        old_is_allow_create = bool(instance.is_allow_create)
         
         updated = serializer.save()
         new_name = updated.name
         new_pages = updated.pages or []
         new_is_allow_webapp = updated.is_allow_webapp
+        new_is_allow_edit = bool(updated.is_allow_edit)
+        new_is_allow_create = bool(updated.is_allow_create)
 
         # 1. CASCADE SYSTEM: If a Global Role Template (location=None) is modified
         if updated.location is None:
@@ -519,7 +533,9 @@ class RoleViewSet(viewsets.ModelViewSet):
             local_roles.update(
                 name=new_name,
                 pages=new_pages,
-                is_allow_webapp=new_is_allow_webapp
+                is_allow_webapp=new_is_allow_webapp,
+                is_allow_edit=new_is_allow_edit,
+                is_allow_create=new_is_allow_create,
             )
 
             # Special case: Global Revocation
@@ -534,6 +550,11 @@ class RoleViewSet(viewsets.ModelViewSet):
                             if len(updated_pages) != len(role.pages):
                                 role.pages = updated_pages
                                 role.save()
+
+                if old_is_allow_edit and not new_is_allow_edit:
+                    Role.objects.exclude(id=updated.id).update(is_allow_edit=False)
+                if old_is_allow_create and not new_is_allow_create:
+                    Role.objects.exclude(id=updated.id).update(is_allow_create=False)
 
         # 2. USER SYNC: If the role name changed, update the string field in the User model
         if old_name.lower() != new_name.lower():

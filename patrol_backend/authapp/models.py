@@ -13,6 +13,14 @@ class Role(models.Model):
     location = models.ForeignKey(Location, on_delete=models.CASCADE, null=True, blank=True, related_name='roles')
     is_default = models.BooleanField(default=False, help_text="True if this is a system default role (Admin, SO, FO, Guard)")
     is_allow_webapp = models.BooleanField(default=False, help_text="True if this role allows web panel access")
+    is_allow_edit = models.BooleanField(
+        default=False,
+        help_text="If true, users with this role see edit/delete actions in the web panel",
+    )
+    is_allow_create = models.BooleanField(
+        default=False,
+        help_text="If true, users with this role see create/add actions in the web panel",
+    )
     pages = models.JSONField(default=list, blank=True, help_text="List of menu strings (e.g., ['Dashboard', 'Users'])")
 
     class Meta:
@@ -211,6 +219,8 @@ def propagate_new_global_role(sender, instance, created, **kwargs):
                 defaults={
                     'is_default': instance.is_default,
                     'is_allow_webapp': instance.is_allow_webapp,
+                    'is_allow_edit': instance.is_allow_edit,
+                    'is_allow_create': instance.is_allow_create,
                     'pages': instance.pages
                 }
             )
