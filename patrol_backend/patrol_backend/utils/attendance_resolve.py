@@ -362,3 +362,8 @@ def apply_v4_attendance_after_log(
                 user_tz,
                 refresh_fn,
             )
+
+    if action_mode == "checkout":
+        from livetracking.checkout_hooks import on_attendance_checkout
+
+        on_attendance_checkout(user, attendance=attendance)

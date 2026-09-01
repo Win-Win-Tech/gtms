@@ -1934,6 +1934,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
         )
 
+        from livetracking.checkout_hooks import on_attendance_checkout
+
+        on_attendance_checkout(user, attendance=attendance)
+
         return Response(
             AttendanceCheckinSerializer(attendance, context={'request': request}).data,
             status=status.HTTP_200_OK
@@ -2898,6 +2902,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         _attendance_v3_refresh_saved_fields(
             attendance, guard, assignment, shift, org_location, search_start_utc, search_end_utc
         )
+
+        from livetracking.checkout_hooks import on_attendance_checkout
+
+        on_attendance_checkout(guard, attendance=attendance)
 
         response_data = AttendanceCheckinSerializer(attendance, context={"request": request}).data
         response_data.update({

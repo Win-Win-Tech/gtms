@@ -6,7 +6,17 @@ from uuid import UUID
 class LocationSiteSerializer(serializers.ModelSerializer):
     class Meta:
         model = LocationSite
-        fields = ['id', 'name', 'latitude', 'longitude']
+        fields = [
+            'id',
+            'name',
+            'latitude',
+            'longitude',
+            'is_active',
+            'boundary_type',
+            'boundary_radius_m',
+            'boundary_polygon',
+            'boundary_enabled',
+        ]
 
 class LocationSerializer(serializers.ModelSerializer):
     sites = LocationSiteSerializer(many=True, required=False)

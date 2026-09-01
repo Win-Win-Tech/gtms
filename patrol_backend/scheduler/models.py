@@ -77,12 +77,37 @@ class Location(models.Model):
 
 
 class LocationSite(models.Model):
+    class BoundaryType(models.TextChoices):
+        NONE = "none", "None"
+        CIRCLE = "circle", "Circle"
+        POLYGON = "polygon", "Polygon"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name="sites")
     name = models.CharField(max_length=255)
     latitude = models.FloatField()
     longitude = models.FloatField()
     is_active = models.BooleanField(default=True)
+
+    boundary_type = models.CharField(
+        max_length=16,
+        choices=BoundaryType.choices,
+        default=BoundaryType.NONE,
+    )
+    boundary_radius_m = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Meters from center; used when boundary_type=circle",
+    )
+    boundary_polygon = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="List of [lat, lng] points when boundary_type=polygon",
+    )
+    boundary_enabled = models.BooleanField(
+        default=False,
+        help_text="Per-site on/off for boundary monitoring (shape is kept when off)",
+    )
 
     # Audit fields
     created_on = models.DateTimeField(auto_now_add=True)

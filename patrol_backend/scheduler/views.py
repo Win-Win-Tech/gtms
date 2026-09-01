@@ -2,7 +2,7 @@ import uuid
 
 from rest_framework import viewsets, status as http_status
 from django.db.models import Q, F
-from .models import Location, Shift, Assignment, Checkpoint, SiteSetting
+from .models import Location, LocationSite, Shift, Assignment, Checkpoint, SiteSetting
 from checkin.models import CheckIn
 from .serializers import (
     LocationSerializer,
@@ -283,11 +283,34 @@ class LocationViewSet(viewsets.ModelViewSet):
             logger.error(f"Error filtering locations: {e}", exc_info=True)
             return Location.objects.none()
             
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get', 'post'], url_path='sites')
     def sites(self, request, pk=None):
         location = self.get_object()
-        sites = location.sites.filter(is_active=True)
-        serializer = LocationSiteSerializer(sites, many=True)
+        if request.method == 'GET':
+            sites = location.sites.filter(is_active=True)
+            serializer = LocationSiteSerializer(sites, many=True)
+            return Response(serializer.data)
+
+        serializer = LocationSiteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        site = serializer.save(location=location)
+        return Response(LocationSiteSerializer(site).data, status=http_status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['patch', 'delete'], url_path=r'sites/(?P<site_id>[^/.]+)')
+    def site_detail(self, request, pk=None, site_id=None):
+        location = self.get_object()
+        site = location.sites.filter(id=site_id, is_active=True).first()
+        if not site:
+            return Response({'error': 'Site not found'}, status=http_status.HTTP_404_NOT_FOUND)
+
+        if request.method == 'DELETE':
+            site.is_active = False
+            site.save(update_fields=['is_active'])
+            return Response(status=http_status.HTTP_204_NO_CONTENT)
+
+        serializer = LocationSiteSerializer(site, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
         return Response(serializer.data)
 
 
