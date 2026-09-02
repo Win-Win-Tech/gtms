@@ -18,6 +18,19 @@ class LocationSiteSerializer(serializers.ModelSerializer):
             'boundary_enabled',
         ]
 
+
+def _normalize_nested_site_payload(site_data):
+    """Accept legacy keys (e.g. site_name) when creating sites with a new org."""
+    data = dict(site_data)
+    if not data.get('name') and data.get('site_name'):
+        data['name'] = data.pop('site_name')
+    else:
+        data.pop('site_name', None)
+    data.pop('id', None)
+    allowed = set(LocationSiteSerializer.Meta.fields) - {'id'}
+    return {key: value for key, value in data.items() if key in allowed}
+
+
 class LocationSerializer(serializers.ModelSerializer):
     sites = LocationSiteSerializer(many=True, required=False)
 
@@ -33,23 +46,17 @@ class LocationSerializer(serializers.ModelSerializer):
         sites_data = validated_data.pop('sites', [])
         location = Location.objects.create(**validated_data)
         for site_data in sites_data:
-            site_data.pop('id', None)  # Ensure we don't try to reuse IDs on creation
-            LocationSite.objects.create(location=location, **site_data)
+            LocationSite.objects.create(
+                location=location,
+                **_normalize_nested_site_payload(site_data),
+            )
         return location
 
     def update(self, instance, validated_data):
-        sites_data = validated_data.pop('sites', None)
-        instance = super().update(instance, validated_data)
-
-        if sites_data is not None:
-            # Simple approach: delete existing and recreate. 
-            # We pop 'id' to avoid potential conflicts with the records we just deleted
-            instance.sites.all().delete()
-            for site_data in sites_data:
-                site_data.pop('id', None)
-                LocationSite.objects.create(location=instance, **site_data)
-        
-        return instance
+        # Sites are managed via POST/PATCH /locations/{id}/sites/ only.
+        # Legacy org PUT used to send `sites` and hard-delete all rows — ignore it.
+        validated_data.pop('sites', None)
+        return super().update(instance, validated_data)
 
 class ShiftSerializer(serializers.ModelSerializer):
     # start_time = serializers.DateTimeField(format='%Y-%m-%d %H:%M:%S')

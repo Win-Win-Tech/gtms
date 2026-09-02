@@ -266,6 +266,19 @@ class LocationViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Failed to duplicate roles for location {instance.id}: {str(e)}")
 
+        try:
+            from scheduler.site_setting_sync import sync_propagatable_settings_for_location
+
+            created = sync_propagatable_settings_for_location(instance.id, user=self.request.user)
+            if created:
+                logger.info(
+                    "Seeded %s site setting(s) for new organization: %s",
+                    created,
+                    instance.name,
+                )
+        except Exception as e:
+            logger.error(f"Failed to seed site settings for location {instance.id}: {str(e)}")
+
 
     def get_queryset(self):
         try:
@@ -1041,35 +1054,9 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
 
     def _sync_settings(self, location_id, user):
         """Ensures location has overrides for every propagatable global key."""
-        from django.db.models import Exists, OuterRef
+        from scheduler.site_setting_sync import sync_propagatable_settings_for_location
 
-        missing_settings = SiteSetting.objects.filter(
-            location__isnull=True,
-            is_deleted=False,
-            propagate_to_orgs=True,
-        ).exclude(
-            Exists(
-                SiteSetting.objects.filter(
-                    key=OuterRef('key'),
-                    location_id=location_id,
-                    is_deleted=False
-                )
-            )
-        )
-
-        to_create = []
-        for g_set in missing_settings:
-            to_create.append(SiteSetting(
-                key=g_set.key,
-                value=g_set.value,
-                unit=g_set.unit,
-                location_id=location_id,
-                propagate_to_orgs=False,  # org copies are not templates
-                created_by=user
-            ))
-
-        if to_create:
-            SiteSetting.objects.bulk_create(to_create, ignore_conflicts=True)
+        sync_propagatable_settings_for_location(location_id, user=user)
 
     def partial_update(self, request, *args, **kwargs):
         return super().partial_update(request, *args, **kwargs)

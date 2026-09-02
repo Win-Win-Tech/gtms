@@ -309,12 +309,12 @@ Admins can draw boundaries and configure alert roles per site without touching v
 
 ### Tasks
 
-- [ ] [`SiteSettings.jsx`](GTMS_NEw/src/pages/settings/SiteSettings.jsx) — add keys:
+- [x] [`SiteSettings.jsx`](GTMS_NEw/src/pages/settings/SiteSettings.jsx) + [`BoundaryMonitoringSettings.jsx`](GTMS_NEw/src/pages/settings/BoundaryMonitoringSettings.jsx) — org panel:
   - Enable boundary monitoring
   - Exit buffer (meters)
   - Still-outside reminder (minutes, 0 = off)
   - Location missing timeout (minutes)
-- [ ] Backend seed/default values for new orgs
+- [x] Backend seed/default values for new orgs — `site_setting_sync.sync_propagatable_settings_for_location` on org create + settings list
 
 ### Deliverable
 

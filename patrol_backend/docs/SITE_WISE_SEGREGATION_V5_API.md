@@ -53,6 +53,8 @@ All v5 auth APIs use the existing wrapper. HTTP status is on the response; it is
 | Assignments by guard | `GET /scheduler/assignments/by-guard/<id>/` | `GET /scheduler/v5/assignments/by-guard/<id>/` |
 | Create assignment (attendance) | `POST /dashboard/attendance/create_assignment/` | `POST /dashboard/attendance/create_assignment_v5/` |
 | Today’s shift (mobile) | `GET /dashboard/attendance/shift_today_v3/` | `GET /dashboard/attendance/shift_today_v5/` |
+| Check-in (mobile) | `POST /dashboard/attendance/checkin_v4/` | `POST /dashboard/attendance/checkin_v5/` — see [ATTENDANCE_PUNCH_V5_API.md](./ATTENDANCE_PUNCH_V5_API.md) |
+| Check-out (mobile) | `POST /dashboard/attendance/checkout_v4/` | `POST /dashboard/attendance/checkout_v5/` — see [ATTENDANCE_PUNCH_V5_API.md](./ATTENDANCE_PUNCH_V5_API.md) |
 | List default shifts (mobile) | `GET /dashboard/attendance/list_default_shifts/` | same live path |
 | Attach checkpoint template (mobile) | `POST /dashboard/attendance/assign-checkpoint-template/` | same live path |
 | Report incident | `POST /incident/report/` | `POST /incident/v5/report/` — **`site_id` required** |
@@ -812,6 +814,8 @@ Response `data.last_selected_site_id` / `last_selected_site_name` match the same
 
 Live `shift_today_v3` and `create_assignment` stay unchanged for old app builds.
 
+**Attendance punch (v5):** use `checkin_v5` / `checkout_v5` with `site_id` from `last_selected_site_id`. Full request/response and error scenarios: [ATTENDANCE_PUNCH_V5_API.md](./ATTENDANCE_PUNCH_V5_API.md).
+
 ---
 
 ## 22. Incident — v5
@@ -1330,5 +1334,5 @@ Login and refresh-token **v5 will not be built**. Keep `POST /auth/login/` and `
 
 | API | Plan |
 |-----|------|
-| `scan_v5`, `checkin/checkout_v5`, monthly-cell-action_v5 | Later (dashboard / attendance) |
+| `scan_v5` | Later (checkpoint scan) |
 | Payslip / dashboard list **v5** | Later modules |

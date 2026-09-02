@@ -45,3 +45,37 @@ def get_site_within_proximity(latitude, longitude, location_id):
             return site, distance
 
     return None, None
+
+
+def get_nearest_site_within_proximity(latitude, longitude, location_id, allowed_site_ids=None):
+    """
+    Among active sites within attendance_distance, return the closest one.
+    allowed_site_ids: optional set of UUIDs the caller may use (v5 site access).
+    """
+    max_distance, active_sites = _get_location_sites_cached(location_id)
+    allowed = None if allowed_site_ids is None else {str(sid) for sid in allowed_site_ids}
+
+    best_site = None
+    best_dist = None
+    for site in active_sites:
+        if allowed is not None and str(site.id) not in allowed:
+            continue
+        distance = geodesic((latitude, longitude), (site.latitude, site.longitude)).meters
+        if distance <= max_distance and (best_dist is None or distance < best_dist):
+            best_site = site
+            best_dist = distance
+
+    if best_site is None:
+        return None, None
+    return best_site, best_dist
+
+
+def distance_to_site_meters(latitude, longitude, site):
+    """Geodesic distance from coordinates to a site's center."""
+    return geodesic((latitude, longitude), (site.latitude, site.longitude)).meters
+
+
+def is_within_site_attendance_radius(latitude, longitude, location_id, site):
+    """True if coords are within org attendance_distance of the given site."""
+    max_distance, _ = _get_location_sites_cached(location_id)
+    return distance_to_site_meters(latitude, longitude, site) <= max_distance

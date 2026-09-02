@@ -33,10 +33,16 @@ from .views import (
     DashboardCheckInReportViewV2,
     MonthlyAttendanceExcelViewSetV2,
     MonthlyAttendanceSummaryViewSetV2,
+    _attendance_v3_refresh_saved_fields,
+    _attendance_v3_shift_window_utc,
     _get_checkin_report_data_v2,
     generate_attendance_v4_excel_report_internal,
 )
+from dashboard.models import AttendanceCheckin, CheckInLog
+from dashboard.serializers import AttendanceCheckinSerializer
+from patrol_backend.utils.attendance_v5 import get_open_checkin_log, resolve_v5_punch_site
 from dashboard.attendance_detail_pdf import generate_attendance_v4_pdf_report_internal
+from django.core.files.base import ContentFile
 
 
 def _v5_error(exc):
@@ -639,6 +645,301 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
         view.request = self.request
         view.format_kwarg = self.format_kwarg
         return view
+
+    def _parse_punch_coords(self, request):
+        try:
+            lat = float(request.data.get("latitude"))
+            lon = float(request.data.get("longitude"))
+        except (TypeError, ValueError):
+            raise ValidationError({"error": "latitude and longitude are required"})
+        return lat, lon
+
+    def _v5_punch_response(self, request, attendance, matched_site, resolution, action_mode, status_code):
+        data = AttendanceCheckinSerializer(attendance, context={"request": request}).data
+        if isinstance(data, dict):
+            org_location = attendance.org_location
+            data["face_attendance"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+            data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
+            data["site_id"] = str(matched_site.id) if matched_site else None
+            data["site_name"] = matched_site.name if matched_site else None
+            data["site_resolution"] = resolution
+            data["mode"] = action_mode
+        return Response(data, status=status_code)
+
+    @action(detail=False, methods=["post"], url_path="checkin_v5")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkin_v5(self, request):
+        """
+        Mobile check-in with explicit site_id (v5).
+        site_id empty → nearest site within attendance_distance.
+        """
+        from patrol_backend.utils.attendance_resolve import (
+            CheckinTooSoonAfterCheckout,
+            apply_v4_attendance_after_log,
+            build_log_window_filter,
+            enforce_checkin_allowed_after_checkout,
+            get_or_create_attendance_for_shift_day,
+        )
+        from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
+
+        try:
+            user = request.user
+            user_tz = get_user_timezone_from_request(request)
+            live = self._live()
+            assignment, shift_start_date = live.get_today_assignment_v2(user, request)
+
+            if not assignment:
+                return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+            shift = assignment.shift
+            org_location = assignment.location
+            lat, lon = self._parse_punch_coords(request)
+
+            matched_site, _dist, resolution = resolve_v5_punch_site(
+                site_id=request.data.get("site_id"),
+                latitude=lat,
+                longitude=lon,
+                org_location_id=org_location.id,
+                user=user,
+            )
+
+            search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+            )
+            log_filter = build_log_window_filter(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+            try:
+                enforce_checkin_allowed_after_checkout(
+                    user, assignment, shift, org_location, search_start_utc, search_end_utc
+                )
+            except CheckinTooSoonAfterCheckout as exc:
+                return Response(
+                    {
+                        "error": f"Check-in allowed {exc.min_minutes} minute(s) after checkout",
+                        "code": "checkin_too_soon_after_checkout",
+                        "min_checkin_after_checkout_minutes": exc.min_minutes,
+                        "remaining_seconds": exc.remaining,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
+            raw_bytes = image_file.read() if image_file else None
+
+            if getattr(org_location, "is_face_attendance_enabled", False):
+                if not is_face_attendance_available():
+                    return Response(
+                        {
+                            "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
+                            "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
+                        },
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+                if not raw_bytes:
+                    return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
+                ok, msg, _dist_face = verify_user_face(user, raw_bytes)
+                if not ok:
+                    return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+            img_name = "checkin.jpg"
+            if image_file:
+                img_name = getattr(image_file, "name", img_name) or img_name
+
+            log = CheckInLog.objects.create(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkin",
+                latitude=lat,
+                longitude=lon,
+                site=matched_site,
+            )
+            if raw_bytes is not None:
+                log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+            attendance = get_or_create_attendance_for_shift_day(
+                user, assignment, shift, org_location, shift_start_date
+            )
+            apply_v4_attendance_after_log(
+                attendance=attendance,
+                user=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                shift_start_date=shift_start_date,
+                matched_site=matched_site,
+                log_filter=log_filter,
+                search_start_utc=search_start_utc,
+                search_end_utc=search_end_utc,
+                action_mode="checkin",
+                raw_bytes=raw_bytes,
+                img_name=img_name,
+                user_tz=user_tz,
+                refresh_fn=_attendance_v3_refresh_saved_fields,
+                skip_sibling_reconcile=False,
+            )
+
+            return self._v5_punch_response(
+                request, attendance, matched_site, resolution, "checkin", status.HTTP_201_CREATED
+            )
+        except (ValidationError, PermissionDenied) as exc:
+            return _v5_error(exc)
+
+    @action(detail=False, methods=["post"], url_path="checkout_v5")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkout_v5(self, request):
+        """
+        Mobile check-out with explicit site_id (v5).
+        site_id empty → nearest site within attendance_distance.
+        Checkout site must match the open check-in site.
+        """
+        from patrol_backend.utils.attendance_resolve import (
+            apply_v4_attendance_after_log,
+            build_log_window_filter,
+            get_or_create_attendance_for_shift_day,
+        )
+        from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
+
+        try:
+            user = request.user
+            user_tz = get_user_timezone_from_request(request)
+            live = self._live()
+            assignment, shift_start_date = live.get_today_assignment_v2(user, request)
+
+            if not assignment:
+                return Response({"message": "No shifts today"}, status=status.HTTP_400_BAD_REQUEST)
+
+            shift = assignment.shift
+            org_location = assignment.location
+            lat, lon = self._parse_punch_coords(request)
+
+            search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+                shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+            )
+            log_filter = build_log_window_filter(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+
+            open_checkin = get_open_checkin_log(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+            if not open_checkin:
+                attendance_probe = AttendanceCheckin.objects.filter(
+                    guard=user,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    shift_date=shift_start_date,
+                ).first()
+                has_checkin = CheckInLog.objects.filter(**log_filter, type="checkin").exists()
+                if not has_checkin and not (attendance_probe and attendance_probe.checkin_time):
+                    return Response({"message": "Cannot checkout before checkin"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {
+                        "error": "No open check-in session found for checkout.",
+                        "code": "no_open_checkin",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            checkin_site_id = open_checkin.site_id
+            if not checkin_site_id:
+                return Response(
+                    {
+                        "error": "Check-in site is missing. Please check in again using checkin_v5.",
+                        "code": "checkin_site_missing",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            matched_site, _dist, resolution = resolve_v5_punch_site(
+                site_id=request.data.get("site_id"),
+                latitude=lat,
+                longitude=lon,
+                org_location_id=org_location.id,
+                user=user,
+            )
+
+            if str(matched_site.id) != str(checkin_site_id):
+                checkin_site_name = getattr(open_checkin.site, "name", None) or str(checkin_site_id)
+                return Response(
+                    {
+                        "error": "Checkout site must match your check-in site.",
+                        "code": "checkout_site_mismatch",
+                        "checkin_site_id": str(checkin_site_id),
+                        "checkin_site_name": checkin_site_name,
+                        "checkout_site_id": str(matched_site.id),
+                        "checkout_site_name": matched_site.name,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            attendance = get_or_create_attendance_for_shift_day(
+                user, assignment, shift, org_location, shift_start_date
+            )
+
+            image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
+            raw_bytes = image_file.read() if image_file else None
+
+            if getattr(org_location, "is_face_attendance_enabled", False):
+                if not is_face_attendance_available():
+                    return Response(
+                        {
+                            "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
+                            "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
+                        },
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+                if not raw_bytes:
+                    return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
+                ok, msg, _dist_face = verify_user_face(user, raw_bytes)
+                if not ok:
+                    return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+
+            img_name = "checkout.jpg"
+            if image_file:
+                img_name = getattr(image_file, "name", img_name) or img_name
+
+            log = CheckInLog.objects.create(
+                guard=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                type="checkout",
+                latitude=lat,
+                longitude=lon,
+                site=matched_site,
+            )
+            if raw_bytes is not None:
+                log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+            apply_v4_attendance_after_log(
+                attendance=attendance,
+                user=user,
+                assignment=assignment,
+                shift=shift,
+                org_location=org_location,
+                shift_start_date=shift_start_date,
+                matched_site=matched_site,
+                log_filter=log_filter,
+                search_start_utc=search_start_utc,
+                search_end_utc=search_end_utc,
+                action_mode="checkout",
+                raw_bytes=raw_bytes,
+                img_name=img_name,
+                user_tz=user_tz,
+                refresh_fn=_attendance_v3_refresh_saved_fields,
+                skip_sibling_reconcile=False,
+            )
+
+            return self._v5_punch_response(
+                request, attendance, matched_site, resolution, "checkout", status.HTTP_200_OK
+            )
+        except (ValidationError, PermissionDenied) as exc:
+            return _v5_error(exc)
 
     @action(detail=False, methods=["get"], url_path="v5/bulk-entry-candidates")
     def bulk_entry_candidates_v5(self, request):
