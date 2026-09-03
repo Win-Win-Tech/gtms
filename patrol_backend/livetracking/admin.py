@@ -34,11 +34,13 @@ class TrackingAlertRecipientAdmin(admin.ModelAdmin):
 class SiteAlertRecipientConfigAdmin(admin.ModelAdmin):
     list_display = (
         "site",
-        "role",
+        "subject_role",
+        "recipient_role",
         "notify_boundary_breach",
         "notify_location_missing",
     )
     list_filter = ("notify_boundary_breach", "notify_location_missing")
+    search_fields = ("site__name", "subject_role__name", "recipient_role__name")
 
 
 @admin.register(UserLiveLocation)

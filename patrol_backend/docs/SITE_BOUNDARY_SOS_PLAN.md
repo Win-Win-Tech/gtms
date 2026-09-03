@@ -1,11 +1,11 @@
 # Site Boundary & Live Tracking Alerts Plan
 
-**Status:** Phase 7 complete  
-**Last updated:** 2026-09-01
+**Status:** Phase 11 complete — mobile live-tracking contract  
+**Last updated:** 2026-09-03
 
 ## In one sentence
 
-**Admin configures each site (boundary + who gets alerts). While a user is checked in until checkout, the system tracks GPS, alerts when they leave the boundary or stop sending location, and notifies configured roles who have access to that site.**
+**Admin enables breach / location-missing alerts globally, draws each site boundary, and configures who is notified when a given role triggers an alert. While a user is checked in until checkout, the system tracks GPS and notifies the recipient roles chosen for that subject’s role (with site access).**
 
 ---
 
@@ -55,9 +55,17 @@ Store on `UserLiveLocation`: `boundary_state` (`inside`/`outside`), `active_brea
 
 - `TrackingAlert` — alert history
 - `TrackingAlertRecipient` — per-user delivery + read state
-- `SiteAlertRecipientConfig` — per site, per role (dynamic org roles)
+- `SiteAlertRecipientConfig` — per site: **subject role** (who triggered) → **recipient role** (who is notified), with flags for breach / location missing
 
-**Recipient delivery:** Config = which roles per site. Runtime = users in those roles who have **site access** (`UserSite` / `all_org_sites`).
+**Recipient delivery (not global):**
+
+| Layer | What it configures |
+|-------|--------------------|
+| **Org Site Settings** | Timeouts and buffers only (exit buffer, still-outside reminder, location-missing timeout). **No enable switches, no recipient list.** |
+| **Per site** | Enable **boundary breach** and/or **location missing** for that site. Then, for each org role (Guard, SO, FO, custom…): if that role crosses / goes missing, which roles receive the alert. |
+| **Runtime** | Match `subject_user.role` → configured recipient roles → users in those roles with **site access**. |
+
+Example: Guard crosses → notify SO + FO + Admin. SO crosses → notify Admin only.
 
 ### Polygon storage (MySQL JSON on `LocationSite`)
 
@@ -83,7 +91,7 @@ Order: `[latitude, longitude]` — not GeoJSON `[lng, lat]`.
 - [x] Add to [`livetracking/models.py`](livetracking/models.py):
   - `TrackingAlert`
   - `TrackingAlertRecipient`
-  - `SiteAlertRecipientConfig` (site + Role FK + `notify_boundary_breach` + `notify_location_missing`)
+  - `SiteAlertRecipientConfig` (site + `subject_role` + `recipient_role` + `notify_boundary_breach` + `notify_location_missing`)
 - [x] Extend `UserLiveLocation`:
   - `assigned_site`, `is_inside_boundary`, `boundary_state`, `last_location_at`, `active_breach_alert`
 - [x] Migrations: `scheduler/0023_...`, `livetracking/0002_...`
@@ -115,11 +123,12 @@ cd backendnew/gtms/patrol_backend
   - `is_point_in_circle()`, `is_point_in_polygon()`, `evaluate_site_boundary()`
   - Exit buffer from org setting (reduce GPS jitter)
 - [x] `SiteSetting` keys (org-level) — migration `0024_seed_boundary_site_settings`:
-  - `boundary_monitoring_enabled` (default off)
+  - `boundary_monitoring_enabled` (legacy)
   - `boundary_exit_buffer_m`
   - `boundary_still_outside_reminder_min` (0 = off)
   - `location_missing_timeout_min`
-- [x] Helper: `is_boundary_monitoring_active(org_id, site)` — global + per-site `boundary_enabled`
+- [x] Per-site enable (migration `0026`): `breach_alerts_enabled`, `location_missing_alerts_enabled` on `LocationSite`
+- [x] Helper: `is_boundary_monitoring_active(org_id, site)` — per-site breach enable + drawable boundary
 
 ### Deliverable
 
@@ -206,7 +215,7 @@ flowchart TB
 - [x] Enrich `location_update` broadcast payload (boundary fields)
 - [x] [`GTMS_NEw/src/services/websocket.jsx`](GTMS_NEw/src/services/websocket.jsx): handle `tracking_alert`; support non-guard users in state
 - [x] [`livetracking/routing.py`](livetracking/routing.py) — no route change (`ws/live-location/`)
-- [ ] Document WS contract in plan appendix / mobile doc (Phase 11)
+- [x] Document WS contract in plan appendix / mobile doc (Phase 11) — [`MOBILE_LIVE_TRACKING_BOUNDARY_CONTRACT.md`](MOBILE_LIVE_TRACKING_BOUNDARY_CONTRACT.md)
 
 ### Deliverable
 
@@ -243,7 +252,7 @@ REST live map matches WebSocket — all on-duty roles visible, not guard-only.
 
 - [x] New [`livetracking/alert_service.py`](livetracking/alert_service.py):
   - `create_tracking_alert(...)`, `resolve_tracking_alert(...)`
-  - `get_recipients_for_alert(site, alert_type)` — `SiteAlertRecipientConfig` + [`authapp/site_access.py`](authapp/site_access.py)
+  - `get_recipients_for_alert(site, alert_type, subject_user=...)` — match subject’s role → recipient roles via `SiteAlertRecipientConfig` + site access
   - `dispatch_tracking_alert_ws(alert, recipients)` — uses Phase 3 groups (`tracking_user_{id}`, `site_{site_id}_tracking`)
 - [x] REST API: alerts inbox, mark read, site recipient config CRUD
 
@@ -290,8 +299,9 @@ Both alert types end-to-end: DB + WebSocket to configured recipients.
 - Site table per org
 - Create / Edit site (dialog or route) with:
   1. Basic: name, lat, lng
-  2. Boundary: type dropdown, map (circle or polygon), `boundary_enabled`
-  3. Alert recipients: matrix of org roles × (boundary breach | location missing)
+  2. Boundary: type dropdown, map (circle or polygon)
+  3. Per-site enable: boundary breach alerts, location missing alerts
+  4. Alert routing: for each **subject role**, multi-select **recipient roles** for breach and for location missing
 
 - [x] New component e.g. `SiteForm.jsx`, `SiteBoundaryMap.jsx`
 - [x] Google Maps Drawing library (`libraries: ['drawing']`)
@@ -303,14 +313,13 @@ Admins can draw boundaries and configure alert roles per site without touching v
 
 ---
 
-## Phase 8 — Site Settings UI (global toggles)
+## Phase 8 — Site Settings UI (timeouts)
 
-**Goal:** Org-wide master switch and timeouts.
+**Goal:** Org-wide **timeouts and buffers only**. Enable is per site.
 
 ### Tasks
 
 - [x] [`SiteSettings.jsx`](GTMS_NEw/src/pages/settings/SiteSettings.jsx) + [`BoundaryMonitoringSettings.jsx`](GTMS_NEw/src/pages/settings/BoundaryMonitoringSettings.jsx) — org panel:
-  - Enable boundary monitoring
   - Exit buffer (meters)
   - Still-outside reminder (minutes, 0 = off)
   - Location missing timeout (minutes)
@@ -318,7 +327,26 @@ Admins can draw boundaries and configure alert roles per site without touching v
 
 ### Deliverable
 
-Org admin can enable feature and tune thresholds before per-site setup.
+Org admin can tune thresholds; each site has its own breach / location-missing enable plus subject-role routing.
+
+---
+
+## Phase 7b — Subject-role → recipient routing (revision)
+
+**Goal:** Replace flat “these roles always get alerts” with routing by who triggered the alert.
+
+### Tasks
+
+- [x] Migrate `SiteAlertRecipientConfig`: `subject_role` + `recipient_role` (unique per site pair); clear legacy flat rows
+- [x] `get_recipients_for_alert(site, alert_type, subject_user)` uses subject role
+- [x] API PUT/GET shape: `{ subject_role, recipient_role, notify_boundary_breach, notify_location_missing }`
+- [x] Site form: per-site enable for breach / location missing; per subject role → recipient checkboxes
+- [x] Gate alert creation by **site** (`breach_alerts_enabled` / `location_missing_alerts_enabled`)
+- [x] WS join groups use `recipient_role`
+
+### Deliverable
+
+Guard breach notifies only the roles selected for Guard; SO breach notifies only the roles selected for SO; same for all dynamic roles.
 
 ---
 
@@ -328,14 +356,14 @@ Org admin can enable feature and tune thresholds before per-site setup.
 
 ### Tasks
 
-- [ ] [`DashboardLayout.jsx`](GTMS_NEw/src/pages/DashboardLayout.jsx):
+- [x] [`DashboardLayout.jsx`](GTMS_NEw/src/pages/DashboardLayout.jsx):
   - **Visitor icon** → `/notifications` (existing `NotificationLog`)
   - **Tracking alert icon** → `/tracking-alerts` (`TrackingAlert`)
   - Separate unread badges
-- [ ] New `TrackingAlertHistory.jsx` + `api/trackingAlerts.js`
-- [ ] List, filter by type/site, mark read, link to live map
-- [ ] WebSocket listener → `gtms-tracking-alerts-updated` for badge refresh
-- [ ] Clarify visitor page title/icon (visitor-only)
+- [x] New `TrackingAlertHistory.jsx` + `api/trackingAlerts.js`
+- [x] List, filter by type/status, mark read, link to live map
+- [x] WebSocket listener → `gtms-tracking-alerts-updated` for badge refresh
+- [x] Clarify visitor page title/icon (visitor-only)
 
 ### Deliverable
 
@@ -349,15 +377,15 @@ Recipients see tracking alerts in dedicated inbox; visitor flow unchanged.
 
 ### Tasks
 
-- [ ] [`LiveTrackingMap.jsx`](GTMS_NEw/src/pages/livetracking/LiveTrackingMap.jsx):
+- [x] [`LiveTrackingMap.jsx`](GTMS_NEw/src/pages/livetracking/LiveTrackingMap.jsx):
   - Load site boundaries → render `Circle` / `Polygon` overlays
   - Marker colors: inside / outside / location missing
-  - Breach filter card
-- [ ] [`websocket.jsx`](GTMS_NEw/src/services/websocket.jsx):
-  - Handle `tracking_alert`, `boundary_breach` broadcast
-  - Preserve alert flags across `location_update`
-  - Toast/banner on new alert
-- [ ] Optional: auto-pan to alerting user
+  - Breach / GPS-missing filter cards
+- [x] [`websocket.jsx`](GTMS_NEw/src/services/websocket.jsx):
+  - Handle `tracking_alert`, update guard flags
+  - Preserve alert flags across `location_update` (clear missing on GPS; sync breach from boundary_status)
+  - Toast on new alert (live map listens to `gtms-tracking-alerts-updated`)
+- [x] Deep-link auto-pan from tracking inbox (`?user=` / `?site=`)
 
 ### Deliverable
 
@@ -371,12 +399,12 @@ Ops team sees boundaries and alert state on live map.
 
 ### Tasks
 
-- [ ] Written contract:
+- [x] Written contract: [`MOBILE_LIVE_TRACKING_BOUNDARY_CONTRACT.md`](MOBILE_LIVE_TRACKING_BOUNDARY_CONTRACT.md)
   - Connect WS + start GPS **after check-in**
   - Send `location_update` every N seconds until **checkout**
   - Stop GPS on checkout
   - Manual SOS: `emergency_alert` unchanged
-- [ ] Server rejects GPS outside check-in window regardless
+- [x] Server rejects GPS outside check-in window regardless (`not_on_duty`) — already enforced in `LocationConsumer`
 
 ### Deliverable
 
@@ -420,18 +448,18 @@ Mobile behavior matches server assumptions.
 | Header / inbox | `DashboardLayout.jsx`, `TrackingAlertHistory.jsx`, `api/trackingAlerts.js` |
 | Live map | `LiveTrackingMap.jsx`, `websocket.jsx` |
 
-**Do not modify** `notifications.NotificationLog` for tracking alerts.
+**Do not modify** `notifications.NotificationLog` for tracking alerts.  
+Tracking alerts use **WebSocket + FCM** to recipients; inbox remains `TrackingAlert` / `TrackingAlertRecipient` (`/livetracking/alerts/`). FCM reuses `DeviceToken` via `notifications.services.send_push_to_user`.
 
 ---
 
 ## Done when
 
-- [ ] Phases 1–6 complete (backend + **WebSocket** fully functional)
-- [ ] Phases 7–8 complete (admin can configure sites + global settings)
-- [ ] Phases 9–10 complete (recipients notified in UI + live map)
-- [ ] Phase 11 documented for mobile
-- [ ] Circle OR polygon per site; check-in → checkout only
-- [ ] Boundary breach + location missing alerts with correct state machine
-- [ ] Per-site role config; delivery respects site access
-- [ ] Separate `TrackingAlert` table; dual header icons
-- [ ] Attendance punch radius unchanged
+- [x] Phases 9–10 complete (recipients notified in UI + live map)
+- [x] Phase 11 documented for mobile
+- [x] Circle OR polygon per site; check-in → checkout only
+- [x] Boundary breach + location missing alerts with correct state machine
+- [x] Per-site **subject role → recipient roles** config; delivery respects site access
+- [x] Per-site enable for breach / location-missing; delivery respects site access and subject-role routing
+- [x] Separate `TrackingAlert` table; dual header icons
+- [x] Attendance punch radius unchanged

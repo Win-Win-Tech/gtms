@@ -95,7 +95,11 @@ class TrackingAlertRecipient(models.Model):
 
 
 class SiteAlertRecipientConfig(models.Model):
-    """Per-site: which org roles receive which tracking alert types."""
+    """
+    Per-site routing: when subject_role triggers an alert, notify recipient_role.
+
+    Example: Guard crosses boundary → SO / FO / Admin receive the alert.
+    """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     site = models.ForeignKey(
@@ -103,10 +107,17 @@ class SiteAlertRecipientConfig(models.Model):
         on_delete=models.CASCADE,
         related_name="alert_recipient_configs",
     )
-    role = models.ForeignKey(
+    subject_role = models.ForeignKey(
         "authapp.Role",
         on_delete=models.CASCADE,
-        related_name="site_alert_configs",
+        related_name="site_alert_as_subject",
+        help_text="Role of the user who crossed the boundary or went missing",
+    )
+    recipient_role = models.ForeignKey(
+        "authapp.Role",
+        on_delete=models.CASCADE,
+        related_name="site_alert_as_recipient",
+        help_text="Role that should receive the alert for this subject role",
     )
     notify_boundary_breach = models.BooleanField(default=False)
     notify_location_missing = models.BooleanField(default=False)
@@ -114,14 +125,16 @@ class SiteAlertRecipientConfig(models.Model):
     modified_on = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("site", "role")
+        unique_together = ("site", "subject_role", "recipient_role")
         indexes = [
-            models.Index(fields=["site", "notify_boundary_breach"]),
-            models.Index(fields=["site", "notify_location_missing"]),
+            models.Index(fields=["site", "subject_role", "notify_boundary_breach"]),
+            models.Index(fields=["site", "subject_role", "notify_location_missing"]),
         ]
 
     def __str__(self):
-        return f"{self.site.name} → {self.role.name}"
+        return (
+            f"{self.site.name}: {self.subject_role.name} → {self.recipient_role.name}"
+        )
 
 
 class UserLiveLocation(models.Model):

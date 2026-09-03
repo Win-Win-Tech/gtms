@@ -110,6 +110,38 @@ def _send_fcm(tokens: list[str], title: str, body: str, data: Dict[str, str]) ->
         return False, str(exc)
 
 
+def get_active_mobile_tokens(user) -> list[str]:
+    """Active android/ios FCM tokens for a user."""
+    if not user:
+        return []
+    return list(
+        DeviceToken.objects.filter(
+            user=user,
+            is_active=True,
+            device_type__in=[DeviceToken.DEVICE_ANDROID, DeviceToken.DEVICE_IOS],
+        ).values_list("token", flat=True)
+    )
+
+
+def send_push_to_user(
+    user,
+    title: str,
+    body: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> tuple[bool, str]:
+    """
+    Send FCM only (no NotificationLog).
+    Use for domains that keep their own inbox (e.g. livetracking alerts).
+    """
+    if not user:
+        return False, "no_user"
+    tokens = get_active_mobile_tokens(user)
+    if not tokens:
+        return False, "no_active_mobile_tokens"
+    str_data = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
+    return _send_fcm(tokens, title, body or "", str_data)
+
+
 def notify_user(
     user,
     notif_type: str,
@@ -139,13 +171,7 @@ def notify_user(
         delivery_status=NotificationLog.STATUS_PENDING,
     )
 
-    tokens = list(
-        DeviceToken.objects.filter(
-            user=user,
-            is_active=True,
-            device_type__in=[DeviceToken.DEVICE_ANDROID, DeviceToken.DEVICE_IOS],
-        ).values_list("token", flat=True)
-    )
+    tokens = get_active_mobile_tokens(user)
 
     if not tokens:
         log.delivery_status = NotificationLog.STATUS_SKIPPED

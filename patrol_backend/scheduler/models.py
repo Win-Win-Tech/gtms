@@ -106,12 +106,26 @@ class LocationSite(models.Model):
     )
     boundary_enabled = models.BooleanField(
         default=False,
-        help_text="Per-site on/off for boundary monitoring (shape is kept when off)",
+        help_text="Derived: True when breach or location-missing alerts are enabled for this site",
+    )
+    breach_alerts_enabled = models.BooleanField(
+        default=False,
+        help_text="Per-site on/off for boundary breach alerts",
+    )
+    location_missing_alerts_enabled = models.BooleanField(
+        default=False,
+        help_text="Per-site on/off for location-missing alerts",
     )
 
     # Audit fields
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        self.boundary_enabled = bool(
+            self.breach_alerts_enabled or self.location_missing_alerts_enabled
+        )
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.location.name} - {self.name}"

@@ -9,15 +9,18 @@ from .models import (
 
 
 class SiteAlertRecipientConfigSerializer(serializers.ModelSerializer):
-    role_name = serializers.CharField(source="role.name", read_only=True)
+    subject_role_name = serializers.CharField(source="subject_role.name", read_only=True)
+    recipient_role_name = serializers.CharField(source="recipient_role.name", read_only=True)
 
     class Meta:
         model = SiteAlertRecipientConfig
         fields = [
             "id",
             "site",
-            "role",
-            "role_name",
+            "subject_role",
+            "subject_role_name",
+            "recipient_role",
+            "recipient_role_name",
             "notify_boundary_breach",
             "notify_location_missing",
             "created_on",
@@ -86,7 +89,8 @@ class SiteAlertRecipientConfigWriteSerializer(serializers.ModelSerializer):
     class Meta:
         model = SiteAlertRecipientConfig
         fields = [
-            "role",
+            "subject_role",
+            "recipient_role",
             "notify_boundary_breach",
             "notify_location_missing",
         ]
@@ -98,9 +102,11 @@ class SiteAlertRecipientConfigBulkSerializer(serializers.Serializer):
     def validate_configs(self, configs):
         if not configs:
             return configs
-        role_ids = [item["role"].id for item in configs]
-        if len(role_ids) != len(set(role_ids)):
-            raise serializers.ValidationError("Duplicate role entries are not allowed.")
+        pairs = [(item["subject_role"].id, item["recipient_role"].id) for item in configs]
+        if len(pairs) != len(set(pairs)):
+            raise serializers.ValidationError(
+                "Duplicate subject_role + recipient_role pairs are not allowed."
+            )
         return configs
 
 

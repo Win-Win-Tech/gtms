@@ -147,7 +147,10 @@ class SiteAlertRecipientConfigView(APIView):
     def get(self, request, site_id):
         site = get_site_or_error(site_id)
         assert_caller_can_access_site(request.user, site)
-        configs = SiteAlertRecipientConfig.objects.filter(site=site).select_related("role")
+        configs = SiteAlertRecipientConfig.objects.filter(site=site).select_related(
+            "subject_role",
+            "recipient_role",
+        )
         return Response(SiteAlertRecipientConfigSerializer(configs, many=True).data)
 
     def put(self, request, site_id):
@@ -158,7 +161,11 @@ class SiteAlertRecipientConfigView(APIView):
         serializer.is_valid(raise_exception=True)
         items = serializer.validated_data["configs"]
 
-        role_ids = [item["role"].id for item in items]
+        role_ids = set()
+        for item in items:
+            role_ids.add(item["subject_role"].id)
+            role_ids.add(item["recipient_role"].id)
+
         valid_roles = Role.objects.filter(
             id__in=role_ids,
             location_id=site.location_id,
@@ -171,17 +178,20 @@ class SiteAlertRecipientConfigView(APIView):
         SiteAlertRecipientConfig.objects.filter(site=site).delete()
         created = []
         for item in items:
+            if not item.get("notify_boundary_breach") and not item.get("notify_location_missing"):
+                continue
             created.append(
                 SiteAlertRecipientConfig.objects.create(
                     site=site,
-                    role=item["role"],
+                    subject_role=item["subject_role"],
+                    recipient_role=item["recipient_role"],
                     notify_boundary_breach=item.get("notify_boundary_breach", False),
                     notify_location_missing=item.get("notify_location_missing", False),
                 )
             )
 
         logger.info(
-            "[ALERT_CONFIG] Site %s updated with %s recipient role configs by %s",
+            "[ALERT_CONFIG] Site %s updated with %s subject→recipient configs by %s",
             site.id,
             len(created),
             request.user.email,

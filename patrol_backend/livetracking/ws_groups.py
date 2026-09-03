@@ -43,7 +43,11 @@ def get_alert_recipient_site_ids(user):
     from livetracking.models import SiteAlertRecipientConfig
 
     site_ids = []
-    configs = SiteAlertRecipientConfig.objects.filter(role=role_obj).select_related("site")
+    configs = SiteAlertRecipientConfig.objects.filter(
+        recipient_role=role_obj,
+    ).filter(
+        Q(notify_boundary_breach=True) | Q(notify_location_missing=True)
+    ).select_related("site")
     for config in configs:
         if caller_can_access_site(user, config.site):
             site_ids.append(str(config.site_id))

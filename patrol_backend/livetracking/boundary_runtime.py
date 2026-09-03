@@ -15,6 +15,7 @@ from patrol_backend.utils.boundary_utils import (
     get_boundary_still_outside_reminder_min,
     get_location_missing_timeout_min,
     is_boundary_monitoring_active,
+    is_site_location_missing_alerts_enabled,
 )
 
 from .alert_service import create_tracking_alert, resolve_tracking_alert
@@ -59,9 +60,10 @@ def _maybe_still_outside_reminder(
         return
 
     cache.set(cache_key, 1, timeout=max(reminder_min * 60 * 2, 60))
-    from .alert_service import dispatch_tracking_alert_ws
+    from .alert_service import dispatch_tracking_alert_push, dispatch_tracking_alert_ws
 
     dispatch_tracking_alert_ws(breach_alert)
+    dispatch_tracking_alert_push(breach_alert)
     logger.info(
         "[BOUNDARY] Still-outside reminder sent alert=%s bucket=%s",
         breach_alert.id,
@@ -148,13 +150,14 @@ def process_location_boundary_update(
             latitude=lat,
             longitude=lng,
         )
-        live_loc.active_breach_alert = alert
-        logger.info(
-            "[BOUNDARY] Breach alert created user=%s site=%s alert=%s",
-            user.id,
-            assigned_site.id,
-            alert.id,
-        )
+        if alert:
+            live_loc.active_breach_alert = alert
+            logger.info(
+                "[BOUNDARY] Breach alert created user=%s site=%s alert=%s",
+                user.id,
+                assigned_site.id,
+                alert.id,
+            )
     elif (
         prev_state == UserLiveLocation.BoundaryState.OUTSIDE
         and new_state == UserLiveLocation.BoundaryState.INSIDE
@@ -256,7 +259,7 @@ def run_location_missing_checks(location_id=None) -> dict:
             continue
 
         org_location_id = site.location_id
-        if not is_boundary_monitoring_active(org_location_id, site):
+        if not is_site_location_missing_alerts_enabled(site):
             skipped += 1
             continue
 

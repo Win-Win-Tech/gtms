@@ -16,6 +16,8 @@ class LocationSiteSerializer(serializers.ModelSerializer):
             'boundary_radius_m',
             'boundary_polygon',
             'boundary_enabled',
+            'breach_alerts_enabled',
+            'location_missing_alerts_enabled',
         ]
 
 

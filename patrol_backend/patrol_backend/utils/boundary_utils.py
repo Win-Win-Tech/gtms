@@ -13,12 +13,16 @@ from scheduler.models import LocationSite, SiteSetting
 
 # SiteSetting keys (global template + per-org override via propagate_to_orgs)
 BOUNDARY_SETTING_MONITORING_ENABLED = "boundary_monitoring_enabled"
+BOUNDARY_SETTING_BREACH_ALERTS_ENABLED = "boundary_breach_alerts_enabled"
+BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED = "location_missing_alerts_enabled"
 BOUNDARY_SETTING_EXIT_BUFFER_M = "boundary_exit_buffer_m"
 BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN = "boundary_still_outside_reminder_min"
 BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN = "location_missing_timeout_min"
 
 BOUNDARY_SETTING_DEFAULTS = {
     BOUNDARY_SETTING_MONITORING_ENABLED: ("false", None),
+    BOUNDARY_SETTING_BREACH_ALERTS_ENABLED: ("false", None),
+    BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED: ("false", None),
     BOUNDARY_SETTING_EXIT_BUFFER_M: ("15", "m"),
     BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN: ("0", "min"),
     BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN: ("10", "min"),
@@ -73,22 +77,69 @@ def get_boundary_setting_bool(key: str, location_id=None, default_value: bool = 
     return _parse_bool(raw, default=default_value)
 
 
-def is_org_boundary_monitoring_enabled(location_id) -> bool:
+def is_site_breach_alerts_enabled(site: Optional[LocationSite]) -> bool:
+    return bool(site and getattr(site, "breach_alerts_enabled", False))
+
+
+def is_site_location_missing_alerts_enabled(site: Optional[LocationSite]) -> bool:
+    return bool(site and getattr(site, "location_missing_alerts_enabled", False))
+
+
+def is_alert_type_enabled_for_site(site: Optional[LocationSite], alert_type: str) -> bool:
+    """Gate alert creation by per-site type toggles (not org-wide)."""
+    if alert_type == "boundary_breach":
+        return is_site_breach_alerts_enabled(site) and site_has_configured_boundary(site)
+    if alert_type == "location_missing":
+        return is_site_location_missing_alerts_enabled(site)
+    if alert_type == "manual_sos":
+        return True
+    return False
+
+
+def is_org_breach_alerts_enabled(location_id) -> bool:
+    """Legacy org setting. Alert enable is now per-site."""
     if not location_id:
         return False
-    cache_key = str(location_id)
-    now = time.time()
-    cached = _MONITORING_CACHE.get(cache_key)
-    if cached and cached[0] > now:
-        return cached[1]
-
-    enabled = get_boundary_setting_bool(
-        BOUNDARY_SETTING_MONITORING_ENABLED,
+    return get_boundary_setting_bool(
+        BOUNDARY_SETTING_BREACH_ALERTS_ENABLED,
         location_id=location_id,
         default_value=False,
     )
-    _MONITORING_CACHE[cache_key] = (now + _MONITORING_CACHE_TTL_SEC, enabled)
-    return enabled
+
+
+def is_org_location_missing_alerts_enabled(location_id) -> bool:
+    """Legacy org setting. Alert enable is now per-site."""
+    if not location_id:
+        return False
+    return get_boundary_setting_bool(
+        BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED,
+        location_id=location_id,
+        default_value=False,
+    )
+
+
+def is_alert_type_enabled_for_org(location_id, alert_type: str) -> bool:
+    """Deprecated: use is_alert_type_enabled_for_site. Kept for older call sites."""
+    if alert_type == "manual_sos":
+        return True
+    return True
+
+
+def is_org_boundary_monitoring_enabled(location_id) -> bool:
+    """
+    Org-level GPS monitoring is no longer a master switch.
+    Timeouts/buffers still live on org settings; enable is per site.
+    """
+    return bool(location_id)
+
+
+def is_boundary_monitoring_active(location_id, site: Optional[LocationSite]) -> bool:
+    """Per-site breach enable AND a drawable boundary configured."""
+    if not location_id or not site:
+        return False
+    if not is_site_breach_alerts_enabled(site):
+        return False
+    return site_has_configured_boundary(site)
 
 
 def get_boundary_exit_buffer_m(location_id) -> int:
@@ -133,19 +184,6 @@ def site_has_configured_boundary(site: LocationSite) -> bool:
     if boundary_type == LocationSite.BoundaryType.POLYGON:
         return bool(_normalize_polygon_coords(site.boundary_polygon))
     return False
-
-
-def is_boundary_monitoring_active(location_id, site: Optional[LocationSite]) -> bool:
-    """
-    Global org toggle AND per-site enabled AND a drawable boundary configured.
-    """
-    if not location_id or not site:
-        return False
-    if not is_org_boundary_monitoring_enabled(location_id):
-        return False
-    if not getattr(site, "boundary_enabled", False):
-        return False
-    return site_has_configured_boundary(site)
 
 
 def is_point_in_circle(
