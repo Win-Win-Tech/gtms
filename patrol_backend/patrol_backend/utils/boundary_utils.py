@@ -12,7 +12,6 @@ from geopy.distance import geodesic
 from scheduler.models import LocationSite, SiteSetting
 
 # SiteSetting keys (global template + per-org override via propagate_to_orgs)
-BOUNDARY_SETTING_MONITORING_ENABLED = "boundary_monitoring_enabled"
 BOUNDARY_SETTING_BREACH_ALERTS_ENABLED = "boundary_breach_alerts_enabled"
 BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED = "location_missing_alerts_enabled"
 BOUNDARY_SETTING_EXIT_BUFFER_M = "boundary_exit_buffer_m"
@@ -20,7 +19,6 @@ BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN = "boundary_still_outside_reminder_m
 BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN = "location_missing_timeout_min"
 
 BOUNDARY_SETTING_DEFAULTS = {
-    BOUNDARY_SETTING_MONITORING_ENABLED: ("false", None),
     BOUNDARY_SETTING_BREACH_ALERTS_ENABLED: ("false", None),
     BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED: ("false", None),
     BOUNDARY_SETTING_EXIT_BUFFER_M: ("15", "m"),
@@ -123,14 +121,6 @@ def is_alert_type_enabled_for_org(location_id, alert_type: str) -> bool:
     if alert_type == "manual_sos":
         return True
     return True
-
-
-def is_org_boundary_monitoring_enabled(location_id) -> bool:
-    """
-    Org-level GPS monitoring is no longer a master switch.
-    Timeouts/buffers still live on org settings; enable is per site.
-    """
-    return bool(location_id)
 
 
 def is_boundary_monitoring_active(location_id, site: Optional[LocationSite]) -> bool:

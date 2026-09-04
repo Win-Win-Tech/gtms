@@ -352,10 +352,13 @@ def create_tracking_alert(
 def resolve_tracking_alert(
     alert: TrackingAlert,
     *,
-    dispatch_ws: bool = True,
-    dispatch_push: bool = True,
+    dispatch_ws: bool = False,
+    dispatch_push: bool = False,
 ) -> TrackingAlert:
-    """Mark alert resolved and notify recipients (WS + FCM)."""
+    """
+    Mark alert resolved in DB (and inbox row stays with is_active=false via alert).
+    Does **not** send WS/FCM by default — resolve is silent (returned inside / GPS back / checkout).
+    """
     if not alert.is_active:
         return alert
 
@@ -363,25 +366,26 @@ def resolve_tracking_alert(
     alert.resolved_at = timezone.now()
     alert.save(update_fields=["is_active", "resolved_at"])
 
-    recipients = list(
-        User.objects.filter(
-            id__in=TrackingAlertRecipient.objects.filter(
-                alert=alert,
-                channel=TrackingAlertRecipient.Channel.IN_APP,
-            ).values_list("user_id", flat=True),
-            is_active=True,
-            is_deleted=False,
+    if dispatch_ws or dispatch_push:
+        recipients = list(
+            User.objects.filter(
+                id__in=TrackingAlertRecipient.objects.filter(
+                    alert=alert,
+                    channel=TrackingAlertRecipient.Channel.IN_APP,
+                ).values_list("user_id", flat=True),
+                is_active=True,
+                is_deleted=False,
+            )
         )
-    )
-    if not recipients:
-        recipients = _resolve_recipients(alert)
+        if not recipients:
+            recipients = _resolve_recipients(alert)
 
-    _schedule_tracking_alert_notify(
-        alert,
-        recipients,
-        dispatch_ws=dispatch_ws,
-        dispatch_push=dispatch_push,
-    )
+        _schedule_tracking_alert_notify(
+            alert,
+            recipients,
+            dispatch_ws=dispatch_ws,
+            dispatch_push=dispatch_push,
+        )
 
     logger.info("[TRACKING_ALERT] Resolved alert=%s type=%s", alert.id, alert.alert_type)
     return alert

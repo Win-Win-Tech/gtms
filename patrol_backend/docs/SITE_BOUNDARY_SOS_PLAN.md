@@ -123,10 +123,10 @@ cd backendnew/gtms/patrol_backend
   - `is_point_in_circle()`, `is_point_in_polygon()`, `evaluate_site_boundary()`
   - Exit buffer from org setting (reduce GPS jitter)
 - [x] `SiteSetting` keys (org-level) — migration `0024_seed_boundary_site_settings`:
-  - `boundary_monitoring_enabled` (legacy)
   - `boundary_exit_buffer_m`
   - `boundary_still_outside_reminder_min` (0 = off)
   - `location_missing_timeout_min`
+  - ~~`boundary_monitoring_enabled`~~ removed in `0027` (unused; enable is per-site)
 - [x] Per-site enable (migration `0026`): `breach_alerts_enabled`, `location_missing_alerts_enabled` on `LocationSite`
 - [x] Helper: `is_boundary_monitoring_active(org_id, site)` — per-site breach enable + drawable boundary
 
@@ -271,11 +271,11 @@ Alerts persist in separate table; WS dispatch wired to new groups.
 - [x] In `handle_location_update` (after Phase 4 gate):
   1. `boundary_utils` → update `boundary_state`
   2. **inside → outside:** create `TrackingAlert` + `dispatch_tracking_alert_ws`
-  3. **outside → inside:** resolve breach
-  4. Update `last_location_at` → resolve `location_missing`
-- [x] Optional still-outside reminder (org setting)
+  3. **outside → inside:** resolve breach (**silent** — no WS/FCM)
+  4. Update `last_location_at` → resolve `location_missing` (**silent**)
+- [x] Optional still-outside reminder (org setting; default **0 = off**)
 - [x] Background job: `location_missing` when no GPS past timeout (Celery Beat: `check-location-missing-alerts` every 2 min)
-- [x] On checkout: resolve alerts; clear boundary state
+- [x] On checkout: resolve alerts (silent — no WS/FCM); clear boundary state
 
 ### Deliverable
 

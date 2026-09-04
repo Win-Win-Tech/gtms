@@ -12,12 +12,21 @@ Mobile has a **live map** (same as web). Do the same steps the web frontend does
 
 | Channel | Used for tracking alerts? |
 |---------|---------------------------|
-| **WebSocket** `tracking_alert` | **Yes** — realtime while app is connected |
-| **FCM / push** | **Yes** — to each recipient’s registered android/ios tokens |
-| **REST inbox** `GET /livetracking/alerts/` | **Yes** — history, unread count, mark read |
+| **WebSocket** `tracking_alert` | **Yes** — on **new** alert (and optional still-outside reminder) |
+| **FCM / push** | **Yes** — same moments as WS |
+| **REST inbox** `GET /livetracking/alerts/` | **Yes** — history; resolved alerts appear with `is_active: false` after refresh |
 
-Recipients get **both** socket + FCM on create / resolve / still-outside reminder.  
-Tracking alerts do **not** write visitor `NotificationLog` — inbox is only `/livetracking/alerts/`.  
+**When we notify (WS + FCM):**
+
+| Event | Notify? |
+|-------|---------|
+| New boundary breach | Yes |
+| New location missing | Yes |
+| Still-outside reminder (only if org setting > 0) | Yes |
+| Returned inside / GPS resumes / checkout (resolve) | **No** — DB only, silent |
+
+Recipients need active **android/ios** FCM token for push.  
+Tracking alerts do **not** write visitor `NotificationLog` — inbox is `/livetracking/alerts/`.  
 Device tokens: same `POST /notifications/device-token/` as visitor push.
 
 ---
@@ -238,18 +247,21 @@ After connect, parse every message `type`:
 
 #### `location_update` (inbound — map)
 
-Same fields as Step 4. Merge into map state by `user_id`. Web also preserves breach / missing flags when a plain GPS ping arrives (do not clear `hasBoundaryBreach` / `isLocationMissing` unless a resolve `tracking_alert` says so).
+Same fields as Step 4. Merge into map state by `user_id`.  
+When `is_inside_boundary` becomes `true` (or `boundary_status` is `inside`), clear breach colour on that pin.  
+When a fresh GPS arrives after missing, clear location-missing colour — **resolve does not send a separate `tracking_alert`**.
 
 #### `tracking_alert` (inbound — WebSocket **and** FCM `data`)
 
-Sent to configured **recipients**. Delivery: **socket + FCM** (same fields in FCM `data`; all FCM values are **strings**).
+Sent to configured **recipients** only for **new / open** alerts (and optional still-outside reminder).  
+**Resolve is silent** — no WS/FCM with `is_active: false`.
 
 **Notification (FCM display):**
 
-| | New / open alert | Resolved |
-|--|------------------|----------|
-| **title** | `Boundary breach` / `Location missing` / `Emergency SOS` | `Tracking alert resolved` |
-| **body** | Same as `message` | Same as `message` |
+| | New / open alert |
+|--|------------------|
+| **title** | `Boundary breach` / `Location missing` |
+| **body** | Same as `message` |
 
 **FCM `data` / WS body:**
 
@@ -275,9 +287,10 @@ Sent to configured **recipients**. Delivery: **socket + FCM** (same fields in FC
 Notes:
 
 - On **WebSocket**, `is_active` is a boolean; `latitude` / `longitude` may be numbers; server may also add localized `timestamp` / `timestamp_iso`.
-- On **FCM**, every `data` value is a **string** (`"true"` / `"false"` for `is_active`).
+- On **FCM**, every `data` value is a **string**.
 - Tap handling: open live map focused on `subject_user_id` / `site_id`, or open tracking alerts inbox and load `alert_id`.
 - Deduplicate by `alert_id` if both WS and FCM arrive while foregrounded.
+- **Still-outside reminder:** same payload again for an **already open** breach if org setting `boundary_still_outside_reminder_min` is > 0 (default **0 = off**). Example: set to `15` → every 15 minutes while they stay outside, recipients get another push/WS for that same alert. Leave at `0` if you only want one notification when they first leave.
 
 ### Step 8 — Optional history trail
 
