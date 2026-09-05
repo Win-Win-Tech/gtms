@@ -101,10 +101,24 @@ def get_recipients_for_alert(
         .filter(role_filter, is_active=True, is_deleted=False)
         .distinct()
     )
-    if subject_user is not None:
-        qs = qs.exclude(id=subject_user.id)
 
-    return list(qs)
+    location_id = getattr(site, "location_id", None)
+    admin_qs = User.objects.none()
+    if location_id:
+        admin_qs = User.objects.filter(
+            location_id=location_id,
+            role__iexact="admin",
+            is_active=True,
+            is_deleted=False,
+        )
+
+    all_users = list(qs) + list(admin_qs)
+    if subject_user is not None:
+        all_users = [u for u in all_users if u.id != subject_user.id]
+
+    # Deduplicate users by ID
+    unique_recipients = {u.id: u for u in all_users}
+    return list(unique_recipients.values())
 
 
 def _create_recipient_rows(alert: TrackingAlert, recipients: Sequence[User]) -> None:
