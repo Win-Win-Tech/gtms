@@ -138,10 +138,13 @@ def process_location_boundary_update(
 
     update_fields = ["boundary_state", "is_inside_boundary", "active_breach_alert"]
 
-    if (
-        prev_state == UserLiveLocation.BoundaryState.INSIDE
-        and new_state == UserLiveLocation.BoundaryState.OUTSIDE
-    ):
+    has_active_breach_alert = bool(
+        live_loc.active_breach_alert_id
+        and live_loc.active_breach_alert
+        and live_loc.active_breach_alert.is_active
+    )
+
+    if new_state == UserLiveLocation.BoundaryState.OUTSIDE and not has_active_breach_alert:
         alert, _recipients = create_tracking_alert(
             alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
             site=assigned_site,
@@ -158,10 +161,7 @@ def process_location_boundary_update(
                 assigned_site.id,
                 alert.id,
             )
-    elif (
-        prev_state == UserLiveLocation.BoundaryState.OUTSIDE
-        and new_state == UserLiveLocation.BoundaryState.INSIDE
-    ):
+    elif new_state == UserLiveLocation.BoundaryState.INSIDE:
         if live_loc.active_breach_alert_id:
             resolve_tracking_alert(live_loc.active_breach_alert)
             live_loc.active_breach_alert = None
