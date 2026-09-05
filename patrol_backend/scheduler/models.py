@@ -125,6 +125,13 @@ class LocationSite(models.Model):
         self.boundary_enabled = bool(
             self.breach_alerts_enabled or self.location_missing_alerts_enabled
         )
+        if self.boundary_type == self.BoundaryType.CIRCLE:
+            self.boundary_polygon = None
+        elif self.boundary_type == self.BoundaryType.POLYGON:
+            self.boundary_radius_m = None
+        elif self.boundary_type == self.BoundaryType.NONE:
+            self.boundary_radius_m = None
+            self.boundary_polygon = None
         super().save(*args, **kwargs)
 
     def __str__(self):

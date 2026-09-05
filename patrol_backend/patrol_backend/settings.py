@@ -56,20 +56,40 @@ INSTALLED_APPS = [
     'livetracking',  # Sokcet app
     ]
 
-# Socker config
+# Socket config
 
 ASGI_APPLICATION = 'patrol_backend.asgi.application'
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            "hosts": [('127.0.0.1', 6379)],
-        },
-    },
-}
+import socket
 
-# Socket cofig end
+def _is_redis_available(host='127.0.0.1', port=6379, timeout=1):
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except (OSError, ConnectionRefusedError):
+        return False
+
+_REDIS_HOST = os.getenv('REDIS_HOST', '127.0.0.1')
+_REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+
+if os.getenv('USE_IN_MEMORY_CHANNELS', 'false').lower() in ('1', 'true') or not _is_redis_available(_REDIS_HOST, _REDIS_PORT):
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
+else:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                "hosts": [(_REDIS_HOST, _REDIS_PORT)],
+            },
+        },
+    }
+
+# Socket config end
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
