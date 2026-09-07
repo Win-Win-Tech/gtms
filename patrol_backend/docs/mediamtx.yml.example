@@ -1,0 +1,44 @@
+########################################
+# MediaMTX — GTMS CCTV live view (Phase 2)
+# Docs: https://github.com/bluenviron/mediamtx
+#
+# Install (example):
+#   wget https://github.com/bluenviron/mediamtx/releases/download/v1.11.3/mediamtx_v1.11.3_linux_amd64.tar.gz
+#   tar xf mediamtx_*.tar.gz && ./mediamtx ./mediamtx.yml
+#
+# Django defaults (override with env):
+#   MEDIAMTX_API_URL=http://127.0.0.1:9997
+#   MEDIAMTX_HLS_BASE_URL=http://127.0.0.1:8888
+#   MEDIAMTX_ENABLED=true
+#
+# After cameras are saved in GTMS, click "Sync MediaMTX" on Visitor → CCTV Live
+# (or re-save the site). Paths are created via API as cam-<id>.
+########################################
+
+# API used by Django to add/remove paths
+api: yes
+apiAddress: :9997
+
+# Browser playback (HLS)
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: '*'
+
+# Optional: RTSP republish (not required for web)
+rtsp: yes
+rtspAddress: :8554
+# Keep RTP/RTCP off Django's TCP :8000
+rtpAddress: :8002
+rtcpAddress: :8003
+
+# Paths are managed dynamically by GTMS via API.
+# You can also add a static test path manually:
+#
+# paths:
+#   testcam:
+#     source: rtsp://admin:123456@106.51.181.11:554/cam/realmonitor?channel=1&subtype=0
+#     sourceOnDemand: yes
+#
+# Then open: http://127.0.0.1:8888/testcam/index.m3u8
+
+paths: {}

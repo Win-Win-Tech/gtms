@@ -138,6 +138,52 @@ class LocationSite(models.Model):
         return f"{self.location.name} - {self.name}"
 
 
+class SiteCamera(models.Model):
+    """
+    CCTV camera attached to a LocationSite (ANPR / live view).
+    Separate from boundary fields — additive only.
+    """
+
+    class Direction(models.TextChoices):
+        TOGGLE = "toggle", "Toggle in/out"
+        IN = "in", "Entry only"
+        OUT = "out", "Exit only"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    site = models.ForeignKey(
+        LocationSite,
+        on_delete=models.CASCADE,
+        related_name="cameras",
+    )
+    name = models.CharField(max_length=255)
+    rtsp_url = models.CharField(max_length=1024)
+    direction = models.CharField(
+        max_length=16,
+        choices=Direction.choices,
+        default=Direction.TOGGLE,
+        help_text="toggle = flip check-in/out; in/out = dedicated lane (future)",
+    )
+    is_enabled = models.BooleanField(
+        default=True,
+        help_text="When False, skip sampling / hide from active monitoring",
+    )
+    sort_order = models.PositiveSmallIntegerField(default=0)
+    # Reserved for MediaMTX / browser playback path (optional until streaming is wired)
+    stream_path = models.CharField(max_length=255, blank=True, default="")
+
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+        indexes = [
+            models.Index(fields=["site", "is_enabled"]),
+        ]
+
+    def __str__(self):
+        return f"{self.site.name} — {self.name}"
+
+
 #class Shift(models.Model):
 #    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 #    location = models.ForeignKey(Location, on_delete=models.CASCADE)

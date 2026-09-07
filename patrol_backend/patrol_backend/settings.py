@@ -457,3 +457,8 @@ FCM_CREDENTIALS_PATH = os.environ.get(
     "FCM_CREDENTIALS_PATH",
     str(BASE_DIR / "certificate" / "gtms-e10e8-firebase-adminsdk-fbsvc-8f0b4f378e.json"),
 )
+
+# MediaMTX (CCTV live HLS) — optional; camera CRUD works without it
+MEDIAMTX_ENABLED = os.environ.get("MEDIAMTX_ENABLED", "true").lower() in ("1", "true", "yes")
+MEDIAMTX_API_URL = os.environ.get("MEDIAMTX_API_URL", "http://127.0.0.1:9997")
+MEDIAMTX_HLS_BASE_URL = os.environ.get("MEDIAMTX_HLS_BASE_URL", "http://127.0.0.1:8888")

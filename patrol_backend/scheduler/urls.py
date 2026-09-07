@@ -12,6 +12,7 @@ from .views import (
     AppVersionCheckView,
 )
 from .views_v5 import AssignmentViewSetV5
+from .views_cameras import CctvLiveCamerasView, CctvMediaMtxSyncView, SiteCameraListReplaceView
 
 router = DefaultRouter()
 router.register('locations', LocationViewSet)
@@ -28,5 +29,20 @@ v5_router.register('assignments', AssignmentViewSetV5, basename='assignments-v5'
 
 urlpatterns = router.urls + [
     path('app-version-check/', AppVersionCheckView.as_view(), name='app-version-check'),
+    path(
+        'sites/<uuid:site_id>/cameras/',
+        SiteCameraListReplaceView.as_view(),
+        name='site-cameras',
+    ),
+    path(
+        'cctv/live-cameras/',
+        CctvLiveCamerasView.as_view(),
+        name='cctv-live-cameras',
+    ),
+    path(
+        'cctv/sync-mediamtx/',
+        CctvMediaMtxSyncView.as_view(),
+        name='cctv-sync-mediamtx',
+    ),
     path('v5/', include(v5_router.urls)),
 ]

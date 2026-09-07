@@ -1,7 +1,19 @@
 from rest_framework import serializers
-from .models import Location, LocationSite, Shift, Assignment, Checkpoint, SiteSetting, CheckpointTemplate, ChecklistItem, ChecklistTemplate
+from .models import (
+    Location,
+    LocationSite,
+    SiteCamera,
+    Shift,
+    Assignment,
+    Checkpoint,
+    SiteSetting,
+    CheckpointTemplate,
+    ChecklistItem,
+    ChecklistTemplate,
+)
 from django.utils.timezone import now
 from uuid import UUID
+
 
 class LocationSiteSerializer(serializers.ModelSerializer):
     class Meta:
@@ -19,6 +31,42 @@ class LocationSiteSerializer(serializers.ModelSerializer):
             'breach_alerts_enabled',
             'location_missing_alerts_enabled',
         ]
+
+
+class SiteCameraSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteCamera
+        fields = [
+            "id",
+            "site",
+            "name",
+            "rtsp_url",
+            "direction",
+            "is_enabled",
+            "sort_order",
+            "stream_path",
+            "created_on",
+            "modified_on",
+        ]
+        read_only_fields = ["id", "site", "created_on", "modified_on"]
+
+
+class SiteCameraWriteSerializer(serializers.Serializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
+    name = serializers.CharField(max_length=255)
+    rtsp_url = serializers.CharField(max_length=1024)
+    direction = serializers.ChoiceField(
+        choices=SiteCamera.Direction.choices,
+        default=SiteCamera.Direction.TOGGLE,
+        required=False,
+    )
+    is_enabled = serializers.BooleanField(default=True, required=False)
+    sort_order = serializers.IntegerField(min_value=0, default=0, required=False)
+    stream_path = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+
+
+class SiteCameraBulkSerializer(serializers.Serializer):
+    cameras = SiteCameraWriteSerializer(many=True)
 
 
 def _normalize_nested_site_payload(site_data):
