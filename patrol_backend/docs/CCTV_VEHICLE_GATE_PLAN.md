@@ -78,6 +78,8 @@ python manage.py migrate scheduler 0028
 - [x] Settings: `MEDIAMTX_ENABLED`, `MEDIAMTX_API_URL`, `MEDIAMTX_HLS_BASE_URL`
 - [x] MediaMTX path sync forces `rtspTransport: tcp` (same as `ffplay -rtsp_transport tcp`)
 - [x] `GET /scheduler/cctv/live-cameras/` auto re-registers paths (so first open works after MediaMTX restart; Sync still available)
+- [x] Low-Latency HLS + player live-edge recovery
+- [x] Prefer MediaMTX **WebRTC (WHEP)** for low latency; HLS fallback; container sized to 16:9 video
 
 ### Ops steps (you run on server)
 

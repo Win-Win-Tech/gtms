@@ -2,45 +2,40 @@
 # MediaMTX — GTMS CCTV live view (Phase 2)
 # Docs: https://github.com/bluenviron/mediamtx
 #
-# Install (example):
-#   wget https://github.com/bluenviron/mediamtx/releases/download/v1.11.3/mediamtx_v1.11.3_linux_amd64.tar.gz
-#   tar xf mediamtx_*.tar.gz && ./mediamtx ./mediamtx.yml
+# Live playback prefers WebRTC (WHEP :8889) for low latency; HLS (:8888) is fallback.
 #
-# Django defaults (override with env):
+# On a public server, set webrtcAdditionalHosts to the public IP/hostname and open:
+#   TCP 8888 (HLS), TCP 8889 (WebRTC signaling), UDP 8189 (ICE)
+#
+# Django env:
 #   MEDIAMTX_API_URL=http://127.0.0.1:9997
-#   MEDIAMTX_HLS_BASE_URL=http://127.0.0.1:8888
-#   MEDIAMTX_ENABLED=true
-#
-# After cameras are saved in GTMS, click "Sync MediaMTX" on Visitor → CCTV Live
-# (or re-save the site). Paths are created via API as cam-<id>.
+#   MEDIAMTX_HLS_BASE_URL=http://YOUR_PUBLIC_IP:8888
+#   MEDIAMTX_WEBRTC_BASE_URL=http://YOUR_PUBLIC_IP:8889
 ########################################
 
-# API used by Django to add/remove paths
 api: yes
 apiAddress: :9997
 
-# Browser playback (HLS)
 hls: yes
 hlsAddress: :8888
 hlsAllowOrigin: '*'
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentMaxSize: 50M
 
-# Optional: RTSP republish (not required for web)
+webrtc: yes
+webrtcAddress: :8889
+webrtcAllowOrigin: '*'
+webrtcAdditionalHosts: []
+webrtcIPsFromInterfaces: yes
+webrtcLocalUDPAddress: :8189
+
 rtsp: yes
 rtspAddress: :8554
-# Keep RTP/RTCP off Django's TCP :8000
 rtpAddress: :8002
 rtcpAddress: :8003
-
-# Paths are managed dynamically by GTMS via API (rtspTransport: tcp).
-# You can also add a static test path manually:
-#
-# paths:
-#   testcam:
-#     source: rtsp://admin:pass@CAMERA_IP:554/video/live?channel=1&subtype=0
-#     sourceOnDemand: yes
-#     rtspTransport: tcp
-#
-# Then open: http://127.0.0.1:8888/testcam/index.m3u8
 
 pathDefaults:
   rtspTransport: tcp

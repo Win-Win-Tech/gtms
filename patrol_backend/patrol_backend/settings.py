@@ -462,3 +462,5 @@ FCM_CREDENTIALS_PATH = os.environ.get(
 MEDIAMTX_ENABLED = os.environ.get("MEDIAMTX_ENABLED", "true").lower() in ("1", "true", "yes")
 MEDIAMTX_API_URL = os.environ.get("MEDIAMTX_API_URL", "http://127.0.0.1:9997")
 MEDIAMTX_HLS_BASE_URL = os.environ.get("MEDIAMTX_HLS_BASE_URL", "http://127.0.0.1:8888")
+# WebRTC (WHEP) — low-latency live; set to public host:8889 on live servers
+MEDIAMTX_WEBRTC_BASE_URL = os.environ.get("MEDIAMTX_WEBRTC_BASE_URL", "http://127.0.0.1:8889")

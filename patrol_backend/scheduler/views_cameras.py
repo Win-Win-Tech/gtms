@@ -42,6 +42,7 @@ def _camera_live_payload(camera: SiteCamera) -> dict:
         "rtsp_url": camera.rtsp_url,
         "stream_path": path,
         "hls_url": mediamtx.build_hls_url(path),
+        "whep_url": mediamtx.build_whep_url(path),
         "sort_order": camera.sort_order,
     }
 
@@ -160,6 +161,7 @@ class CctvLiveCamerasView(APIView):
         return Response(
             {
                 "mediamtx_hls_base": mediamtx.hls_base_url(),
+                "mediamtx_webrtc_base": mediamtx.webrtc_base_url(),
                 "results": results,
             }
         )

@@ -19,6 +19,10 @@ def hls_base_url() -> str:
     return (getattr(settings, "MEDIAMTX_HLS_BASE_URL", None) or "http://127.0.0.1:8888").rstrip("/")
 
 
+def webrtc_base_url() -> str:
+    return (getattr(settings, "MEDIAMTX_WEBRTC_BASE_URL", None) or "http://127.0.0.1:8889").rstrip("/")
+
+
 def api_base_url() -> str:
     return (getattr(settings, "MEDIAMTX_API_URL", None) or "http://127.0.0.1:9997").rstrip("/")
 
@@ -35,6 +39,14 @@ def build_hls_url(stream_path: str) -> Optional[str]:
     return f"{hls_base_url()}/{path}/index.m3u8"
 
 
+def build_whep_url(stream_path: str) -> Optional[str]:
+    """MediaMTX WebRTC WHEP endpoint — low latency live (CP Plus-like)."""
+    path = (stream_path or "").strip().strip("/")
+    if not path:
+        return None
+    return f"{webrtc_base_url()}/{path}/whep"
+
+
 def sync_camera_path(stream_path: str, rtsp_url: str) -> bool:
     """
     Upsert a MediaMTX path that pulls from RTSP (on-demand).
@@ -47,15 +59,15 @@ def sync_camera_path(stream_path: str, rtsp_url: str) -> bool:
     if not path or not rtsp:
         return False
 
-    # Force TCP — same as `ffplay -rtsp_transport tcp`. Many CP Plus / NVR
-    # cameras fail on UDP (VLC without Live555 TCP also fails the same way).
+    # Keep RTSP pull alive while the user watches (avoids freeze when HLS
+    # briefly stalls). TCP required for many CP Plus / NVR cameras.
     # record=False: live view only — do not write stream to disk (Phase 2).
     payload = {
         "name": path,
         "source": rtsp,
         "sourceOnDemand": True,
         "sourceOnDemandStartTimeout": "20s",
-        "sourceOnDemandCloseAfter": "30s",
+        "sourceOnDemandCloseAfter": "5m",
         "rtspTransport": "tcp",
         "record": False,
     }

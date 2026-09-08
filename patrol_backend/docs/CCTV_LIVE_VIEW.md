@@ -78,7 +78,24 @@ Live view is **ephemeral**: MediaMTX pulls RTSP on demand when someone opens HLS
 
 ### C. Sync button
 
-`POST /scheduler/cctv/sync-mediamtx/` (org admin / superadmin) re-pushes all enabled cameras to MediaMTX. Use after MediaMTX restart (paths are in-memory / config API, not in our DB as video).
+`POST /scheduler/cctv/sync-mediamtx/` (org admin / superadmin) re-pushes all enabled cameras to MediaMTX. Use after MediaMTX restart (paths are in-memory / config API, not in our DB as video). Opening CCTV Live also auto-registers paths.
+
+### D. Latency / freeze notes
+
+**Why CP Plus feels smooth:** their desktop/web client usually talks **RTSP or proprietary** on the **LAN** (or uses WebRTC). Browsers cannot play RTSP directly, so GTMS used HLS first — HLS is chunk-based and always has delay/stalls on HD over the internet.
+
+**What we do now:**
+- Prefer **WebRTC (WHEP)** via MediaMTX `:8889` (~sub-second–2s) — closer to CP Plus.
+- Fall back to **Low-Latency HLS** `:8888` if WebRTC fails (firewall / ICE).
+- Player jumps to live edge on HLS stall.
+- Set camera **keyframe / GOP ≈ 1s** for best results.
+
+Live Django env example:
+```bash
+MEDIAMTX_HLS_BASE_URL=http://147.93.27.224:8888
+MEDIAMTX_WEBRTC_BASE_URL=http://147.93.27.224:8889
+```
+MediaMTX (or env `MTX_WEBRTCADDITIONALHOSTS=147.93.27.224`) must advertise the public IP for ICE. Open **TCP 8889** and **UDP 8189**.
 
 ---
 
