@@ -77,6 +77,7 @@ python manage.py migrate scheduler 0028
 - [x] Example config: [`mediamtx.yml.example`](mediamtx.yml.example)
 - [x] Settings: `MEDIAMTX_ENABLED`, `MEDIAMTX_API_URL`, `MEDIAMTX_HLS_BASE_URL`
 - [x] MediaMTX path sync forces `rtspTransport: tcp` (same as `ffplay -rtsp_transport tcp`)
+- [x] `GET /scheduler/cctv/live-cameras/` auto re-registers paths (so first open works after MediaMTX restart; Sync still available)
 
 ### Ops steps (you run on server)
 

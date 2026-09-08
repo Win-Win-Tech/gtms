@@ -152,6 +152,9 @@ class CctvLiveCamerasView(APIView):
             if not (cam.stream_path or "").strip():
                 cam.stream_path = mediamtx.build_stream_path(cam.id)
                 cam.save(update_fields=["stream_path", "modified_on"])
+            # MediaMTX forgets API paths after restart — re-register so first
+            # page load works without clicking Sync.
+            mediamtx.sync_camera_path(cam.stream_path, cam.rtsp_url)
             results.append(_camera_live_payload(cam))
 
         return Response(

@@ -68,9 +68,12 @@ Live view is **ephemeral**: MediaMTX pulls RTSP on demand when someone opens HLS
 
 1. Frontend `GET /scheduler/cctv/live-cameras/`.  
 2. Django returns cameras the user may see (site ACL) plus:
-   - `hls_url` e.g. `http://127.0.0.1:8888/cam-xxx/index.m3u8`  
+   - `hls_url` e.g. `http://SERVER:8888/cam-xxx/index.m3u8`  
    - `mediamtx_hls_base`  
-3. **Frontend does not play RTSP.** It plays `hls_url` with **hls.js**.  
+   - **Best-effort:** each camera path is re-registered on MediaMTX (so after MediaMTX
+     reboot, opening CCTV Live works without clicking Sync).  
+3. **Frontend does not play RTSP.** It plays `hls_url` with **hls.js** (retries while
+   on-demand pull starts).  
 4. Browser → MediaMTX HLS. MediaMTX → camera RTSP.  
 
 ### C. Sync button

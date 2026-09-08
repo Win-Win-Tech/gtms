@@ -99,8 +99,8 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
                         error=str(exc),
                     )
                 )
-                continue
-
+                    continue
+                
             if item.site_wise and active_sites:
                 scopes = [(site.id, site.name) for site in active_sites]
             else:
@@ -131,7 +131,7 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
                     )
                     logs_to_create.append(
                         ReportEmailLog(
-                            location=location,
+                    location=location,
                             report_code=item.report_code,
                             site_id=site_id,
                             schedule_key=schedule_key,
@@ -255,7 +255,7 @@ def dispatch_org_report_emails():
 @shared_task(name="reports.tasks.send_org_report_email_now")
 def send_org_report_email_now(config_id: str):
     """Manual/test send — ignores send_time and schedule-day gates."""
-    close_old_connections()
+        close_old_connections()
     config = (
         LocationReportEmailConfig.objects.filter(id=config_id)
         .select_related("location")
@@ -322,7 +322,7 @@ def _process_org_config_force_all(config: LocationReportEmailConfig):
 
     subject = f"[TEST] Reports - {location.name} ({now_local.date().isoformat()})"
     return send_report_email(
-        location=location,
+                    location=location,
         subject=subject,
         body_lines=["", "(This is a manual test send.)"],
         attachments=attachments,
