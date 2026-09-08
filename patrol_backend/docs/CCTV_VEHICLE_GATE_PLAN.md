@@ -1,8 +1,11 @@
 # CCTV Vehicle Gate — Phased Plan
 
 **Status:** Phase 2 complete — live HLS view (MediaMTX)  
-**Last updated:** 2026-09-07  
+**Last updated:** 2026-09-08  
 **Server constraint:** 4 vCPU / 8 GB — pilot = **1 camera**, sample later at 5–10s (not 100-site scale yet)
+
+**How live view works (store / load / MediaMTX / HLS / server install):**  
+→ see **[`CCTV_LIVE_VIEW.md`](CCTV_LIVE_VIEW.md)**
 
 ## In one sentence
 
@@ -73,13 +76,14 @@ python manage.py migrate scheduler 0028
 - [x] Visitor menu tab **CCTV Live** (`/visitor/cctv-live`) + HLS.js player
 - [x] Example config: [`mediamtx.yml.example`](mediamtx.yml.example)
 - [x] Settings: `MEDIAMTX_ENABLED`, `MEDIAMTX_API_URL`, `MEDIAMTX_HLS_BASE_URL`
+- [x] MediaMTX path sync forces `rtspTransport: tcp` (same as `ffplay -rtsp_transport tcp`)
 
 ### Ops steps (you run on server)
 
 1. Install/run MediaMTX using `docs/mediamtx.yml.example` (ports **8888** HLS, **9997** API).  
 2. Ensure Django can reach `http://127.0.0.1:9997` and the browser can reach HLS  
    (if UI is remote, set `MEDIAMTX_HLS_BASE_URL` to a public/nginx-proxied URL, not localhost).  
-3. Save site camera (or click **Sync MediaMTX** on CCTV Live).  
+3. Save site camera (or click **Sync MediaMTX** on CCTV Live) — pulls RTSP over **TCP**.  
 4. Open **Visitor → CCTV Live** and select the camera.
 
 ### Verify Phase 2
@@ -133,4 +137,5 @@ Outline only — CCTV badge, plate as primary label.
 | 1–2 API | `scheduler/views_cameras.py`, `scheduler/mediamtx.py`, `urls.py` |
 | 1 Web config | `SiteCctvCamerasPanel.jsx`, `SiteFormPage.jsx` |
 | 2 Live UI | `GTMS_NEw/.../CctvLiveView.jsx`, `Visitor.jsx`, `App.jsx` |
-| 2 MediaMTX | `docs/mediamtx.yml.example` |
+| 2 MediaMTX | `docs/mediamtx.yml.example`, `bin/mediamtx/` |
+| 2 Explain / deploy | [`CCTV_LIVE_VIEW.md`](CCTV_LIVE_VIEW.md) |

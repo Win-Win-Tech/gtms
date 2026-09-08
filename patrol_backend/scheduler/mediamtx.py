@@ -47,12 +47,17 @@ def sync_camera_path(stream_path: str, rtsp_url: str) -> bool:
     if not path or not rtsp:
         return False
 
+    # Force TCP — same as `ffplay -rtsp_transport tcp`. Many CP Plus / NVR
+    # cameras fail on UDP (VLC without Live555 TCP also fails the same way).
+    # record=False: live view only — do not write stream to disk (Phase 2).
     payload = {
         "name": path,
         "source": rtsp,
         "sourceOnDemand": True,
-        "sourceOnDemandStartTimeout": "15s",
+        "sourceOnDemandStartTimeout": "20s",
         "sourceOnDemandCloseAfter": "30s",
+        "rtspTransport": "tcp",
+        "record": False,
     }
     try:
         # Prefer add; if exists, patch

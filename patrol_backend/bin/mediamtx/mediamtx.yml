@@ -30,14 +30,21 @@ rtspAddress: :8554
 rtpAddress: :8002
 rtcpAddress: :8003
 
-# Paths are managed dynamically by GTMS via API.
+# Paths are managed dynamically by GTMS via API (rtspTransport: tcp).
 # You can also add a static test path manually:
 #
 # paths:
 #   testcam:
-#     source: rtsp://admin:123456@106.51.181.11:554/cam/realmonitor?channel=1&subtype=0
+#     source: rtsp://admin:pass@CAMERA_IP:554/video/live?channel=1&subtype=0
 #     sourceOnDemand: yes
+#     rtspTransport: tcp
 #
 # Then open: http://127.0.0.1:8888/testcam/index.m3u8
+
+# Defaults applied when a path has no specific entry (API-created paths
+# still set rtspTransport explicitly via Django sync).
+pathDefaults:
+  rtspTransport: tcp
+  record: no
 
 paths: {}
