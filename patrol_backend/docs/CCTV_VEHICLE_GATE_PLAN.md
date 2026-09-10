@@ -103,27 +103,32 @@ python manage.py migrate scheduler 0028
 
 ---
 
-## Phase 3 — Sample + OCR (next, not started)
+## Phase 3 — Sample + OCR
 
-**Goal:** Every 5–10s grab a frame, run existing vehicle OCR library.
+**Goal:** Event-driven ANPR (Reader + Celery `anpr`), reuse plate YOLO + RapidOCR.
 
-### Tasks (outline only)
+See full design: [`CCTV_ANPR_FULL_PLAN.md`](CCTV_ANPR_FULL_PLAN.md)  
+Ops commands: [`CCTV_ANPR_OPS.md`](CCTV_ANPR_OPS.md)
 
-- [ ] Dedicated queue / process; load YOLO once  
-- [ ] Snapshot from MediaMTX or RTSP  
-- [ ] Call shared detect+OCR code used by `/visitors/ai/extract/?type=vehicle`  
+### Implementation (in repo)
 
-**Hardware:** 1 enabled camera only on this server.
+- [x] Shared `extract_vehicle_from_bgr`
+- [x] ANPR Reader (`run_anpr_reader`)
+- [x] Celery queue `anpr` + `process_anpr_frame`
+- [x] Gate check-in/out + `entry_source=cctv`
+- [x] List UX CCTV badge / plate-primary
+
+**Hardware:** up to **2** enabled cameras on this server.
 
 ---
 
 ## Phase 4 — Check-in / check-out
 
-Outline only — plate → visitor entry (`entry_source=cctv`), cooldown, no host/photos.
+Synthetic Visitor `CCTV-{plate}`, cooldown, no host / no exit_photo for CCTV path.
 
 ## Phase 5 — List / reports UX
 
-Outline only — CCTV badge, plate as primary label.
+CCTV badge; plate as primary label for `entry_source=cctv`.
 
 ---
 

@@ -13,5 +13,6 @@ Light defaults (8 GB):
 """
 
 from .pipeline import extract_from_upload
+from .pipeline_v2 import extract_from_upload_v2, extract_vehicle_from_bgr
 
-__all__ = ["extract_from_upload"]
+__all__ = ["extract_from_upload", "extract_from_upload_v2", "extract_vehicle_from_bgr"]

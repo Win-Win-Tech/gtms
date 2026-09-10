@@ -11,5 +11,10 @@ Or set env:
 export VISITOR_AI_PLATE_WEIGHTS=/path/to/your_plate_model.pt
 ```
 
-If neither is set, extract-v2 downloads/uses Ultralytics Hub:
-`keremberke/yolov8n-license-plate-detection` (first request may be slow).
+If neither is set, code may try Ultralytics Hub
+`keremberke/yolov8n-license-plate-detection` (often fails / unavailable).
+
+**If Hub fails:** detection automatically falls back to **vehicle YOLO**
+(`yolov8n.pt` already in the repo) so ANPR Reader can still track cars.
+OCR then runs on the vehicle crop / full frame. For best plate accuracy,
+add a real plate `.pt` file here.

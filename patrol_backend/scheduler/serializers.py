@@ -45,6 +45,7 @@ class SiteCameraSerializer(serializers.ModelSerializer):
             "is_enabled",
             "sort_order",
             "stream_path",
+            "anpr_geometry",
             "created_on",
             "modified_on",
         ]
@@ -63,7 +64,7 @@ class SiteCameraWriteSerializer(serializers.Serializer):
     is_enabled = serializers.BooleanField(default=True, required=False)
     sort_order = serializers.IntegerField(min_value=0, default=0, required=False)
     stream_path = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
-
+    anpr_geometry = serializers.JSONField(required=False, default=dict)
 
 class SiteCameraBulkSerializer(serializers.Serializer):
     cameras = SiteCameraWriteSerializer(many=True)

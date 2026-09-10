@@ -372,7 +372,12 @@ def extract_id_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str, flo
 
 
 def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str, float]]:
-    """Returns (normalized_plate, confidence) or None."""
+    """
+    Returns (normalized_plate, confidence) or None.
+
+    Country-agnostic: accepts common letter+digit plate patterns worldwide.
+    Prefers longer, higher-confidence candidates (avoids truncated OCR).
+    """
     if not lines:
         return None
     candidates = []
@@ -383,28 +388,35 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
         m = IN_PLATE_RE.search(text)
         if m:
             plate = f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}".upper()
-            if len(plate) <= 11:
-                candidates.append((plate, score))
-            continue
-        m2 = re.search(r"\b([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4})\b", compact)
-        if m2 and len(m2.group(1)) <= 11:
-            candidates.append((m2.group(1), score))
-            continue
+            if 5 <= len(plate) <= 12:
+                candidates.append((plate, float(score)))
+        m2 = re.search(r"([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4})", compact)
+        if m2 and 5 <= len(m2.group(1)) <= 12:
+            candidates.append((m2.group(1), float(score)))
         m3 = MY_PLATE_RE.search(text)
         if m3:
             plate = f"{m3.group(1)}{m3.group(2)}{m3.group(3) or ''}".upper()
-            if 5 <= len(plate) <= 11:
-                candidates.append((plate, score * 0.9))
+            if 5 <= len(plate) <= 12:
+                candidates.append((plate, float(score) * 0.9))
+        # Generic worldwide: mixed alnum token (no national layout required)
+        if 5 <= len(compact) <= 12:
+            has_a = any(c.isalpha() for c in compact)
+            has_d = any(c.isdigit() for c in compact)
+            if has_a and has_d:
+                candidates.append((compact, float(score) * 0.85))
 
     if not candidates:
         blob = re.sub(r"[^A-Za-z0-9]", "", _join_lines(lines)).upper()
-        m2 = re.search(r"([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4})", blob)
-        if m2 and len(m2.group(1)) <= 11:
-            candidates.append((m2.group(1), 0.5))
+        # Prefer longest mixed alnum run in the blob
+        for m in re.finditer(r"[A-Z0-9]{5,12}", blob):
+            plate = m.group(0)
+            if any(c.isalpha() for c in plate) and any(c.isdigit() for c in plate):
+                candidates.append((plate, 0.5))
 
     if not candidates:
         return None
-    candidates.sort(key=lambda c: c[1], reverse=True)
+    # Prefer confidence, then length (truncated OCR loses)
+    candidates.sort(key=lambda c: (c[1], len(c[0])), reverse=True)
     return candidates[0]
 
 

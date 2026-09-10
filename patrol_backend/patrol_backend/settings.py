@@ -168,11 +168,13 @@ DATABASES = {
             'write_timeout': 30,
             'charset': 'utf8mb4',
         },
-        # Connection pool settings
+        # Connection pool settings (SQLAlchemy via dj_db_conn_pool)
+        # Recycle well under typical remote MySQL wait_timeout to avoid
+        # "MySQL server has gone away" on long-lived processes (ANPR reader, Celery).
         'POOL_OPTIONS': {
             'POOL_SIZE': 5,        # Keep 5 connections in pool
             'MAX_OVERFLOW': 10,     # Allow up to 10 extra connections
-            'POOL_RECYCLE': 3600,   # Recycle connections after 1 hour
+            'POOL_RECYCLE': int(os.environ.get("DB_POOL_RECYCLE", "280")),
         },
     }
 }
@@ -464,3 +466,21 @@ MEDIAMTX_API_URL = os.environ.get("MEDIAMTX_API_URL", "http://127.0.0.1:9997")
 MEDIAMTX_HLS_BASE_URL = os.environ.get("MEDIAMTX_HLS_BASE_URL", "http://127.0.0.1:8888")
 # WebRTC (WHEP) — low-latency live; set to public host:8889 on live servers
 MEDIAMTX_WEBRTC_BASE_URL = os.environ.get("MEDIAMTX_WEBRTC_BASE_URL", "http://127.0.0.1:8889")
+
+# CCTV ANPR (Phases 3–5) — Reader + Celery queue `anpr` (Redis broker, not RabbitMQ)
+ANPR_ENABLED = os.environ.get("ANPR_ENABLED", "false").lower() in ("1", "true", "yes")
+ANPR_MAX_CAMERAS = int(os.environ.get("ANPR_MAX_CAMERAS", "2"))
+ANPR_DETECT_FPS = float(os.environ.get("ANPR_DETECT_FPS", "1"))
+ANPR_COOLDOWN_SEC = int(os.environ.get("ANPR_COOLDOWN_SEC", "60"))
+ANPR_QUEUE = os.environ.get("ANPR_QUEUE", "anpr")
+ANPR_MAX_QUEUE_DEPTH = int(os.environ.get("ANPR_MAX_QUEUE_DEPTH", "8"))
+ANPR_STALE_FRAME_SEC = int(os.environ.get("ANPR_STALE_FRAME_SEC", "10"))
+ANPR_MIN_TRACK_HITS = int(os.environ.get("ANPR_MIN_TRACK_HITS", "2"))
+ANPR_DETECT_CONF = float(os.environ.get("ANPR_DETECT_CONF", "0.25"))
+# How often the reader reloads SiteCamera rows (diff-only; default 5 min)
+ANPR_CAMERA_REFRESH_SEC = int(os.environ.get("ANPR_CAMERA_REFRESH_SEC", "300"))
+
+# Route ANPR OCR tasks to dedicated queue (separate worker: -Q anpr -c 1)
+CELERY_TASK_ROUTES = {
+    "visitor.anpr.tasks.process_anpr_frame": {"queue": ANPR_QUEUE},
+}

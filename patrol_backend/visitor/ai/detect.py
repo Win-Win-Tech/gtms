@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 VEHICLE_CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 
-# Default plate detector (Ultralytics Hub). Override with local .pt via VISITOR_AI_PLATE_WEIGHTS.
+# Default plate detector (Ultralytics Hub — often unavailable offline).
+# Prefer a local .pt via VISITOR_AI_PLATE_WEIGHTS or visitor/ai/weights/*.pt.
 _DEFAULT_PLATE_HUB = "keremberke/yolov8n-license-plate-detection"
 _LOCAL_PLATE_CANDIDATES = (
     Path(__file__).resolve().parent / "weights" / "license_plate_detector.pt",
@@ -32,12 +33,14 @@ _LOCAL_PLATE_CANDIDATES = (
 _yolo_lock = threading.Lock()
 _yolo_model = None
 _yolo_id_model = None
+# Plate model: YOLO instance, or False after a failed load (do not retry every frame).
 _yolo_plate_model = None
+_plate_fallback_logged = False
 
 
 def unload_yolo() -> None:
     """Drop warm YOLO singletons (called after idle on 8 GB hosts)."""
-    global _yolo_model, _yolo_id_model, _yolo_plate_model
+    global _yolo_model, _yolo_id_model, _yolo_plate_model, _plate_fallback_logged
     with _yolo_lock:
         if _yolo_model is None and _yolo_id_model is None and _yolo_plate_model is None:
             return
@@ -45,6 +48,7 @@ def unload_yolo() -> None:
         _yolo_model = None
         _yolo_id_model = None
         _yolo_plate_model = None
+        _plate_fallback_logged = False
 
 
 def _resolve_plate_weights() -> str:
@@ -115,11 +119,18 @@ def _get_id_yolo():
 
 
 def _get_plate_yolo():
-    """Lazy-load dedicated license-plate YOLO once (warm singleton)."""
+    """
+    Lazy-load dedicated license-plate YOLO once.
+    Returns None if weights cannot be loaded (failure is cached — no per-frame retry).
+    """
     global _yolo_plate_model
+    if _yolo_plate_model is False:
+        return None
     if _yolo_plate_model is not None:
         return _yolo_plate_model
     with _yolo_lock:
+        if _yolo_plate_model is False:
+            return None
         if _yolo_plate_model is not None:
             return _yolo_plate_model
         try:
@@ -130,9 +141,20 @@ def _get_plate_yolo():
                 "Install: pip install ultralytics"
             ) from exc
         weights = _resolve_plate_weights()
-        logger.info("Loading plate YOLO weights=%s (first load may download)", weights)
-        _yolo_plate_model = YOLO(weights)
-        return _yolo_plate_model
+        try:
+            logger.info("Loading plate YOLO weights=%s (first load may download)", weights)
+            _yolo_plate_model = YOLO(weights)
+            return _yolo_plate_model
+        except Exception as exc:
+            logger.warning(
+                "Plate YOLO unavailable (%s): %s — "
+                "place a .pt in visitor/ai/weights/ or set VISITOR_AI_PLATE_WEIGHTS. "
+                "Falling back to vehicle YOLO for detection.",
+                weights,
+                exc,
+            )
+            _yolo_plate_model = False
+            return None
 
 
 def detect_vehicles(bgr_image, conf: float = 0.35) -> List[Box]:
@@ -193,10 +215,13 @@ def detect_plates(bgr_image, conf: float = 0.25) -> List[Box]:
     """
     Dedicated license-plate YOLO — returns plate boxes (largest first).
 
-    Works on full-vehicle scenes and close-up plate shots.
+    If plate weights are missing/broken, falls back to vehicle YOLO boxes
+    (ANPR can still track cars; OCR uses vehicle crop / full frame).
+
     Weights: VISITOR_AI_PLATE_WEIGHTS, else local visitor/ai/weights/*.pt,
-    else Ultralytics Hub keremberke/yolov8n-license-plate-detection.
+    else Ultralytics Hub (may fail offline).
     """
+    global _plate_fallback_logged
     skip = (os.environ.get("VISITOR_AI_PLATE_SKIP_YOLO") or "").lower() in (
         "1",
         "true",
@@ -210,7 +235,16 @@ def detect_plates(bgr_image, conf: float = 0.25) -> List[Box]:
         model = _get_plate_yolo()
     except Exception as exc:
         logger.warning("Plate YOLO unavailable: %s", exc)
-        return []
+        model = None
+
+    if model is None:
+        if not _plate_fallback_logged:
+            logger.warning(
+                "Using vehicle YOLO fallback for plate-region detection "
+                "(ANPR will track vehicles; OCR still runs on crop/frame)."
+            )
+            _plate_fallback_logged = True
+        return detect_vehicles(bgr_image, conf=max(conf, 0.35))
 
     results = model.predict(
         source=bgr_image,

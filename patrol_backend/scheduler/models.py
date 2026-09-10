@@ -170,6 +170,12 @@ class SiteCamera(models.Model):
     sort_order = models.PositiveSmallIntegerField(default=0)
     # Reserved for MediaMTX / browser playback path (optional until streaming is wired)
     stream_path = models.CharField(max_length=255, blank=True, default="")
+    # ANPR geometry (normalized 0..1): {"roi": {...}, "line": {...}}
+    anpr_geometry = models.JSONField(
+        blank=True,
+        default=dict,
+        help_text='Optional ANPR ROI/line, e.g. {"roi":{"x1":0,"y1":0.3,"x2":1,"y2":1},"line":{"x1":0,"y1":0.55,"x2":1,"y2":0.55}}',
+    )
 
     created_on = models.DateTimeField(auto_now_add=True)
     modified_on = models.DateTimeField(auto_now=True)

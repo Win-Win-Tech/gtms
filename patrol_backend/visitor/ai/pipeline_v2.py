@@ -32,8 +32,9 @@ MAX_CONCURRENT = int(os.environ.get("VISITOR_AI_MAX_CONCURRENT", "2"))
 ID_MAX_SIDE = int(os.environ.get("VISITOR_AI_ID_MAX_SIDE", "800"))
 # Hard cap on RapidOCR calls per ID request (each ~1–3s on CPU).
 MAX_ID_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_ID_OCR_PASSES", "2"))
-# Plate pipeline OCR budget (detect + enhance / rotate fallbacks).
-MAX_PLATE_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_PLATE_OCR_PASSES", "3"))
+# Plate pipeline OCR budget (detect + enhance / vehicle-zone fallbacks).
+MAX_PLATE_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_PLATE_OCR_PASSES", "4"))
+_VEHICLE_DETECT_LABELS = frozenset({"car", "truck", "bus", "motorcycle", "full_frame"})
 _ai_sema_v2 = threading.Semaphore(max(1, MAX_CONCURRENT))
 # Reuse one worker pool instead of creating/destroying per request.
 _timeout_pool = ThreadPoolExecutor(max_workers=max(1, MAX_CONCURRENT))
@@ -48,6 +49,90 @@ def _ocr_lines_preview(lines, limit: int = 20) -> str:
         parts.append(f"{text!r}:{float(conf):.2f}")
     extra = f" …(+{len(lines) - limit})" if len(lines) > limit else ""
     return "[" + "; ".join(parts) + "]" + extra
+
+
+def _slim_vehicle_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Stable shape for HTTP + CCTV ANPR Celery consumers."""
+    number = result.get("vehicle_number") or result.get("number")
+    detect = result.get("detect") or {}
+    yolo_label = ""
+    if isinstance(detect, dict):
+        yolo_label = (detect.get("label") or "").strip().lower()
+    return {
+        "type": "vehicle",
+        "found": bool(result.get("found")),
+        "number": number,
+        "vehicle_number": number,
+        "confidence": result.get("confidence"),
+        "reason": result.get("reason"),
+        "raw_text": result.get("raw_text") or [],
+        "detect": detect,
+        "yolo_label": yolo_label,
+        "vehicle_type": yolo_label,  # coarse COCO class; gate maps to lookup codes
+        "elapsed_ms": result.get("elapsed_ms"),
+        "engine": result.get("engine") or "plate+rapidocr",
+        "error": result.get("error"),
+    }
+
+
+def extract_vehicle_from_bgr(bgr) -> Dict[str, Any]:
+    """
+    Plate YOLO + RapidOCR on an in-memory BGR frame (CCTV ANPR / library reuse).
+
+    Same core path as upload extract-v2 type=vehicle. Synchronous — callers
+    (HTTP timeout pool or Celery time limits) own concurrency/timeouts.
+    """
+    import numpy as np
+
+    if bgr is None or not isinstance(bgr, np.ndarray) or bgr.size == 0:
+        return _slim_vehicle_result({
+            "found": False,
+            "reason": "bad_image",
+            "error": "empty frame",
+        })
+
+    t0 = time.monotonic()
+    try:
+        from .memory import touch_activity
+
+        ensure_rapid_ocr_ready()
+        touch_activity()
+
+        h, w = bgr.shape[:2]
+        max_side = max(h, w)
+        frame = bgr
+        if max_side > ID_MAX_SIDE:
+            scale = ID_MAX_SIDE / float(max_side)
+            frame = cv2.resize(
+                bgr,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        logger.info(
+            "extract_vehicle_from_bgr resized=%sx%s",
+            frame.shape[1],
+            frame.shape[0],
+        )
+        result = _pipeline_vehicle_plate_v2(frame, t0)
+        touch_activity()
+        slim = _slim_vehicle_result(result)
+        logger.info(
+            "extract_vehicle_from_bgr done found=%s number=%s conf=%s reason=%s elapsed_ms=%s",
+            slim.get("found"),
+            slim.get("number"),
+            slim.get("confidence"),
+            slim.get("reason"),
+            slim.get("elapsed_ms"),
+        )
+        return slim
+    except Exception as exc:
+        logger.exception("extract_vehicle_from_bgr failed: %s", exc)
+        return _slim_vehicle_result({
+            "found": False,
+            "reason": "error",
+            "error": str(exc),
+            "elapsed_ms": int((time.monotonic() - t0) * 1000),
+        })
 
 
 def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
@@ -98,9 +183,8 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
             )
             if extract_type == "id":
                 return _pipeline_id_v2(bgr, t0)
-            # extract-v2 vehicle → dedicated plate model + RapidOCR
-            # (legacy vehicle-YOLO path kept as _pipeline_vehicle_v2)
-            return _pipeline_vehicle_plate_v2(bgr, t0)
+            # Shared library with CCTV ANPR (already inside timeout pool)
+            return extract_vehicle_from_bgr(bgr)
 
         fut = _timeout_pool.submit(_run)
         try:
@@ -112,7 +196,7 @@ def extract_from_upload_v2(file_obj, extract_type: str) -> Dict[str, Any]:
                 result.get("found"),
                 result.get("reason"),
                 result.get("confidence"),
-                result.get("id_number") or result.get("vehicle_number"),
+                result.get("id_number") or result.get("vehicle_number") or result.get("number"),
                 result.get("name"),
                 result.get("elapsed_ms"),
             )
@@ -192,6 +276,79 @@ def _upscale_if_small(bgr, min_long_side: int = 220):
         (max(1, int(w * scale)), max(1, int(h * scale))),
         interpolation=cv2.INTER_CUBIC,
     )
+
+
+def _is_vehicle_sized_box(box, frame) -> bool:
+    """True when YOLO returned a vehicle (not a tight license-plate box)."""
+    label = (getattr(box, "label", "") or "").lower()
+    if label in _VEHICLE_DETECT_LABELS:
+        return True
+    try:
+        return _box_fill_ratio(box, frame) >= 0.12
+    except Exception:
+        return False
+
+
+def _plate_zone_crops(bgr, box) -> list:
+    """
+    Build OCR crops. For vehicle boxes, prefer lower bands (where plates sit).
+    For real plate boxes, use the padded plate ROI.
+    Returns list of (image, detector_name).
+    """
+    out = []
+    if _is_vehicle_sized_box(box, bgr):
+        roi = crop_with_padding(bgr, box, pad_ratio=0.04)
+        h_roi = roi.shape[0]
+        if h_roi > 40:
+            # Primary: lower ~55% of vehicle (plate zone)
+            out.append((roi[int(h_roi * 0.45) :, :], "vehicle_bottom"))
+            # Tighter: lower ~40%
+            out.append((roi[int(h_roi * 0.60) :, :], "vehicle_lower"))
+        out.append((roi, "vehicle_full"))
+        return out
+
+    roi = crop_with_padding(bgr, box, pad_ratio=0.12)
+    roi = _deskew_plate_roi(roi)
+    out.append((roi, "plate_crop"))
+    return out
+
+
+def _pick_plate_from_attempts(attempts):
+    """
+    Choose plate from OCR passes: prefer consensus across passes, then conf+length.
+    """
+    scored = []
+    for lines_local, parsed_local, meta_local in attempts:
+        if not parsed_local:
+            continue
+        plate, conf = parsed_local
+        plate = (plate or "").upper().strip()
+        if len(plate) < 4:
+            continue
+        scored.append((plate, float(conf), meta_local, lines_local))
+    if not scored:
+        return None, float("-inf"), None, None
+
+    # Vote by exact plate string
+    from collections import Counter
+
+    counts = Counter(p for p, _, _, _ in scored)
+    best_plate = None
+    best_score = float("-inf")
+    best_meta = None
+    best_lines = None
+    best_conf = float("-inf")
+    for plate, conf, meta, lines in scored:
+        # consensus bonus + prefer longer (less truncated OCR)
+        vote = counts[plate]
+        score = conf + 0.12 * (vote - 1) + 0.015 * len(plate)
+        if score > best_score:
+            best_score = score
+            best_plate = plate
+            best_meta = meta
+            best_lines = lines
+            best_conf = conf
+    return best_plate, best_conf, best_meta, best_lines
 
 
 def _deskew_plate_roi(bgr):
@@ -521,7 +678,7 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
         if ocr_passes >= MAX_PLATE_OCR_PASSES:
             return False
         ocr_passes += 1
-        prepared = _upscale_if_small(image)
+        prepared = _upscale_if_small(image, min_long_side=280)
         lines_local = run_rapid_ocr(prepared)
         parsed_local = extract_vehicle_number(lines_local) if lines_local else None
         attempts.append((lines_local, parsed_local, meta))
@@ -592,27 +749,35 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
             "confidence": round(best.confidence, 3),
             "box": [best.x1, best.y1, best.x2, best.y2],
             "frame_fill_ratio": round(_box_fill_ratio(best, bgr), 3),
+            "vehicle_sized": _is_vehicle_sized_box(best, bgr),
         })
-        roi = crop_with_padding(bgr, best, pad_ratio=0.12)
-        roi = _deskew_plate_roi(roi)
 
-        # Pass 1: plate crop (upscaled if tiny)
-        hit = _ocr_attempt(
-            roi,
-            {**detect_meta, "detector": "plate_crop"},
-        )
-
-        # Pass 2: blur / screen-photo — CLAHE + mild sharpen
-        if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
-            enhanced = _sharpen_for_blur(_enhance_for_ocr(roi))
+        # Vehicle YOLO fallback returns a car box — OCR lower plate zone, not whole car.
+        # Real plate YOLO returns a tight plate box — OCR that crop.
+        for crop_img, det_name in _plate_zone_crops(bgr, best):
+            if ocr_passes >= MAX_PLATE_OCR_PASSES:
+                break
+            hit = _ocr_attempt(
+                crop_img,
+                {**detect_meta, "detector": det_name},
+            ) or hit
+            if ocr_passes >= MAX_PLATE_OCR_PASSES:
+                break
+            # Second pass: CLAHE + sharpen on same crop (blur / glare)
+            enhanced = _sharpen_for_blur(_enhance_for_ocr(crop_img))
             hit = _ocr_attempt(
                 enhanced,
-                {**detect_meta, "detector": "plate_crop_enhanced"},
-            )
+                {**detect_meta, "detector": f"{det_name}_enhanced"},
+            ) or hit
+            # Enough signal from primary zone — stop burning passes on worse crops
+            if hit and det_name in ("vehicle_bottom", "plate_crop"):
+                break
 
-        # Pass 3: perspective warp on crop / frame (tilted plate / screen angle)
+        # Perspective warp only if still no confident hit
         if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
-            warped = warp_document_if_possible(roi)
+            zone = _plate_zone_crops(bgr, best)
+            base = zone[0][0] if zone else crop_with_padding(bgr, best, pad_ratio=0.08)
+            warped = warp_document_if_possible(base)
             if warped is None:
                 warped = warp_document_if_possible(bgr)
             if warped is not None:
@@ -647,21 +812,11 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
             },
         )
 
-    best_candidate = None
-    best_conf = float("-inf")
-    best_lines = None
-    best_meta = detect_meta
-    for lines_local, parsed_local, meta_local in attempts:
-        if not parsed_local:
-            if best_lines is None and lines_local:
-                best_lines = lines_local
-            continue
-        plate, conf = parsed_local
-        if conf > best_conf:
-            best_conf = conf
-            best_candidate = plate
-            best_lines = lines_local
-            best_meta = meta_local
+    best_candidate, best_conf, best_meta, best_lines = _pick_plate_from_attempts(
+        attempts
+    )
+    if best_meta is None:
+        best_meta = detect_meta
 
     if isinstance(best_meta, dict):
         best_meta = {**best_meta, "ocr_passes": ocr_passes}

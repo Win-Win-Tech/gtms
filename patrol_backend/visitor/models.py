@@ -95,9 +95,11 @@ class VisitorEntry(models.Model):
 
     ENTRY_MANUAL = "manual"
     ENTRY_INVITATION = "invitation"
+    ENTRY_CCTV = "cctv"
     ENTRY_SOURCE_CHOICES = [
         (ENTRY_MANUAL, "Manual Entry"),
         (ENTRY_INVITATION, "Invitation"),
+        (ENTRY_CCTV, "CCTV ANPR"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -258,6 +260,7 @@ class VisitorAsset(models.Model):
     ASSET_VISITOR_PHOTO = "visitor_photo"
     ASSET_ID_PROOF = "id_proof"
     ASSET_EXIT_PHOTO = "exit_photo"  # checkout image (mandatory)
+    ASSET_CHECK_IN_PHOTO = "check_in_photo"  # CCTV / ANPR check-in frame
     ASSET_VEHICLE_PHOTO = "vehicle_photo"
     ASSET_ADDITIONAL = "additional"
     ASSET_OTHER = "other"
@@ -265,6 +268,7 @@ class VisitorAsset(models.Model):
         (ASSET_VISITOR_PHOTO, "Visitor Photo"),
         (ASSET_ID_PROOF, "ID Proof"),
         (ASSET_EXIT_PHOTO, "Checkout Image"),
+        (ASSET_CHECK_IN_PHOTO, "Check-in Image"),
         (ASSET_VEHICLE_PHOTO, "Vehicle Photo"),
         (ASSET_ADDITIONAL, "Additional"),
         (ASSET_OTHER, "Other"),

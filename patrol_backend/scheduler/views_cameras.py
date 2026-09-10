@@ -105,6 +105,7 @@ class SiteCameraListReplaceView(APIView):
                 is_enabled=item.get("is_enabled", True),
                 sort_order=item.get("sort_order", index),
                 stream_path=(item.get("stream_path") or "").strip(),
+                anpr_geometry=item.get("anpr_geometry") or {},
             )
             cam.save()
             if not cam.stream_path:
