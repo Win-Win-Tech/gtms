@@ -168,13 +168,16 @@ DATABASES = {
             'write_timeout': 30,
             'charset': 'utf8mb4',
         },
-        # Connection pool settings (SQLAlchemy via dj_db_conn_pool)
-        # Recycle well under typical remote MySQL wait_timeout to avoid
-        # "MySQL server has gone away" on long-lived processes (ANPR reader, Celery).
+        # Connection pool settings (SQLAlchemy via dj_db_conn_pool).
+        # Keys must be UPPERCASE names that lower-case to QueuePool args:
+        # pool_size, max_overflow, recycle, pre_ping, timeout, echo.
+        # NOTE: "POOL_RECYCLE" is NOT valid and is silently ignored (defaults to 900s).
         'POOL_OPTIONS': {
-            'POOL_SIZE': 5,        # Keep 5 connections in pool
-            'MAX_OVERFLOW': 10,     # Allow up to 10 extra connections
-            'POOL_RECYCLE': int(os.environ.get("DB_POOL_RECYCLE", "280")),
+            'POOL_SIZE': 5,
+            'MAX_OVERFLOW': 10,
+            'RECYCLE': int(os.environ.get("DB_POOL_RECYCLE", "280")),
+            'PRE_PING': True,
+            'TIMEOUT': 30,
         },
     }
 }

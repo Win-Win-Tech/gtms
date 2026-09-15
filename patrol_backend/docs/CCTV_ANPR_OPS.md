@@ -92,7 +92,14 @@ When plate YOLO weights are missing, OCR uses the **lower band of the vehicle bo
 - check-out → `exit_photo`  
 Temp files under `media/anpr_pending/` are deleted after copy.
 
-DB pool: `DB_POOL_RECYCLE` (default **280**) — keep below MySQL `wait_timeout` so long processes do not hit “server has gone away”.
+DB pool: env `DB_POOL_RECYCLE` → settings `POOL_OPTIONS.RECYCLE` (default **280**).  
+Use key **`RECYCLE`** (not `POOL_RECYCLE` — ignored by `dj_db_conn_pool`).
+
+ANPR reader also:
+- **releases** the DB connection after every camera query (management commands otherwise hold it forever)
+- **keepalive** `SELECT 1` every `ANPR_DB_KEEPALIVE_SEC` (default **60**)
+- disables SQLAlchemy **rollback-on-return** so a dead idle socket does not log  
+  `Exception during reset or similar` / `MySQL server has gone away`
 
 ---
 
@@ -157,7 +164,7 @@ Environment=ANPR_CAMERA_REFRESH_SEC=300
 Environment=ANPR_QUEUE=anpr
 # If you use a .env file instead:
 # EnvironmentFile=/root/htdocs/ravi/gms/patrol_backend/.env
-ExecStart=/root/htdocs/ravi/gms/venv/bin/python manage.py run_anpr_reader
+ExecStart=/root/htdocs/ravi/gms/gtms_venv/bin/python manage.py run_anpr_reader
 Restart=always
 RestartSec=5
 
@@ -169,16 +176,19 @@ Enable:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now gtms-anpr-reader
-sudo systemctl status gtms-anpr-reader
-sudo journalctl -u gtms-anpr-reader -f
+sudo systemctl enable --now patrol-anpr-reader
+sudo systemctl status patrol-anpr-reader
+sudo journalctl -u patrol-anpr-reader -f
 ```
+
+**Do not** use gunicorn in this unit — that is the website API, not the camera watcher.  
+Healthy reader: `Main PID: … (python)` and `manage.py run_anpr_reader`.
 
 ### Optional: ANPR-only Celery worker service
 
 Only if you chose **Option B** above.
 
-`/etc/systemd/system/gtms-celery-anpr.service`:
+`/etc/systemd/system/patrol-anpr-celery.service`:
 
 ```ini
 [Unit]
@@ -192,7 +202,7 @@ User=root
 WorkingDirectory=/root/htdocs/ravi/gms/patrol_backend
 Environment=DJANGO_SETTINGS_MODULE=patrol_backend.settings
 Environment=ANPR_ENABLED=true
-ExecStart=/root/htdocs/ravi/gms/venv/bin/celery -A patrol_backend worker -Q anpr -c 1 --prefetch-multiplier=1 --loglevel=info
+ExecStart=/root/htdocs/ravi/gms/gtms_venv/bin/celery -A patrol_backend worker -Q anpr -c 1 --prefetch-multiplier=1 --loglevel=info
 Restart=always
 RestartSec=5
 
@@ -201,7 +211,26 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable --now gtms-celery-anpr
+sudo systemctl enable --now patrol-anpr-celery
+sudo systemctl status patrol-anpr-celery
+```
+
+Healthy Celery: `celery@… ready` and registered task `visitor.anpr.tasks.process_anpr_frame`.
+
+### Troubleshoot systemd
+
+| Symptom | Cause | Fix |
+|---------|--------|-----|
+| `status=203/EXEC` | Wrong binary path | Use real `gtms_venv` paths; `ls` the ExecStart file |
+| Reader runs as **gunicorn** | Wrong ExecStart | Must be `python manage.py run_anpr_reader` |
+| `MySQL server has gone away` | Stale DB pool after idle | Deploy latest reader; keep `DB_POOL_RECYCLE≤280`; restart reader |
+| Celery inactive, reader OK | No OCR → no check-in/out | Fix/start `patrol-anpr-celery` |
+
+After deploying reader code:
+
+```bash
+sudo systemctl restart patrol-anpr-reader
+sudo systemctl restart patrol-anpr-celery
 ```
 
 ---
@@ -209,11 +238,11 @@ sudo systemctl enable --now gtms-celery-anpr
 ## Final picture on the server
 
 ```text
-1) gunicorn / daphne     → normal website API
-2) celery worker -B      → reports + beat  (+ anpr queue if Option A)
-3) gtms-anpr-reader      → WATCHES camera  ← new systemd service (required)
-4) mediamtx              → live view for guards (unchanged)
-5) (optional) celery -Q anpr   → only if Option B
+1) gunicorn / daphne           → normal website API
+2) celery worker -B            → reports + beat  (+ anpr queue if Option A)
+3) patrol-anpr-reader          → WATCHES camera  ← required
+4) mediamtx                    → live view for guards
+5) patrol-anpr-celery (opt B)  → OCR queue only
 ```
 
 Manual `python manage.py run_anpr_reader` = same as the reader service, but for a quick test in SSH.  

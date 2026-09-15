@@ -273,18 +273,133 @@ class CameraWorker:
                     pass
 
 
+def _is_mysql_gone_away(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "gone away" in msg
+        or "connection reset" in msg
+        or "lost connection" in msg
+        or "2006" in msg
+        or "2013" in msg
+    )
+
+
+def _configure_pool_no_rollback_on_return() -> None:
+    """
+    dj_db_conn_pool → SQLAlchemy QueuePool defaults to reset_on_return=rollback.
+    When a remote MySQL socket dies while idle, that ROLLBACK logs:
+      "Exception during reset or similar" / MySQL server has gone away
+    Disable reset-on-return for this long-lived process (reader is read-mostly).
+    """
+    try:
+        from dj_db_conn_pool.core import pool_container
+        from sqlalchemy.pool.base import ResetStyle
+
+        with pool_container.lock:
+            for pool in pool_container.values():
+                try:
+                    pool._reset_on_return = ResetStyle.reset_none
+                except Exception:
+                    try:
+                        pool._reset_on_return = None
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _release_db_connection() -> None:
+    """Return the thread-local connection to the pool immediately after use."""
+    from django.db import connections
+
+    _configure_pool_no_rollback_on_return()
+    for alias in connections:
+        conn = connections[alias]
+        try:
+            if conn.connection is None:
+                continue
+            # Invalidate if the socket is already dead (avoids ROLLBACK noise).
+            try:
+                raw = getattr(conn.connection, "driver_connection", None) or conn.connection
+                invalidate = getattr(conn.connection, "invalidate", None)
+                if callable(invalidate):
+                    # Probe without a full query when possible
+                    sock = getattr(raw, "_sock", None)
+                    if sock is None:
+                        invalidate()
+                        conn.connection = None
+                        continue
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception as exc:
+                if _is_mysql_gone_away(exc):
+                    try:
+                        conn.connection = None
+                    except Exception:
+                        pass
+                else:
+                    logger.debug("[ANPR_READER] release db: %s", exc)
+        except Exception as exc:
+            logger.debug("[ANPR_READER] release db alias=%s: %s", alias, exc)
+
+
+def _db_keepalive() -> None:
+    """Ping MySQL so the pool never sits idle past remote wait_timeout / firewalls."""
+    from django.db import connection
+    from django.db.utils import OperationalError as DjOperationalError
+
+    try:
+        connection.ensure_connection()
+        with connection.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception as exc:
+        if _is_mysql_gone_away(exc) or isinstance(exc, DjOperationalError):
+            logger.info("[ANPR_READER] DB keepalive reconnect after %s", type(exc).__name__)
+            try:
+                if connection.connection is not None:
+                    inv = getattr(connection.connection, "invalidate", None)
+                    if callable(inv):
+                        inv(exc)
+                connection.connection = None
+            except Exception:
+                pass
+            try:
+                connection.ensure_connection()
+                with connection.cursor() as cur:
+                    cur.execute("SELECT 1")
+            except Exception:
+                logger.warning("[ANPR_READER] DB keepalive failed — will retry next tick")
+        else:
+            logger.debug("[ANPR_READER] DB keepalive: %s", exc)
+    finally:
+        _release_db_connection()
+
+
 def load_cameras():
-    from django.db import close_old_connections, connection
-    from django.db.utils import OperationalError
+    """
+    Load enabled cameras. Always release the DB connection afterwards.
+
+    Root cause of the recurring ERROR: management commands keep a checked-out
+    connection for the whole process. After ANPR_CAMERA_REFRESH_SEC (~300s) of
+    RTSP-only work, remote MySQL has dropped the socket; close/dispose then
+    triggers SQLAlchemy ROLLBACK → "Exception during reset or similar".
+    """
+    from django.db.utils import OperationalError as DjOperationalError
     from scheduler.models import SiteCamera
 
+    try:
+        import pymysql
+
+        pymysql_errors: Tuple[type, ...] = (
+            pymysql.err.OperationalError,
+            pymysql.err.InterfaceError,
+        )
+    except ImportError:
+        pymysql_errors = ()
+
     def _fetch():
-        # dj_db_conn_pool (SQLAlchemy): force drop stale socket before long-idle query
-        close_old_connections()
-        try:
-            connection.close()
-        except Exception:
-            pass
         qs = (
             SiteCamera.objects.filter(is_enabled=True)
             .select_related("site")
@@ -293,15 +408,29 @@ def load_cameras():
         return list(qs[: anpr_settings.max_cameras()])
 
     try:
-        return _fetch()
-    except OperationalError:
-        logger.warning("[ANPR_READER] DB OperationalError — retry once with fresh connection")
-        close_old_connections()
         try:
-            connection.close()
-        except Exception:
-            pass
-        return _fetch()
+            return _fetch()
+        except Exception as exc:
+            catch_types = (DjOperationalError,) + pymysql_errors
+            if not isinstance(exc, catch_types) and not _is_mysql_gone_away(exc):
+                raise
+            logger.warning(
+                "[ANPR_READER] DB error on camera refresh (%s) — retry once",
+                type(exc).__name__,
+            )
+            try:
+                from django.db import connection
+
+                if connection.connection is not None:
+                    inv = getattr(connection.connection, "invalidate", None)
+                    if callable(inv):
+                        inv(exc)
+                    connection.connection = None
+            except Exception:
+                pass
+            return _fetch()
+    finally:
+        _release_db_connection()
 
 
 def run_reader_loop(*, once: bool = False) -> None:
@@ -311,6 +440,8 @@ def run_reader_loop(*, once: bool = False) -> None:
 
     interval = 1.0 / anpr_settings.detect_fps()
     refresh_every = float(anpr_settings.camera_refresh_sec())
+    # Keep below typical remote MySQL / NAT idle kills (~120–300s)
+    keepalive_every = float(os.environ.get("ANPR_DB_KEEPALIVE_SEC", "60"))
     workers: List[CameraWorker] = []
 
     def refresh_workers():
@@ -366,15 +497,20 @@ def run_reader_loop(*, once: bool = False) -> None:
 
     refresh_workers()
     last_refresh = time.monotonic()
+    last_keepalive = time.monotonic()
     logger.info(
-        "[ANPR_READER] started fps=%s interval=%.2fs camera_refresh=%ss",
+        "[ANPR_READER] started fps=%s interval=%.2fs camera_refresh=%ss db_keepalive=%ss",
         anpr_settings.detect_fps(),
         interval,
         int(refresh_every),
+        int(keepalive_every),
     )
 
     while True:
         loop_start = time.monotonic()
+        if loop_start - last_keepalive >= keepalive_every:
+            _db_keepalive()
+            last_keepalive = loop_start
         if loop_start - last_refresh >= refresh_every:
             refresh_workers()
             last_refresh = loop_start
