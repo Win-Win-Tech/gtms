@@ -223,6 +223,18 @@ After the systemd unit works, you do **not** start it by hand every time.
 
 ## Optional: set line/ROI
 
+ROI and virtual line are **optional per camera**. Empty `anpr_geometry` (`{}`) means
+capture-on-stable (full frame) — no default line/ROI is applied.
+
+**Admin UI (preferred):** Visitor → **CCTV Live** → **ANPR zone**
+- **Add ROI** / **Add line** — only when that org wants them
+- **Delete ROI** / **Delete line** / **Clear all** then **Save** — removes zone
+- Leave empty → reader captures without requiring a line cross
+
+Reader reloads geometry within `ANPR_CAMERA_REFRESH_SEC` (default 5 min).
+
+**Shell (optional):**
+
 ```bash
 python manage.py shell
 ```
@@ -230,10 +242,13 @@ python manage.py shell
 ```python
 from scheduler.models import SiteCamera
 c = SiteCamera.objects.filter(is_enabled=True).first()
+# Optional zone (omit roi and/or line keys you don't want):
 c.anpr_geometry = {
   "roi": {"x1": 0.05, "y1": 0.25, "x2": 0.95, "y2": 0.98},
   "line": {"x1": 0.0, "y1": 0.55, "x2": 1.0, "y2": 0.55},
 }
+# Or clear for capture-only:
+# c.anpr_geometry = {}
 c.save(update_fields=["anpr_geometry", "modified_on"])
 ```
 

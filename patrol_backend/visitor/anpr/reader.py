@@ -205,24 +205,35 @@ class CameraWorker:
                         "sharpness": sharp,
                     }
 
-            # Event: line crossed + stable
-            ready = (
-                tr.crossed
-                and tr.hits >= min_hits
-                and tr.state == "STABLE"
-                and tr.best_jpeg
-            )
-            # Fallback if camera has no useful line motion (parked test): stable in ROI long enough
-            if (
-                not ready
-                and tr.hits >= max(min_hits + 2, 4)
-                and tr.state == "STABLE"
-                and tr.best_jpeg
-                and point_in_roi(tr.nx, tr.ny, self.roi)
-            ):
-                # Only for toggle/test when vehicle sits in ROI without crossing
-                ready = True
-                tr.cross_dir = 0
+            # Event: line crossed + stable (only meaningful when a virtual line is set)
+            ready = False
+            if self.line is not None:
+                ready = (
+                    tr.crossed
+                    and tr.hits >= min_hits
+                    and tr.state == "STABLE"
+                    and tr.best_jpeg
+                )
+                # Parked / weak motion: stable in ROI (or full frame) without a clean cross
+                if (
+                    not ready
+                    and tr.hits >= max(min_hits + 2, 4)
+                    and tr.state == "STABLE"
+                    and tr.best_jpeg
+                    and point_in_roi(tr.nx, tr.ny, self.roi)
+                ):
+                    ready = True
+                    tr.cross_dir = 0
+            else:
+                # No virtual line: capture when track is stable (ROI optional filter)
+                if (
+                    tr.hits >= max(min_hits + 2, 4)
+                    and tr.state == "STABLE"
+                    and tr.best_jpeg
+                    and point_in_roi(tr.nx, tr.ny, self.roi)
+                ):
+                    ready = True
+                    tr.cross_dir = 0
 
             if not ready:
                 continue

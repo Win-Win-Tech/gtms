@@ -44,6 +44,7 @@ def _camera_live_payload(camera: SiteCamera) -> dict:
         "hls_url": mediamtx.build_hls_url(path),
         "whep_url": mediamtx.build_whep_url(path),
         "sort_order": camera.sort_order,
+        "anpr_geometry": camera.anpr_geometry or {},
     }
 
 
