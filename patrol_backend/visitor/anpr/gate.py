@@ -127,9 +127,14 @@ def apply_gate_event(
     confidence: Optional[float] = None,
     evidence_path: Optional[str] = None,
     yolo_label: Optional[str] = None,
+    gate_mode: str = "parked_toggle",
 ) -> Dict[str, Any]:
     """
     Create check-in or check-out for a CCTV plate event.
+
+    gate_mode:
+      parked_toggle  — action from direction_mode + open-entry (testing / parked OK)
+      line_direction — action from cross_dir (+1=in, -1=out); direction_mode can restrict lane
 
     direction_mode: toggle | in | out (SiteCamera.direction)
 
@@ -178,11 +183,103 @@ def apply_gate_event(
         .first()
     )
 
+    # Same physical vehicle, OCR read differently (e.g. TN60S2542 vs TN6O82342SMA)
+    if not open_entry:
+        from .plate_stabilize import _similar, plate_quality_score
+
+        fuzzy_open = (
+            VisitorEntry.objects.select_for_update()
+            .filter(
+                site=site,
+                status=VisitorEntry.STATUS_CHECKED_IN,
+                entry_source=VisitorEntry.ENTRY_CCTV,
+                is_deleted=False,
+            )
+            .exclude(vehicle_number="")
+            .select_related("visitor")
+            .order_by("-check_in_time")[:25]
+        )
+        best = None
+        best_score = -1
+        for cand in fuzzy_open:
+            other = normalize_plate(cand.vehicle_number or "")
+            if not other or not _similar(plate, other):
+                continue
+            # Prefer higher-quality open plate as canonical
+            q = plate_quality_score(other)
+            if q > best_score:
+                best = cand
+                best_score = q
+        if best is not None:
+            open_entry = best
+            # Prefer the open entry's plate spelling going forward
+            other = normalize_plate(best.vehicle_number or "")
+            logger.info(
+                "[ANPR_GATE] fuzzy matched open ocr=%s -> canonical=%s entry=%s",
+                plate,
+                other,
+                best.id,
+            )
+            plate = other or plate
+            visitor = best.visitor
+            ic = synthetic_ic(plate)
+            if visitor.visitor_name != plate or visitor.ic_passport_number != ic:
+                visitor.visitor_name = plate
+                visitor.ic_passport_number = ic
+                visitor.save(
+                    update_fields=[
+                        "visitor_name",
+                        "ic_passport_number",
+                        "modified_on",
+                    ]
+                )
+
     mode = (direction_mode or "toggle").lower()
     if mode not in ("toggle", "in", "out"):
         mode = "toggle"
+    gmode = (gate_mode or "parked_toggle").strip().lower() or "parked_toggle"
 
-    if mode == "in":
+    if gmode == "line_direction":
+        # +1 = entry (check-in), -1 = exit (check-out). Flip by drawing the line opposite way.
+        cd = int(cross_dir or 0)
+        if cd == 0:
+            return {
+                "ok": False,
+                "reason": "no_cross_dir",
+                "plate": plate,
+                "gate_mode": gmode,
+            }
+        action = "check_in" if cd > 0 else "check_out"
+        # Dedicated lane filter still applies
+        if mode == "in" and action != "check_in":
+            return {
+                "ok": False,
+                "reason": "lane_entry_only",
+                "plate": plate,
+                "cross_dir": cd,
+            }
+        if mode == "out" and action != "check_out":
+            return {
+                "ok": False,
+                "reason": "lane_exit_only",
+                "plate": plate,
+                "cross_dir": cd,
+            }
+        if action == "check_in" and open_entry:
+            return {
+                "ok": False,
+                "reason": "already_in",
+                "plate": plate,
+                "cross_dir": cd,
+            }
+        if action == "check_out" and not open_entry:
+            return {
+                "ok": False,
+                "reason": "no_open_entry",
+                "plate": plate,
+                "cross_dir": cd,
+            }
+    elif mode == "in":
         if open_entry:
             return {"ok": False, "reason": "already_in", "plate": plate}
         action = "check_in"
@@ -192,6 +289,9 @@ def apply_gate_event(
         action = "check_out"
     else:
         action = "check_out" if open_entry else "check_in"
+
+    if action == "check_out" and open_entry and not vehicle_type:
+        vehicle_type = open_entry.vehicle_type or vehicle_type
 
     now = timezone.now()
     if action == "check_in":
@@ -217,14 +317,24 @@ def apply_gate_event(
             evidence_path=evidence_path,
             plate=plate,
         )
+        # Also as "additional" so Visitors list Entry Photos column shows it
+        # (same as manual registration vehicle photos).
+        if asset_id:
+            _attach_anpr_evidence(
+                entry,
+                asset_type=VisitorAsset.ASSET_ADDITIONAL,
+                evidence_path=evidence_path,
+                plate=plate,
+            )
         set_cooldown(str(site.id), plate)
         logger.info(
-            "[ANPR_GATE] CHECK_IN plate=%s entry=%s site=%s conf=%s cross_dir=%s "
+            "[ANPR_GATE] CHECK_IN plate=%s entry=%s site=%s conf=%s gate_mode=%s cross_dir=%s "
             "yolo=%s vehicle_type=%s evidence=%s asset=%s",
             plate,
             entry.id,
             site.id,
             confidence,
+            gmode,
             cross_dir,
             yolo_label,
             vehicle_type,
@@ -255,11 +365,12 @@ def apply_gate_event(
     )
     set_cooldown(str(site.id), plate)
     logger.info(
-        "[ANPR_GATE] CHECK_OUT plate=%s entry=%s site=%s conf=%s cross_dir=%s asset=%s",
+        "[ANPR_GATE] CHECK_OUT plate=%s entry=%s site=%s conf=%s gate_mode=%s cross_dir=%s asset=%s",
         plate,
         open_entry.id,
         site.id,
         confidence,
+        gmode,
         cross_dir,
         asset_id,
     )

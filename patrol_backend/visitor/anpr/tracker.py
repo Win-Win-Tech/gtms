@@ -31,13 +31,15 @@ class Track:
     ny: float = 0.5
     box_norm: Tuple[float, float, float, float] = (0, 0, 0, 0)
     conf: float = 0.0
+    vehicle_label: str = ""
     line_side: int = 0
     prev_line_side: int = 0
     crossed: bool = False
     cross_dir: int = 0  # +1 or -1 when crossed
     state: str = "CANDIDATE"  # CANDIDATE|STABLE|OCR_QUEUED|COMMITTED|COOLDOWN
     best_sharpness: float = -1.0
-    best_jpeg: Optional[bytes] = None
+    best_jpeg: Optional[bytes] = None  # plate zoom — OCR only
+    best_evidence_jpeg: Optional[bytes] = None  # full frame / vehicle — visitor photos
     best_meta: Dict[str, Any] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
@@ -59,8 +61,10 @@ class SimpleTracker:
 
     def update(
         self,
-        detections: List[Tuple[float, float, float, Tuple[float, float, float, float], float]],
-        # each: nx, ny, line_side, box_norm(x1,y1,x2,y2), conf
+        detections: List[
+            Tuple[float, float, int, Tuple[float, float, float, float], float, str]
+        ],
+        # each: nx, ny, line_side, box_norm, conf, vehicle_label
     ) -> List[Track]:
         assigned: Dict[str, bool] = {}
         used_det = set()
@@ -68,14 +72,14 @@ class SimpleTracker:
         # Greedy match by IoU
         for tid, tr in list(self.tracks.items()):
             best_j, best_iou = -1, 0.0
-            for j, (nx, ny, side, box_n, conf) in enumerate(detections):
+            for j, (nx, ny, side, box_n, conf, veh_label) in enumerate(detections):
                 if j in used_det:
                     continue
                 score = _iou(tr.box_norm, box_n)
                 if score > best_iou:
                     best_iou, best_j = score, j
             if best_j >= 0 and best_iou >= self.iou_thresh:
-                nx, ny, side, box_n, conf = detections[best_j]
+                nx, ny, side, box_n, conf, veh_label = detections[best_j]
                 used_det.add(best_j)
                 tr.prev_line_side = tr.line_side
                 tr.line_side = side
@@ -90,6 +94,8 @@ class SimpleTracker:
                 tr.nx, tr.ny = nx, ny
                 tr.box_norm = box_n
                 tr.conf = conf
+                if veh_label:
+                    tr.vehicle_label = veh_label
                 tr.hits += 1
                 tr.misses = 0
                 tr.updated_at = time.monotonic()
@@ -100,7 +106,7 @@ class SimpleTracker:
                 tr.misses += 1
                 tr.updated_at = time.monotonic()
 
-        for j, (nx, ny, side, box_n, conf) in enumerate(detections):
+        for j, (nx, ny, side, box_n, conf, veh_label) in enumerate(detections):
             if j in used_det:
                 continue
             tid = self._new_id()
@@ -110,6 +116,7 @@ class SimpleTracker:
                 ny=ny,
                 box_norm=box_n,
                 conf=conf,
+                vehicle_label=veh_label or "",
                 line_side=side,
                 prev_line_side=side,
             )

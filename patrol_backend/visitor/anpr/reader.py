@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from django.conf import settings
 
-from visitor.ai.detect import detect_plates
+from visitor.ai.detect import detect_plates, detect_vehicles
 
 from . import settings_helpers as anpr_settings
 from .geometry import (
@@ -39,6 +39,7 @@ def _camera_config_key(camera) -> Tuple:
         str(camera.id),
         str(getattr(camera, "rtsp_url", "") or ""),
         str(getattr(camera, "direction", "") or "toggle"),
+        str(getattr(camera, "gate_mode", "") or "parked_toggle"),
         str(getattr(camera, "site_id", "") or ""),
         str(getattr(getattr(camera, "site", None), "location_id", "") or ""),
         geom_s,
@@ -78,10 +79,20 @@ class CameraWorker:
         self.camera = camera
         self.config_key = _camera_config_key(camera)
         self.roi, self.line = parse_geometry(getattr(camera, "anpr_geometry", None) or {})
+        self.gate_mode = (
+            str(getattr(camera, "gate_mode", "") or "parked_toggle").strip().lower()
+            or "parked_toggle"
+        )
         self.tracker = SimpleTracker(camera_key=str(camera.id)[:8])
         self.cap: Optional[cv2.VideoCapture] = None
         self.last_detect_at = 0.0
         self.reconnect_at = 0.0
+        if self.gate_mode == "line_direction" and self.line is None:
+            logger.warning(
+                "[ANPR_READER] camera=%s gate_mode=line_direction but no virtual line — "
+                "events will not fire until a line is set in CCTV Live → ANPR zone",
+                camera.id,
+            )
 
     def close(self) -> None:
         if self.cap is not None:
@@ -161,7 +172,8 @@ class CameraWorker:
                 continue
             side = line_side(nx, ny, self.line)
             box_n = (x1 / w, y1 / h, x2 / w, y2 / h)
-            detections.append((nx, ny, side, box_n, float(p.confidence)))
+            veh_label = (getattr(p, "label", "") or "").strip().lower()
+            detections.append((nx, ny, side, box_n, float(p.confidence), veh_label))
 
         tracks = self.tracker.update(detections)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -188,6 +200,7 @@ class CameraWorker:
                 tr.crossed = False
                 tr.cross_dir = 0
                 tr.best_jpeg = None
+                tr.best_evidence_jpeg = None
                 tr.best_sharpness = -1.0
                 tr.best_meta = {}
                 tr.hits = min_hits  # need a few more frames before parked fallback
@@ -195,26 +208,70 @@ class CameraWorker:
 
             # Update best frame while tracking
             if tr.state in ("CANDIDATE", "STABLE") and sharp >= tr.best_sharpness:
-                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                if ok:
+                # Plate-centered zoom for OCR (distant park); full frame kept for evidence.
+                enc_src = frame
+                bn = tr.box_norm
+                if bn and len(bn) == 4:
+                    try:
+                        x1n, y1n, x2n, y2n = [float(v) for v in bn]
+                        bw = max(0.01, x2n - x1n)
+                        bh = max(0.01, y2n - y1n)
+                        # Expand to ~min 28% width / 18% height of frame around plate
+                        need_w = max(bw * 3.0, 0.28)
+                        need_h = max(bh * 3.0, 0.18)
+                        cx = (x1n + x2n) / 2.0
+                        cy = (y1n + y2n) / 2.0
+                        x1 = max(0.0, cx - need_w / 2.0)
+                        y1 = max(0.0, cy - need_h / 2.0)
+                        x2 = min(1.0, cx + need_w / 2.0)
+                        y2 = min(1.0, cy + need_h / 2.0)
+                        px1, py1 = int(x1 * w), int(y1 * h)
+                        px2, py2 = int(x2 * w), int(y2 * h)
+                        if px2 > px1 + 20 and py2 > py1 + 20:
+                            enc_src = frame[py1:py2, px1:px2]
+                    except (TypeError, ValueError):
+                        enc_src = frame
+                ok_ocr, buf_ocr = cv2.imencode(
+                    ".jpg", enc_src, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+                )
+                ok_ev, buf_ev = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+                )
+                if ok_ocr and ok_ev:
                     tr.best_sharpness = sharp
-                    tr.best_jpeg = buf.tobytes()
+                    tr.best_jpeg = buf_ocr.tobytes()
+                    tr.best_evidence_jpeg = buf_ev.tobytes()
                     tr.best_meta = {
                         "conf": tr.conf,
                         "box_norm": tr.box_norm,
                         "sharpness": sharp,
+                        "label": tr.vehicle_label or "",
+                        "zoom_crop": enc_src is not frame,
                     }
 
-            # Event: line crossed + stable (only meaningful when a virtual line is set)
+            # Event readiness depends on gate_mode:
+            # - parked_toggle: line cross OR stable/parked in ROI (testing)
+            # - line_direction: virtual-line cross required (real gate)
             ready = False
-            if self.line is not None:
+            line_mode = self.gate_mode == "line_direction"
+            if line_mode:
+                if self.line is None:
+                    continue
+                ready = (
+                    tr.crossed
+                    and int(tr.cross_dir or 0) != 0
+                    and tr.hits >= min_hits
+                    and tr.state == "STABLE"
+                    and tr.best_jpeg
+                )
+            elif self.line is not None:
                 ready = (
                     tr.crossed
                     and tr.hits >= min_hits
                     and tr.state == "STABLE"
                     and tr.best_jpeg
                 )
-                # Parked / weak motion: stable in ROI (or full frame) without a clean cross
+                # Parked / weak motion: stable in ROI without a clean cross
                 if (
                     not ready
                     and tr.hits >= max(min_hits + 2, 4)
@@ -238,12 +295,82 @@ class CameraWorker:
             if not ready:
                 continue
 
+            # Vehicle class + box for evidence crop (plate YOLO only returns license_plate)
+            veh_label = (tr.vehicle_label or "").strip().lower()
+            chosen_vehicle = None
+            try:
+                vehicles = detect_vehicles(frame, conf=0.35)
+                if vehicles:
+                    px, py = tr.nx, tr.ny
+                    chosen_vehicle = vehicles[0]
+                    for v in vehicles:
+                        x1, y1, x2, y2 = v.x1 / w, v.y1 / h, v.x2 / w, v.y2 / h
+                        if x1 <= px <= x2 and y1 <= py <= y2:
+                            chosen_vehicle = v
+                            break
+                    if veh_label in (
+                        "",
+                        "license_plate",
+                        "plate",
+                        "number_plate",
+                        "full_frame",
+                    ):
+                        veh_label = (chosen_vehicle.label or "").strip().lower()
+            except Exception as exc:
+                logger.debug("[ANPR_READER] vehicle detect skipped: %s", exc)
+
+            meta = dict(tr.best_meta or {})
+            if veh_label and veh_label not in (
+                "license_plate",
+                "plate",
+                "number_plate",
+                "full_frame",
+            ):
+                meta["label"] = veh_label
+                meta["vehicle_label"] = veh_label
+
+            # Evidence JPEG: prefer padded vehicle crop, else full frame (never plate zoom).
+            evidence_bytes = tr.best_evidence_jpeg or tr.best_jpeg
+            if chosen_vehicle is not None:
+                try:
+                    pad = 0.12
+                    x1 = max(0, int(chosen_vehicle.x1 - pad * w))
+                    y1 = max(0, int(chosen_vehicle.y1 - pad * h))
+                    x2 = min(w, int(chosen_vehicle.x2 + pad * w))
+                    y2 = min(h, int(chosen_vehicle.y2 + pad * h))
+                    if x2 > x1 + 40 and y2 > y1 + 40:
+                        ok_v, buf_v = cv2.imencode(
+                            ".jpg",
+                            frame[y1:y2, x1:x2],
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+                        )
+                        if ok_v:
+                            evidence_bytes = buf_v.tobytes()
+                            meta["evidence"] = "vehicle_crop"
+                except Exception as exc:
+                    logger.debug("[ANPR_READER] vehicle evidence crop failed: %s", exc)
+            if not meta.get("evidence"):
+                meta["evidence"] = "full_frame" if tr.best_evidence_jpeg else "ocr_fallback"
+
             path = None
+            ocr_path = None
             try:
                 name = f"{tr.track_id}-{int(time.time() * 1000)}.jpg".replace("/", "_")
                 path = os.path.join(_pending_dir(), name)
                 with open(path, "wb") as f:
-                    f.write(tr.best_jpeg)
+                    f.write(evidence_bytes)
+                # Separate plate-zoom file for OCR when we have one
+                if (
+                    tr.best_jpeg
+                    and tr.best_evidence_jpeg
+                    and tr.best_jpeg != tr.best_evidence_jpeg
+                    and meta.get("zoom_crop")
+                ):
+                    ocr_path = os.path.join(
+                        _pending_dir(), name.replace(".jpg", "_ocr.jpg")
+                    )
+                    with open(ocr_path, "wb") as f:
+                        f.write(tr.best_jpeg)
             except OSError as exc:
                 logger.warning("[ANPR_READER] jpeg write failed: %s", exc)
                 continue
@@ -254,23 +381,29 @@ class CameraWorker:
                 "location_id": str(self.camera.site.location_id),
                 "track_id": tr.track_id,
                 "direction_mode": self.camera.direction or "toggle",
+                "gate_mode": self.gate_mode,
                 "captured_at": datetime.now(dt_timezone.utc).isoformat(),
                 "jpeg_path": path,
+                "ocr_jpeg_path": ocr_path,
                 "cross_dir": int(tr.cross_dir or 0),
-                "detect_meta": tr.best_meta,
+                "detect_meta": meta,
             }
             task_id = enqueue_anpr_frame(payload)
             if task_id:
                 tr.state = "OCR_QUEUED"
                 tr.crossed = False
                 tr.best_jpeg = None
+                tr.best_evidence_jpeg = None
                 tr.queued_at = now_m
             else:
                 # backpressure — delete unused jpeg
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                for p in (path, ocr_path):
+                    if not p:
+                        continue
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
 
 
 def _is_mysql_gone_away(exc: BaseException) -> bool:

@@ -145,9 +145,15 @@ class SiteCamera(models.Model):
     """
 
     class Direction(models.TextChoices):
-        TOGGLE = "toggle", "Toggle in/out"
-        IN = "in", "Entry only"
-        OUT = "out", "Exit only"
+        TOGGLE = "toggle", "Both entry and exit"
+        IN = "in", "Entry only (check-in)"
+        OUT = "out", "Exit only (check-out)"
+
+    class GateMode(models.TextChoices):
+        # Fire when plate is stable in view (parked OK) — good for testing
+        PARKED_TOGGLE = "parked_toggle", "Whenever plate is seen (good for testing)"
+        # Fire only when vehicle crosses the virtual line; cross side = in/out
+        LINE_DIRECTION = "line_direction", "Only when vehicle crosses the line"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     site = models.ForeignKey(
@@ -161,7 +167,16 @@ class SiteCamera(models.Model):
         max_length=16,
         choices=Direction.choices,
         default=Direction.TOGGLE,
-        help_text="toggle = flip check-in/out; in/out = dedicated lane (future)",
+        help_text="Lane type: both entry/exit, or entry-only / exit-only",
+    )
+    gate_mode = models.CharField(
+        max_length=32,
+        choices=GateMode.choices,
+        default=GateMode.PARKED_TOGGLE,
+        help_text=(
+            "When to record: whenever plate is seen (testing), "
+            "or only when vehicle crosses the virtual line"
+        ),
     )
     is_enabled = models.BooleanField(
         default=True,

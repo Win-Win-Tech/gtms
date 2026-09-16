@@ -9,6 +9,8 @@ import logging
 from datetime import timedelta
 from typing import Iterable, List, Optional, Tuple
 
+import re
+
 from django.core.cache import cache
 from django.utils import timezone
 
@@ -19,19 +21,37 @@ from .gate import normalize_plate
 logger = logging.getLogger(__name__)
 
 
+def _format_score(plate: str) -> int:
+    """Prefer structured plates over long OCR garbage (mirrors parse._plate_format_score)."""
+    p = normalize_plate(plate)
+    if not p:
+        return 0
+    if re.match(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$", p):
+        return 100 + len(p)
+    if len(p) > 11:
+        return max(0, 40 - (len(p) - 11) * 8)
+    if any(c.isalpha() for c in p) and any(c.isdigit() for c in p):
+        return 50 + min(len(p), 10)
+    return 10
+
+
 def plate_quality_score(plate: str) -> int:
     """
     Generic preference only (not country-specific):
-    - longer strings beat truncated OCR
+    - structured plates beat long OCR garbage
     - mixed letters+digits slightly preferred over all-one-type noise
     """
     p = normalize_plate(plate)
     if not p:
         return 0
+    fmt = _format_score(p)
     has_alpha = any(c.isalpha() for c in p)
     has_digit = any(c.isdigit() for c in p)
     mix = 2 if (has_alpha and has_digit) else 0
-    return len(p) * 10 + mix
+    length_bonus = min(len(p), 10) * 3
+    if len(p) > 11:
+        length_bonus -= (len(p) - 11) * 15
+    return fmt + length_bonus + mix
 
 
 def edit_distance(a: str, b: str) -> int:
@@ -71,7 +91,16 @@ def _similar(a: str, b: str) -> bool:
     a, b = normalize_plate(a), normalize_plate(b)
     if not a or not b:
         return False
-    return edit_distance(a, b) <= _max_dist(a, b)
+    if a == b:
+        return True
+    d = edit_distance(a, b)
+    # Keep tight — dist=2 merged TN60S2542 with TNS052542 (wrong vehicle).
+    # Allow 1 char OCR slip (0/O, 8/B) on plates of similar length.
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if min(len(a), len(b)) < 7:
+        return d <= 1
+    return d <= 1
 
 
 def _prefer(a: str, b: str) -> str:

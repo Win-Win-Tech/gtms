@@ -161,6 +161,41 @@ def _is_date_noise_text(text: str) -> bool:
     return False
 
 
+# CCTV OSD / watermark text (timestamps, vendor strings) — never treat as plates
+_OSD_WATERMARK_RE = re.compile(
+    r"(?:Smart\s*Patrol|Smart\s*Surveillance|\bSMA\b|WEDSMA|"
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b|"
+    r"\b\d{2}-\d{2}-\d{4}\b|"
+    r"\d{1,2}\s*[\.:]\s*\d{1,2}\s*[\.:]\s*\d{2})",
+    re.IGNORECASE,
+)
+_TIMESTAMP_OSD_RE = re.compile(
+    r"^\d{1,4}\s*[\.:]\s*\d{1,2}\s*[\.:]\s*\d{1,2}",
+    re.IGNORECASE,
+)
+_DAY_SUFFIX_RE = re.compile(r"(?:MON|TUE|WED|THU|FRI|SAT|SUN)", re.IGNORECASE)
+
+
+def _is_osd_watermark_text(text: str) -> bool:
+    """True when OCR line is camera overlay / timestamp, not a plate."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _is_date_noise_text(t):
+        return True
+    if _OSD_WATERMARK_RE.search(t):
+        return True
+    if _TIMESTAMP_OSD_RE.match(t):
+        return True
+    if re.fullmatch(r"\d{1,2}-\d{1,2}-\d{4}", t):
+        return True
+    return False
+
+
+def _is_ocr_noise_line(text: str) -> bool:
+    return _is_date_noise_text(text) or _is_osd_watermark_text(text)
+
+
 def _find_mykad_candidates(text: str, score: float) -> List[Tuple[str, float, str]]:
     out: List[Tuple[str, float, str]] = []
     if _is_date_noise_text(text):
@@ -371,53 +406,303 @@ def extract_id_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str, flo
     return candidates[0]
 
 
+# Indian plates are often OCR'd as two lines: "TN.60" + "S.2542" → TN60S2542
+_IN_STATE_PART_RE = re.compile(r"^([A-Z]{2})[\s.\-]*(\d{1,2})$", re.IGNORECASE)
+_IN_STATE_PART_LOOSE_RE = re.compile(
+    r"^([A-Z]{2})[\s.\-]*([A-Z0-9]{1,2})$", re.IGNORECASE
+)
+_IN_SERIES_PART_RE = re.compile(r"^([A-Z]{1,3})[\s.\-]*(\d{1,4})$", re.IGNORECASE)
+_IN_FULL_COMPACT_RE = re.compile(r"^([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{1,4})$")
+_SERIES_LETTER_FROM_DIGIT = {"5": "S", "8": "B", "0": "O"}
+
+
+def is_rejected_anpr_plate(
+    plate: str,
+    source_lines: Optional[Sequence[Tuple[str, float]]] = None,
+) -> bool:
+    """
+    True when a normalized plate string is likely OSD/timestamp garbage (ANPR gate).
+    """
+    p = _normalize_plate_token(plate)
+    if not p or len(p) < 5:
+        return True
+    if p.endswith("SMA") and len(p) > 8:
+        return True
+    if _DAY_SUFFIX_RE.search(p):
+        return True
+    # Timestamp blobs like 12.13:05-Wed → 1305WEDSMA
+    if re.match(r"^\d{4,}", p) and not _IN_FULL_COMPACT_RE.match(p):
+        return True
+    if source_lines:
+        useful = [
+            t
+            for t, _ in source_lines
+            if t and not _is_ocr_noise_line(t)
+        ]
+        if not useful:
+            return True
+        joined = " ".join(useful)
+        if _is_osd_watermark_text(joined) and not _IN_FULL_COMPACT_RE.match(p):
+            return True
+    return False
+
+
+def _ocr_fix_digits(segment: str) -> str:
+    """Common OCR confusions inside numeric parts of plates."""
+    out = []
+    for ch in segment:
+        if ch in "OQD":
+            out.append("0")
+        elif ch in "IL":
+            out.append("1")
+        elif ch in "SB":
+            out.append("8")
+        elif ch in "Z":
+            out.append("2")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _ocr_fix_district(segment: str) -> str:
+    """District on Indian plates is numeric (1–99); fix common letter confusions."""
+    out = []
+    for ch in (segment or "").upper():
+        if ch.isdigit():
+            out.append(ch)
+        elif ch in "OQD":
+            out.append("0")
+        elif ch in "IL":
+            out.append("1")
+        elif ch == "B":
+            out.append("8")
+        elif ch == "S":
+            out.append("6")
+        elif ch in "Z":
+            out.append("2")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _parse_indian_state_line(raw: str) -> Optional[Tuple[str, str]]:
+    """Parse TN.60 / TN.S0 style first line → (state, district)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for pattern in (_IN_STATE_PART_RE, _IN_STATE_PART_LOOSE_RE):
+        m = pattern.match(raw) or pattern.match(_normalize_plate_token(raw))
+        if not m:
+            continue
+        state = re.sub(r"[^A-Z]", "", m.group(1).upper())
+        dist = _ocr_fix_district(m.group(2))
+        if state and dist.isdigit() and 1 <= int(dist) <= 99:
+            return state, dist
+    compact = _normalize_plate_token(raw)
+    if len(compact) >= 4 and compact[:2].isalpha():
+        state = compact[:2]
+        dist = _ocr_fix_district(compact[2:4])
+        if dist.isdigit() and 1 <= int(dist) <= 99:
+            return state, dist
+    return None
+
+
+def _parse_indian_series_line(raw: str) -> Optional[Tuple[str, str]]:
+    """Parse S.2542 / 52542 style second line → (series, number)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    m = _IN_SERIES_PART_RE.match(raw) or _IN_SERIES_PART_RE.match(
+        _normalize_plate_token(raw)
+    )
+    if m:
+        series = re.sub(r"[^A-Z]", "", m.group(1).upper())
+        number = _ocr_fix_digits(m.group(2))
+        if series and number:
+            return series, number
+    compact = _normalize_plate_token(raw)
+    if re.fullmatch(r"5\d{4}", compact):
+        return "S", _ocr_fix_digits(compact[1:])
+    if re.fullmatch(r"\d{5}", compact):
+        letter = _SERIES_LETTER_FROM_DIGIT.get(compact[0], "")
+        number = _ocr_fix_digits(compact[1:])
+        if letter and len(number) == 4:
+            return letter, number
+    if re.fullmatch(r"\d{4}", compact):
+        return "", _ocr_fix_digits(compact)
+    return None
+
+
+def _normalize_plate_token(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", text or "").upper()
+
+
+def _format_indian_plate(state: str, dist: str, series: str, number: str) -> str:
+    dist = _ocr_fix_digits(dist)
+    number = _ocr_fix_digits(number)
+    series = re.sub(r"[^A-Z]", "", series.upper())
+    state = re.sub(r"[^A-Z]", "", state.upper())
+    plate = f"{state}{dist}{series}{number}"
+    if 8 <= len(plate) <= 10 and _IN_FULL_COMPACT_RE.match(plate):
+        return plate
+    return ""
+
+
+def _indian_two_line_candidates(lines: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+    """Merge consecutive OCR lines that look like Indian state + series rows."""
+    out: List[Tuple[str, float]] = []
+    if not lines:
+        return out
+    for i, (t1, s1) in enumerate(lines):
+        if _is_ocr_noise_line(t1 or ""):
+            continue
+        parsed_state = _parse_indian_state_line(t1 or "")
+        if not parsed_state:
+            continue
+        state, dist = parsed_state
+        for j in range(i + 1, min(i + 4, len(lines))):
+            t2, s2 = lines[j]
+            if _is_ocr_noise_line(t2 or ""):
+                continue
+            parsed_series = _parse_indian_series_line(t2 or "")
+            if not parsed_series:
+                continue
+            series, number = parsed_series
+            if not series and dist:
+                # e.g. TN.60 on line 1 and bare 2542 on line 2 — rare, skip
+                continue
+            plate = _format_indian_plate(state, dist, series, number)
+            if plate:
+                conf = float(min(0.99, (float(s1) + float(s2)) / 2.0 + 0.08))
+                out.append((plate, conf))
+    return out
+
+
+def _indian_compact_candidates(text: str, score: float) -> List[Tuple[str, float]]:
+    """Extract TN60S2542-style plates from a noisy merged OCR blob."""
+    out: List[Tuple[str, float]] = []
+    compact = _normalize_plate_token(text)
+    if len(compact) < 8:
+        return out
+    # Prefer a tight Indian match inside long garbage (e.g. TN6O82342SMA → TN60S2542)
+    for m in _IN_FULL_COMPACT_RE.finditer(compact):
+        raw = m.group(0)
+        fixed = _format_indian_plate(m.group(1), m.group(2), m.group(3), m.group(4))
+        if fixed:
+            penalty = 0.02 * max(0, len(compact) - len(fixed))
+            out.append((fixed, float(score) * (0.95 - penalty)))
+    # Brute-force split when regex on merged blob fails (O in district code)
+    if not out and len(compact) >= 8:
+        for dist_len in (2, 1):
+            if len(compact) < 2 + dist_len + 5:
+                continue
+            state = compact[:2]
+            dist = _ocr_fix_digits(compact[2 : 2 + dist_len])
+            rest = compact[2 + dist_len :]
+            for series_len in (1, 2, 3):
+                if len(rest) <= series_len:
+                    continue
+                series = rest[:series_len]
+                number = _ocr_fix_digits(rest[series_len:])
+                if len(number) != 4:
+                    continue
+                plate = _format_indian_plate(state, dist, series, number)
+                if plate:
+                    out.append((plate, float(score) * 0.88))
+    return out
+
+
+def _plate_format_score(plate: str) -> int:
+    """Higher = more likely a real plate (not OCR garbage)."""
+    p = _normalize_plate_token(plate)
+    if not p:
+        return 0
+    if _IN_FULL_COMPACT_RE.match(p):
+        return 100 + len(p)
+    if re.match(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$", p):
+        return 90 + len(p)
+    if len(p) > 11:
+        return max(0, 40 - (len(p) - 11) * 8)
+    if any(c.isalpha() for c in p) and any(c.isdigit() for c in p):
+        return 50 + min(len(p), 10)
+    return 10
+
+
 def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str, float]]:
     """
     Returns (normalized_plate, confidence) or None.
 
     Country-agnostic: accepts common letter+digit plate patterns worldwide.
-    Prefers longer, higher-confidence candidates (avoids truncated OCR).
+    Prefers structured Indian two-line plates and penalises long OCR garbage.
     """
     if not lines:
         return None
-    candidates = []
+    candidates: List[Tuple[str, float]] = []
+
+    # Highest priority: Indian two-line (TN.60 + S.2542)
+    candidates.extend(_indian_two_line_candidates(lines))
+
     for text, score in lines:
-        if _is_date_noise_text(text):
+        if _is_ocr_noise_line(text):
             continue
-        compact = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+        compact = _normalize_plate_token(text)
+        candidates.extend(_indian_compact_candidates(text, float(score)))
+
         m = IN_PLATE_RE.search(text)
         if m:
-            plate = f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}".upper()
-            if 5 <= len(plate) <= 12:
+            plate = _format_indian_plate(m.group(1), m.group(2), m.group(3), m.group(4))
+            if not plate:
+                plate = f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}".upper()
+            if 5 <= len(plate) <= 10:
                 candidates.append((plate, float(score)))
+
         m2 = re.search(r"([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4})", compact)
-        if m2 and 5 <= len(m2.group(1)) <= 12:
+        if m2 and 8 <= len(m2.group(1)) <= 10:
             candidates.append((m2.group(1), float(score)))
+
         m3 = MY_PLATE_RE.search(text)
         if m3:
             plate = f"{m3.group(1)}{m3.group(2)}{m3.group(3) or ''}".upper()
             if 5 <= len(plate) <= 12:
                 candidates.append((plate, float(score) * 0.9))
-        # Generic worldwide: mixed alnum token (no national layout required)
-        if 5 <= len(compact) <= 12:
+
+        if 5 <= len(compact) <= 10:
             has_a = any(c.isalpha() for c in compact)
             has_d = any(c.isdigit() for c in compact)
             if has_a and has_d:
                 candidates.append((compact, float(score) * 0.85))
 
     if not candidates:
-        blob = re.sub(r"[^A-Za-z0-9]", "", _join_lines(lines)).upper()
-        # Prefer longest mixed alnum run in the blob
-        for m in re.finditer(r"[A-Z0-9]{5,12}", blob):
+        blob = _normalize_plate_token(_join_lines(lines))
+        for plate, conf in _indian_compact_candidates(blob, 0.55):
+            candidates.append((plate, conf))
+        for m in re.finditer(r"[A-Z0-9]{5,10}", blob):
             plate = m.group(0)
             if any(c.isalpha() for c in plate) and any(c.isdigit() for c in plate):
                 candidates.append((plate, 0.5))
 
     if not candidates:
         return None
-    # Prefer confidence, then length (truncated OCR loses)
-    candidates.sort(key=lambda c: (c[1], len(c[0])), reverse=True)
-    return candidates[0]
+
+    # De-dupe keeping best conf per plate string
+    best_by_plate: dict = {}
+    for plate, conf in candidates:
+        plate = _normalize_plate_token(plate)
+        if len(plate) < 5:
+            continue
+        prev = best_by_plate.get(plate)
+        if prev is None or conf > prev:
+            best_by_plate[plate] = conf
+
+    ranked = sorted(
+        best_by_plate.items(),
+        key=lambda c: (c[1], _plate_format_score(c[0])),
+        reverse=True,
+    )
+    for plate, conf in ranked:
+        if not is_rejected_anpr_plate(plate, lines):
+            return plate, conf
+    return None
 
 
 # =====================================================================

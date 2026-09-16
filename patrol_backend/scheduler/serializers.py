@@ -42,6 +42,7 @@ class SiteCameraSerializer(serializers.ModelSerializer):
             "name",
             "rtsp_url",
             "direction",
+            "gate_mode",
             "is_enabled",
             "sort_order",
             "stream_path",
@@ -59,6 +60,11 @@ class SiteCameraWriteSerializer(serializers.Serializer):
     direction = serializers.ChoiceField(
         choices=SiteCamera.Direction.choices,
         default=SiteCamera.Direction.TOGGLE,
+        required=False,
+    )
+    gate_mode = serializers.ChoiceField(
+        choices=SiteCamera.GateMode.choices,
+        default=SiteCamera.GateMode.PARKED_TOGGLE,
         required=False,
     )
     is_enabled = serializers.BooleanField(default=True, required=False)

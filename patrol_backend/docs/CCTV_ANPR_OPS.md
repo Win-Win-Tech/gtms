@@ -79,13 +79,24 @@ ANPR_CAMERA_REFRESH_SEC=300   # reload SiteCamera from DB every 5 min (diff-only
 
 No RabbitMQ. Same Redis as Celery.
 
-Reader polls cameras every `ANPR_CAMERA_REFRESH_SEC` (default **300**). It only restarts a camera worker when RTSP / direction / geometry / site changed; unchanged cameras keep their RTSP + tracker. Stale MySQL sockets are cleared before each poll (`close_old_connections` + `connection.close`, one retry).
+Reader polls cameras every `ANPR_CAMERA_REFRESH_SEC` (default **300**). It only restarts a camera worker when RTSP / direction / **gate_mode** / geometry / site changed; unchanged cameras keep their RTSP + tracker. Stale MySQL sockets are cleared before each poll (`close_old_connections` + `connection.close`, one retry).
 
-After a plate is enqueued, that track waits `ANPR_COOLDOWN_SEC` then **re-arms** so a parked car can toggle check-in/out again without leaving the frame.
+After a plate is enqueued, that track waits `ANPR_COOLDOWN_SEC` then **re-arms** so a parked car can toggle check-in/out again without leaving the frame (only when **gate_mode** = `parked_toggle`).
+
+### Gate mode (`SiteCamera.gate_mode`)
+
+Set under **Organisation → Site → CCTV cameras**:
+
+| Mode | When it fires | How in/out is chosen |
+|------|---------------|----------------------|
+| **Whenever plate is seen** `parked_toggle` | Stable plate in view (parked OK), or line cross if a line exists | Lane type: both / entry-only / exit-only |
+| **Only when vehicle crosses the line** `line_direction` | **Only** when the vehicle crosses the virtual line | Crossing side: `cross_dir > 0` → check-in, `< 0` → check-out. Flip by drawing the line the opposite way. Lane type can still restrict to entry-only / exit-only. |
+
+`line_direction` **requires** a virtual line (CCTV Live → ANPR zone). Without a line, events will not fire.
 
 OCR often misreads 1 character on the same vehicle. Before gate, plates are **stabilized** (country-agnostic): match open CCTV entries / same track memory / recent site plates by small edit distance — never remaps to a *worse/shorter* known plate.
 
-When plate YOLO weights are missing, OCR uses the **lower band of the vehicle box** (not the whole car) plus multi-pass consensus. For best accuracy place a plate `.pt` via `VISITOR_AI_PLATE_WEIGHTS`.
+When plate YOLO weights are missing, OCR uses the **lower band of the vehicle box** (not the whole car) plus multi-pass consensus. Install the plate `.pt` (section below) for best accuracy.
 
 **Evidence images:** on successful gate events the JPEG is saved to `VisitorAsset`:
 - check-in → `check_in_photo`
@@ -252,13 +263,15 @@ After the systemd unit works, you do **not** start it by hand every time.
 
 ## Optional: set line/ROI
 
-ROI and virtual line are **optional per camera**. Empty `anpr_geometry` (`{}`) means
+ROI and virtual line are **optional per camera** when **gate_mode** is `parked_toggle`. Empty `anpr_geometry` (`{}`) means
 capture-on-stable (full frame) — no default line/ROI is applied.
+
+For **gate_mode** = `line_direction`, a virtual **line is required**.
 
 **Admin UI (preferred):** Visitor → **CCTV Live** → **ANPR zone**
 - **Add ROI** / **Add line** — only when that org wants them
 - **Delete ROI** / **Delete line** / **Clear all** then **Save** — removes zone
-- Leave empty → reader captures without requiring a line cross
+- Leave empty → reader captures without requiring a line cross (**parked_toggle** only)
 
 Reader reloads geometry within `ANPR_CAMERA_REFRESH_SEC` (default 5 min).
 
@@ -280,6 +293,112 @@ c.anpr_geometry = {
 # c.anpr_geometry = {}
 c.save(update_fields=["anpr_geometry", "modified_on"])
 ```
+
+---
+
+## OCR quality (watermark / full-frame / distant plates)
+
+The ANPR Celery task is **stricter than mobile extract-v2**:
+
+- Rejects camera OSD/timestamp text (`12.13:05-Wed`, `Smart Surveillance`, `…SMA` suffix).
+- **No check-in/out** when OCR came from `full_frame_enhanced` or `screen_inset_enhanced` (no plate/vehicle crop).
+- Requires a trusted detector (`plate_crop`, `plate_wide`, `plate_context`, `vehicle_bottom`, …).
+- Plate YOLO conf ≥ **0.28** (distant plates); vehicle-box conf ≥ **0.5**.
+
+**Distant parked vehicles:** detect may run on a downscaled frame, but OCR crops are taken from the **full-resolution** JPEG. Tiny plate boxes get expanded context (`plate_wide` / `plate_context`) and strong upscale before RapidOCR. The reader also saves a **plate-centered zoom crop** for OCR only (`*_ocr.jpg`). Visitor check-in/out photos use a **vehicle crop or full frame**, never the plate zoom.
+
+Task skip reasons in Celery logs: `watermark_plate`, `untrusted_ocr_source`, `no_plate_crop`, `low_yolo_conf`.
+
+---
+
+## Install plate YOLO weights (local + live server)
+
+**Why:** Without this file, logs show `Falling back to vehicle YOLO` and OCR runs on the whole bike/car box (noisy). With it, detection returns a **tight license-plate box**.
+
+**Not** `pip install` of a plate package — you download one small `.pt` file (~6 MB) once.
+
+**Target path** (code looks here automatically):
+
+```text
+patrol_backend/visitor/ai/weights/license_plate_detector.pt
+```
+
+Also accepted: `yolov8n-license-plate.pt` in the same folder, or env:
+
+```bash
+VISITOR_AI_PLATE_WEIGHTS=/full/path/to/license_plate_detector.pt
+```
+
+### Steps (live server)
+
+1. Activate the same venv used by Celery / Django:
+
+```bash
+cd /path/to/patrol_backend   # e.g. .../backendnew/gtms/patrol_backend
+source ../venv/bin/activate  # adjust to your live venv path
+```
+
+2. Install Hugging Face CLI helper (once; needs outbound HTTPS to `pypi.org`):
+
+```bash
+pip install huggingface_hub
+```
+
+3. Download YOLOv8 **nano** plate model and rename to the expected filename:
+
+```bash
+# Use `hf` (not deprecated `huggingface-cli`)
+hf download joker5914/yolov8n-license-plate best.pt \
+  --local-dir visitor/ai/weights
+
+mv -f visitor/ai/weights/best.pt visitor/ai/weights/license_plate_detector.pt
+```
+
+**Alternative** (no `hf` — needs DNS to `huggingface.co`):
+
+```bash
+cd visitor/ai/weights
+# remove any empty failed download first
+rm -f license_plate_detector.pt
+wget -O license_plate_detector.pt \
+  "https://huggingface.co/joker5914/yolov8n-license-plate/resolve/main/best.pt"
+```
+
+4. Confirm file size is ~6 MB (not 0 bytes):
+
+```bash
+ls -lh visitor/ai/weights/license_plate_detector.pt
+```
+
+5. Restart ANPR services so they load the new weights:
+
+```bash
+sudo systemctl restart patrol-anpr-reader
+sudo systemctl restart patrol-anpr-celery
+# or your live unit names, e.g. gtms-anpr-reader / gtms-anpr-celery
+```
+
+6. Verify in logs after the next ANPR frame:
+
+```text
+Loading plate YOLO weights=.../license_plate_detector.pt
+```
+
+**Bad** (still missing / empty file):
+
+```text
+Plate YOLO unavailable ...
+Falling back to vehicle YOLO for plate-region detection
+```
+
+### Notes
+
+| Topic | Detail |
+|--------|--------|
+| Memory | Nano plate model is small (~100–300 MB RAM when loaded). Already planned for 4 vCPU / 8 GB. |
+| First load | File is downloaded **once**. Python loads it into RAM **once per process restart**, then reuses it. |
+| Offline / DNS fail | Copy `license_plate_detector.pt` from a machine that can download (USB/scp) into `visitor/ai/weights/` on the live host. |
+| Source model | [joker5914/yolov8n-license-plate](https://huggingface.co/joker5914/yolov8n-license-plate) (`best.pt`). Ultralytics Hub id `keremberke/yolov8n-license-plate-detection` often fails — do not rely on it. |
 
 ---
 

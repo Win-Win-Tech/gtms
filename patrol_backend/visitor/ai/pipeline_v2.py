@@ -30,10 +30,14 @@ MIN_OCR_CONF = float(os.environ.get("VISITOR_AI_MIN_OCR_CONF", "0.45"))
 MAX_CONCURRENT = int(os.environ.get("VISITOR_AI_MAX_CONCURRENT", "2"))
 # Pre-resize longest side before OCR (smaller = faster on CPU).
 ID_MAX_SIDE = int(os.environ.get("VISITOR_AI_ID_MAX_SIDE", "800"))
+# Plate YOLO detect size (OCR still uses full-resolution crops when available).
+PLATE_DETECT_MAX_SIDE = int(os.environ.get("VISITOR_AI_PLATE_DETECT_MAX_SIDE", "960"))
+# Upscale distant plate crops so RapidOCR can read glyphs.
+PLATE_OCR_MIN_LONG_SIDE = int(os.environ.get("VISITOR_AI_PLATE_OCR_MIN_LONG_SIDE", "480"))
 # Hard cap on RapidOCR calls per ID request (each ~1–3s on CPU).
 MAX_ID_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_ID_OCR_PASSES", "2"))
 # Plate pipeline OCR budget (detect + enhance / vehicle-zone fallbacks).
-MAX_PLATE_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_PLATE_OCR_PASSES", "4"))
+MAX_PLATE_OCR_PASSES = int(os.environ.get("VISITOR_AI_MAX_PLATE_OCR_PASSES", "5"))
 _VEHICLE_DETECT_LABELS = frozenset({"car", "truck", "bus", "motorcycle", "full_frame"})
 _ai_sema_v2 = threading.Semaphore(max(1, MAX_CONCURRENT))
 # Reuse one worker pool instead of creating/destroying per request.
@@ -75,12 +79,14 @@ def _slim_vehicle_result(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def extract_vehicle_from_bgr(bgr) -> Dict[str, Any]:
+def extract_vehicle_from_bgr(bgr, hint_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
     Plate YOLO + RapidOCR on an in-memory BGR frame (CCTV ANPR / library reuse).
 
-    Same core path as upload extract-v2 type=vehicle. Synchronous — callers
-    (HTTP timeout pool or Celery time limits) own concurrency/timeouts.
+    Detect may run on a downscaled copy for speed; OCR crops are taken from the
+    original full-resolution frame so distant CCTV plates stay readable.
+
+    hint_meta: optional ANPR reader metadata (e.g. zoom_crop=True, box_norm).
     """
     import numpy as np
 
@@ -100,20 +106,34 @@ def extract_vehicle_from_bgr(bgr) -> Dict[str, Any]:
 
         h, w = bgr.shape[:2]
         max_side = max(h, w)
-        frame = bgr
-        if max_side > ID_MAX_SIDE:
-            scale = ID_MAX_SIDE / float(max_side)
-            frame = cv2.resize(
+        detect_frame = bgr
+        box_mul = 1.0
+        detect_max = max(320, PLATE_DETECT_MAX_SIDE)
+        if max_side > detect_max:
+            scale = detect_max / float(max_side)
+            detect_frame = cv2.resize(
                 bgr,
                 (max(1, int(w * scale)), max(1, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
             )
+            # Map detect-frame box coords → full-res OCR frame (width ratio)
+            box_mul = float(w) / float(detect_frame.shape[1])
         logger.info(
-            "extract_vehicle_from_bgr resized=%sx%s",
-            frame.shape[1],
-            frame.shape[0],
+            "extract_vehicle_from_bgr detect=%sx%s ocr_source=%sx%s box_mul=%.3f zoom=%s",
+            detect_frame.shape[1],
+            detect_frame.shape[0],
+            w,
+            h,
+            box_mul,
+            bool((hint_meta or {}).get("zoom_crop")),
         )
-        result = _pipeline_vehicle_plate_v2(frame, t0)
+        result = _pipeline_vehicle_plate_v2(
+            detect_frame,
+            t0,
+            ocr_bgr=bgr,
+            box_mul=box_mul,
+            hint_meta=hint_meta,
+        )
         touch_activity()
         slim = _slim_vehicle_result(result)
         logger.info(
@@ -271,6 +291,8 @@ def _upscale_if_small(bgr, min_long_side: int = 220):
     if longest >= min_long_side:
         return bgr
     scale = min_long_side / float(max(1, longest))
+    # Cap extreme upscales (noise) but allow distant CCTV plates
+    scale = min(scale, 12.0)
     return cv2.resize(
         bgr,
         (max(1, int(w * scale)), max(1, int(h * scale))),
@@ -289,10 +311,45 @@ def _is_vehicle_sized_box(box, frame) -> bool:
         return False
 
 
+def _map_box(box, mul: float):
+    """Scale a detect-frame Box into OCR-frame pixel coordinates."""
+    from visitor.ai.detect import Box
+
+    if mul == 1.0:
+        return box
+    return Box(
+        x1=int(round(box.x1 * mul)),
+        y1=int(round(box.y1 * mul)),
+        x2=int(round(box.x2 * mul)),
+        y2=int(round(box.y2 * mul)),
+        confidence=float(box.confidence),
+        label=box.label,
+    )
+
+
+def _crop_min_context(bgr, box, *, min_w: int, min_h: int, pad_ratio: float = 0.35):
+    """
+    Crop around a plate box ensuring a minimum context size (distant CCTV).
+    pad_ratio expands relative to the box; min_w/min_h force readable OCR size.
+    """
+    h, w = bgr.shape[:2]
+    bw = max(1, box.x2 - box.x1)
+    bh = max(1, box.y2 - box.y1)
+    pad_x = max(int(bw * pad_ratio), (min_w - bw) // 2, 8)
+    pad_y = max(int(bh * pad_ratio), (min_h - bh) // 2, 8)
+    x1 = max(0, box.x1 - pad_x)
+    y1 = max(0, box.y1 - pad_y)
+    x2 = min(w, box.x2 + pad_x)
+    y2 = min(h, box.y2 + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return bgr.copy()
+    return bgr[y1:y2, x1:x2].copy()
+
+
 def _plate_zone_crops(bgr, box) -> list:
     """
     Build OCR crops. For vehicle boxes, prefer lower bands (where plates sit).
-    For real plate boxes, use the padded plate ROI.
+    For real plate boxes: tight crop, then wider context for distant CCTV.
     Returns list of (image, detector_name).
     """
     out = []
@@ -307,10 +364,56 @@ def _plate_zone_crops(bgr, box) -> list:
         out.append((roi, "vehicle_full"))
         return out
 
-    roi = crop_with_padding(bgr, box, pad_ratio=0.12)
-    roi = _deskew_plate_roi(roi)
-    out.append((roi, "plate_crop"))
+    fill = _box_fill_ratio(box, bgr)
+    bw = max(1, box.x2 - box.x1)
+    bh = max(1, box.y2 - box.y1)
+    tiny = fill < 0.008 or max(bw, bh) < 64
+
+    # Tight plate crop (still padded enough for deskew)
+    tight = _crop_min_context(
+        bgr, box, min_w=120 if tiny else 80, min_h=64 if tiny else 40, pad_ratio=0.45
+    )
+    tight = _deskew_plate_roi(tight)
+    out.append((tight, "plate_crop"))
+
+    # Wider context around the same plate (bike rear / car bumper)
+    wide = _crop_min_context(
+        bgr, box, min_w=280 if tiny else 160, min_h=140 if tiny else 80, pad_ratio=1.2
+    )
+    out.append((wide, "plate_wide"))
+
+    if tiny:
+        # Even larger band for far scooters (still plate-centered, not full frame)
+        ctx = _crop_min_context(
+            bgr, box, min_w=420, min_h=220, pad_ratio=2.5
+        )
+        out.append((ctx, "plate_context"))
     return out
+
+
+_PLATE_DETECTOR_TRUST = {
+    "plate_crop": 0.18,
+    "plate_wide": 0.16,
+    "plate_context": 0.12,
+    "reader_zoom": 0.15,
+    "vehicle_bottom": 0.14,
+    "vehicle_lower": 0.10,
+    "plate_warped": 0.08,
+    "vehicle_full": -0.05,
+    "screen_inset_enhanced": -0.22,
+    "full_frame_enhanced": -0.30,
+    "full_frame": -0.35,
+}
+
+
+def _plate_detector_trust(meta: Dict[str, Any]) -> float:
+    if not isinstance(meta, dict):
+        return 0.0
+    if meta.get("fallback"):
+        return -0.25
+    det = (meta.get("detector") or "").lower()
+    base = det.replace("_enhanced", "")
+    return _PLATE_DETECTOR_TRUST.get(base, _PLATE_DETECTOR_TRUST.get(det, 0.0))
 
 
 def _pick_plate_from_attempts(attempts):
@@ -339,9 +442,21 @@ def _pick_plate_from_attempts(attempts):
     best_lines = None
     best_conf = float("-inf")
     for plate, conf, meta, lines in scored:
-        # consensus bonus + prefer longer (less truncated OCR)
+        # consensus bonus + structured plate format over long OCR garbage
         vote = counts[plate]
-        score = conf + 0.12 * (vote - 1) + 0.015 * len(plate)
+        try:
+            from visitor.ai.parse import _plate_format_score
+
+            fmt = _plate_format_score(plate)
+        except Exception:
+            fmt = len(plate)
+        score = (
+            conf
+            + 0.12 * (vote - 1)
+            + 0.02 * fmt
+            - 0.03 * max(0, len(plate) - 10)
+            + _plate_detector_trust(meta)
+        )
         if score > best_score:
             best_score = score
             best_plate = plate
@@ -652,41 +767,73 @@ def _pipeline_id_v2(bgr, t0: float) -> Dict[str, Any]:
     }
 
 
-def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
+def _looks_like_reader_zoom(bgr) -> bool:
+    """True when JPEG is already a plate-centered strip from the ANPR reader."""
+    h, w = bgr.shape[:2]
+    area = h * w
+    # Full gate frames are ~1280x720+; reader zoom is typically ~300–500 wide strips.
+    return max(h, w) <= 720 and area <= 350_000 and w >= h
+
+
+def _pipeline_vehicle_plate_v2(
+    bgr,
+    t0: float,
+    *,
+    ocr_bgr=None,
+    box_mul: float = 1.0,
+    hint_meta: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     """
     extract-v2 vehicle path: dedicated plate YOLO + RapidOCR.
+
+    Detect runs on ``bgr`` (may be downscaled). OCR crops are taken from
+    ``ocr_bgr`` (full-res) when provided, with boxes mapped by ``box_mul``.
 
     Handles (same spirit as type=id):
       - full vehicle with plate in frame
       - close-up plate only
       - soft blur / low contrast (CLAHE + mild sharpen)
       - tilt / skew (deskew + 90° rotate when portrait)
+      - distant CCTV plates (wide context crop + strong upscale)
       - photo of another device / screen (inset + enhance + upscale tiny crop)
       - perspective-ish document warp fallback
 
     Does NOT call / modify `_pipeline_vehicle_v2` (legacy vehicle-COCO path).
     """
     h, w = bgr.shape[:2]
-    logger.info("vehicle-plate-v2 start frame=%sx%s", w, h)
+    ocr_frame = ocr_bgr if ocr_bgr is not None else bgr
+    oh, ow = ocr_frame.shape[:2]
+    logger.info(
+        "vehicle-plate-v2 start detect=%sx%s ocr=%sx%s box_mul=%.3f",
+        w,
+        h,
+        ow,
+        oh,
+        box_mul,
+    )
 
     ocr_passes = 0
     attempts = []
 
-    def _ocr_attempt(image, meta: Dict[str, Any]) -> bool:
+    def _ocr_attempt(image, meta: Dict[str, Any], *, min_long: int | None = None) -> bool:
         """Run RapidOCR once. Returns True when a confident plate is found."""
         nonlocal ocr_passes
         if ocr_passes >= MAX_PLATE_OCR_PASSES:
             return False
         ocr_passes += 1
-        prepared = _upscale_if_small(image, min_long_side=280)
+        side = min_long if min_long is not None else PLATE_OCR_MIN_LONG_SIDE
+        prepared = _upscale_if_small(image, min_long_side=side)
         lines_local = run_rapid_ocr(prepared)
         parsed_local = extract_vehicle_number(lines_local) if lines_local else None
         attempts.append((lines_local, parsed_local, meta))
         logger.info(
-            "vehicle-plate-v2 ocr pass=%s detector=%s lines=%s parsed=%s conf=%s "
-            "elapsed_ms=%s texts=%s",
+            "vehicle-plate-v2 ocr pass=%s detector=%s crop=%sx%s up_to=%s lines=%s "
+            "parsed=%s conf=%s elapsed_ms=%s texts=%s",
             ocr_passes,
             meta.get("detector"),
+            image.shape[1] if image is not None else 0,
+            image.shape[0] if image is not None else 0,
+            side,
             len(lines_local or []),
             parsed_local[0] if parsed_local else None,
             round(float(parsed_local[1]), 3) if parsed_local else None,
@@ -695,18 +842,23 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
         )
         return bool(parsed_local and parsed_local[1] >= MIN_OCR_CONF)
 
-    def _detect_on(frame):
+    def _detect_on(frame, conf: float = 0.25):
         try:
-            return detect_plates(frame)
+            return detect_plates(frame, conf=conf)
         except Exception as exc:
             logger.warning("vehicle-plate-v2 detect_plates failed: %s", exc)
             return []
 
-    plates = _detect_on(bgr)
+    reader_zoom = bool((hint_meta or {}).get("zoom_crop")) or _looks_like_reader_zoom(
+        ocr_frame
+    )
+    # Zoom crops are already plate-centered — use a lower YOLO threshold
+    plates = _detect_on(bgr, conf=0.15 if reader_zoom else 0.25)
     detect_meta = {
         "detector": "plate_yolo",
         "plate_count": len(plates),
         "engine": "plate+rapidocr",
+        "reader_zoom": reader_zoom,
     }
     logger.info(
         "vehicle-plate-v2 yolo count=%s elapsed_ms=%s boxes=%s",
@@ -732,6 +884,12 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
                 bgr = rotated
                 h, w = bgr.shape[:2]
                 plates = plates_r
+                # OCR source must match orientation when we rotated detect frame
+                if ocr_bgr is None or ocr_frame is bgr:
+                    ocr_frame = bgr
+                else:
+                    ocr_frame = cv2.rotate(ocr_frame, cv2.ROTATE_90_CLOCKWISE)
+                    oh, ow = ocr_frame.shape[:2]
                 detect_meta["rotated"] = "90_cw_before_detect"
                 logger.info(
                     "vehicle-plate-v2 rotated_detect count=%s elapsed_ms=%s",
@@ -743,24 +901,39 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
 
     hit = False
     if plates:
-        best = plates[0]
+        best_det = plates[0]
+        best = _map_box(best_det, box_mul)
+        # Clamp mapped box into OCR frame
+        best.x1 = max(0, min(best.x1, ow - 1))
+        best.y1 = max(0, min(best.y1, oh - 1))
+        best.x2 = max(best.x1 + 1, min(best.x2, ow))
+        best.y2 = max(best.y1 + 1, min(best.y2, oh))
+
         detect_meta.update({
             "label": best.label,
             "confidence": round(best.confidence, 3),
             "box": [best.x1, best.y1, best.x2, best.y2],
-            "frame_fill_ratio": round(_box_fill_ratio(best, bgr), 3),
-            "vehicle_sized": _is_vehicle_sized_box(best, bgr),
+            "frame_fill_ratio": round(_box_fill_ratio(best, ocr_frame), 3),
+            "vehicle_sized": _is_vehicle_sized_box(best, ocr_frame),
+            "ocr_frame": [ow, oh],
         })
 
         # Vehicle YOLO fallback returns a car box — OCR lower plate zone, not whole car.
-        # Real plate YOLO returns a tight plate box — OCR that crop.
-        for crop_img, det_name in _plate_zone_crops(bgr, best):
+        # Real plate YOLO returns a tight plate box — OCR tight + wide context crops.
+        for crop_img, det_name in _plate_zone_crops(ocr_frame, best):
             if ocr_passes >= MAX_PLATE_OCR_PASSES:
                 break
             hit = _ocr_attempt(
                 crop_img,
                 {**detect_meta, "detector": det_name},
             ) or hit
+            if hit and det_name in (
+                "vehicle_bottom",
+                "plate_crop",
+                "plate_wide",
+                "plate_context",
+            ):
+                break
             if ocr_passes >= MAX_PLATE_OCR_PASSES:
                 break
             # Second pass: CLAHE + sharpen on same crop (blur / glare)
@@ -769,26 +942,48 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
                 enhanced,
                 {**detect_meta, "detector": f"{det_name}_enhanced"},
             ) or hit
-            # Enough signal from primary zone — stop burning passes on worse crops
-            if hit and det_name in ("vehicle_bottom", "plate_crop"):
+            if hit and det_name in (
+                "vehicle_bottom",
+                "plate_crop",
+                "plate_wide",
+                "plate_context",
+            ):
                 break
 
         # Perspective warp only if still no confident hit
         if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
-            zone = _plate_zone_crops(bgr, best)
-            base = zone[0][0] if zone else crop_with_padding(bgr, best, pad_ratio=0.08)
+            zone = _plate_zone_crops(ocr_frame, best)
+            base = zone[0][0] if zone else crop_with_padding(ocr_frame, best, pad_ratio=0.08)
             warped = warp_document_if_possible(base)
-            if warped is None:
-                warped = warp_document_if_possible(bgr)
             if warped is not None:
                 hit = _ocr_attempt(
                     _enhance_for_ocr(warped),
                     {**detect_meta, "detector": "plate_warped"},
                 )
 
+    # Reader already sent a plate zoom JPEG — OCR the whole strip as trusted crop
+    # (YOLO often returns 0 on tight 359x129 crops even when the plate is readable).
+    if not hit and reader_zoom and ocr_passes < MAX_PLATE_OCR_PASSES:
+        detect_meta.update({
+            "detector": "reader_zoom",
+            "box": [0, 0, ow - 1, oh - 1],
+            "frame_fill_ratio": 1.0,
+            "confidence": float((hint_meta or {}).get("conf") or 0.55),
+            "label": "license_plate",
+        })
+        hit = _ocr_attempt(
+            ocr_frame,
+            {**detect_meta, "detector": "reader_zoom"},
+        ) or hit
+        if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
+            hit = _ocr_attempt(
+                _sharpen_for_blur(_enhance_for_ocr(ocr_frame)),
+                {**detect_meta, "detector": "reader_zoom_enhanced"},
+            ) or hit
+
     # No plate box (or crop OCR miss): ID-style fallbacks for close-up / screen capture
     if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
-        inset_list = _prepare_inset_variant(bgr)
+        inset_list = _prepare_inset_variant(ocr_frame)
         if inset_list:
             inset_img, inset_meta = inset_list[0]
             hit = _ocr_attempt(
@@ -799,17 +994,19 @@ def _pipeline_vehicle_plate_v2(bgr, t0: float) -> Dict[str, Any]:
                     "detector": "screen_inset_enhanced",
                     "fallback": True,
                 },
+                min_long=280,
             )
 
     if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
         hit = _ocr_attempt(
-            _sharpen_for_blur(_enhance_for_ocr(bgr)),
+            _sharpen_for_blur(_enhance_for_ocr(ocr_frame)),
             {
                 **detect_meta,
                 "detector": "full_frame_enhanced",
                 "fallback": True,
                 "frame_fill_ratio": 1.0,
             },
+            min_long=280,
         )
 
     best_candidate, best_conf, best_meta, best_lines = _pick_plate_from_attempts(
