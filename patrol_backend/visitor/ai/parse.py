@@ -422,9 +422,10 @@ def is_rejected_anpr_plate(
 ) -> bool:
     """
     True when a normalized plate string is likely OSD/timestamp garbage (ANPR gate).
+    Also rejects incomplete fragments like S2S42 / S2542 (missing state code).
     """
     p = _normalize_plate_token(plate)
-    if not p or len(p) < 5:
+    if not p or len(p) < 7:
         return True
     if p.endswith("SMA") and len(p) > 8:
         return True
@@ -433,6 +434,19 @@ def is_rejected_anpr_plate(
     # Timestamp blobs like 12.13:05-Wed → 1305WEDSMA
     if re.match(r"^\d{4,}", p) and not _IN_FULL_COMPACT_RE.match(p):
         return True
+    # Series-only / bottom-row fragments (S2542, S2S42) — no state+district prefix
+    if not _IN_FULL_COMPACT_RE.match(p) and not re.match(
+        r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$", p
+    ):
+        # Allow Malaysian-style ABC1234 if length OK
+        if not re.match(r"^[A-Z]{1,3}\d{1,4}[A-Z]{0,3}$", p) or len(p) < 7:
+            return True
+        # Single-letter + digits (S2542) is almost always Indian bottom row only
+        if re.match(r"^[A-Z]\d", p) and len(p) <= 6:
+            return True
+        if re.match(r"^[A-Z]{1,3}\d*[A-Z]\d+$", p) and len(p) < 8:
+            # S2S42 style garbled bottom row
+            return True
     if source_lines:
         useful = [
             t
@@ -455,8 +469,11 @@ def _ocr_fix_digits(segment: str) -> str:
             out.append("0")
         elif ch in "IL":
             out.append("1")
-        elif ch in "SB":
+        elif ch == "B":
             out.append("8")
+        elif ch == "S":
+            # On Indian plates, S is almost always a misread 5 in the number block
+            out.append("5")
         elif ch in "Z":
             out.append("2")
         else:
@@ -508,7 +525,7 @@ def _parse_indian_state_line(raw: str) -> Optional[Tuple[str, str]]:
 
 
 def _parse_indian_series_line(raw: str) -> Optional[Tuple[str, str]]:
-    """Parse S.2542 / 52542 style second line → (series, number)."""
+    """Parse S.2542 / 52542 / S2S42 style second line → (series, number)."""
     raw = (raw or "").strip()
     if not raw:
         return None
@@ -530,6 +547,16 @@ def _parse_indian_series_line(raw: str) -> Optional[Tuple[str, str]]:
             return letter, number
     if re.fullmatch(r"\d{4}", compact):
         return "", _ocr_fix_digits(compact)
+    # Garbled bottom row: S2S42 / S2542 / SS2542 → series letter(s) + 4 digits
+    m_loose = re.match(r"^([A-Z]{1,3})([A-Z0-9]{3,6})$", compact)
+    if m_loose:
+        series = m_loose.group(1)
+        number = _ocr_fix_digits(m_loose.group(2))
+        # Prefer last 4 digits if OCR injected extras
+        if len(number) > 4:
+            number = number[-4:]
+        if series and len(number) == 4:
+            return series, number
     return None
 
 
@@ -666,20 +693,22 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
             if 5 <= len(plate) <= 12:
                 candidates.append((plate, float(score) * 0.9))
 
-        if 5 <= len(compact) <= 10:
+        if 7 <= len(compact) <= 10:
             has_a = any(c.isalpha() for c in compact)
             has_d = any(c.isdigit() for c in compact)
-            if has_a and has_d:
+            # Skip short fragments (S2S42) — need structured plate or longer token
+            if has_a and has_d and _plate_format_score(compact) >= 90:
                 candidates.append((compact, float(score) * 0.85))
 
     if not candidates:
         blob = _normalize_plate_token(_join_lines(lines))
         for plate, conf in _indian_compact_candidates(blob, 0.55):
             candidates.append((plate, conf))
-        for m in re.finditer(r"[A-Z0-9]{5,10}", blob):
+        for m in re.finditer(r"[A-Z0-9]{7,10}", blob):
             plate = m.group(0)
             if any(c.isalpha() for c in plate) and any(c.isdigit() for c in plate):
-                candidates.append((plate, 0.5))
+                if _plate_format_score(plate) >= 50:
+                    candidates.append((plate, 0.5))
 
     if not candidates:
         return None
@@ -688,15 +717,16 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
     best_by_plate: dict = {}
     for plate, conf in candidates:
         plate = _normalize_plate_token(plate)
-        if len(plate) < 5:
+        if len(plate) < 7:
             continue
         prev = best_by_plate.get(plate)
         if prev is None or conf > prev:
             best_by_plate[plate] = conf
 
+    # Prefer real plate shape over raw OCR confidence (stops S2S42 beating TN60S2542)
     ranked = sorted(
         best_by_plate.items(),
-        key=lambda c: (c[1], _plate_format_score(c[0])),
+        key=lambda c: (_plate_format_score(c[0]), c[1], len(c[0])),
         reverse=True,
     )
     for plate, conf in ranked:

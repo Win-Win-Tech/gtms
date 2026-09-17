@@ -145,7 +145,7 @@ def apply_gate_event(
     vehicle_type comes from YOLO class (car/truck/bus/motorcycle), mapped to org lookup codes.
     """
     plate = normalize_plate(plate)
-    if len(plate) < 4:
+    if len(plate) < 7:
         return {"ok": False, "reason": "invalid_plate", "plate": plate}
 
     if in_cooldown(str(site.id), plate):

@@ -38,7 +38,13 @@ def min_track_hits() -> int:
 
 
 def detect_conf() -> float:
-    return float(getattr(settings, "ANPR_DETECT_CONF", 0.25))
+    # Lower default helps distant/parked plates after 640→higher downscale.
+    return float(getattr(settings, "ANPR_DETECT_CONF", 0.18))
+
+
+def detect_max_side() -> int:
+    """Longest side (px) for plate YOLO input. Higher = better distant plates, slower CPU."""
+    return max(480, int(getattr(settings, "ANPR_DETECT_MAX_SIDE", 960)))
 
 
 def camera_refresh_sec() -> int:

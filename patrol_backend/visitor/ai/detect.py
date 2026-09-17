@@ -144,6 +144,7 @@ def _get_plate_yolo():
         try:
             logger.info("Loading plate YOLO weights=%s (first load may download)", weights)
             _yolo_plate_model = YOLO(weights)
+            logger.info("Plate YOLO ready weights=%s", weights)
             return _yolo_plate_model
         except Exception as exc:
             logger.warning(

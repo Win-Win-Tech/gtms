@@ -87,6 +87,9 @@ class CameraWorker:
         self.cap: Optional[cv2.VideoCapture] = None
         self.last_detect_at = 0.0
         self.reconnect_at = 0.0
+        self._tick_count = 0
+        self._last_status_log = 0.0
+        self._plates_loaded_logged = False
         if self.gate_mode == "line_direction" and self.line is None:
             logger.warning(
                 "[ANPR_READER] camera=%s gate_mode=line_direction but no virtual line — "
@@ -139,9 +142,9 @@ class CameraWorker:
     def process_tick(self, frame) -> None:
         h, w = frame.shape[:2]
         crop, (ox, oy) = crop_roi_bgr(frame, self.roi)
-        # Downscale crop for detect speed
+        # Downscale crop for detect speed (960 default — 640 missed distant parked plates)
         ch, cw = crop.shape[:2]
-        max_side = 640
+        max_side = anpr_settings.detect_max_side()
         scale = 1.0
         det_img = crop
         if max(ch, cw) > max_side:
@@ -152,11 +155,37 @@ class CameraWorker:
                 interpolation=cv2.INTER_AREA,
             )
 
+        t_det0 = time.monotonic()
         try:
             plates = detect_plates(det_img, conf=anpr_settings.detect_conf())
         except Exception as exc:
             logger.warning("[ANPR_READER] detect_plates failed: %s", exc)
             plates = []
+        detect_ms = (time.monotonic() - t_det0) * 1000.0
+        if not self._plates_loaded_logged:
+            self._plates_loaded_logged = True
+            logger.info(
+                "[ANPR_READER] first detect done camera=%s plates=%s ms=%.0f "
+                "det_size=%sx%s conf=%.2f max_side=%s gate_mode=%s line=%s",
+                self.camera.id,
+                len(plates),
+                detect_ms,
+                det_img.shape[1],
+                det_img.shape[0],
+                anpr_settings.detect_conf(),
+                max_side,
+                self.gate_mode,
+                "yes" if self.line else "no",
+            )
+
+        # Parked testing: if plate YOLO sees nothing, still track vehicles so OCR can run.
+        used_vehicle_fallback = False
+        if not plates and self.gate_mode != "line_direction":
+            try:
+                plates = detect_vehicles(det_img, conf=max(0.25, anpr_settings.detect_conf()))
+                used_vehicle_fallback = bool(plates)
+            except Exception as exc:
+                logger.debug("[ANPR_READER] vehicle fallback failed: %s", exc)
 
         # Map boxes from det_img → full frame pixels → norm
         detections = []
@@ -176,9 +205,30 @@ class CameraWorker:
             detections.append((nx, ny, side, box_n, float(p.confidence), veh_label))
 
         tracks = self.tracker.update(detections)
+        self._tick_count += 1
+        now_m = time.monotonic()
+        if now_m - self._last_status_log >= 15.0:
+            self._last_status_log = now_m
+            states = {}
+            for tr in tracks:
+                states[tr.state] = states.get(tr.state, 0) + 1
+            logger.info(
+                "[ANPR_READER] status camera=%s name=%s gate=%s ticks=%s "
+                "plates=%s dets=%s tracks=%s states=%s veh_fb=%s detect_ms=%.0f",
+                self.camera.id,
+                self.camera.name,
+                self.gate_mode,
+                self._tick_count,
+                len(plates) if not used_vehicle_fallback else 0,
+                len(detections),
+                len(tracks),
+                states or "-",
+                used_vehicle_fallback,
+                detect_ms,
+            )
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         sharp = _sharpness(gray)
-        now_m = time.monotonic()
         rearm_after = float(anpr_settings.cooldown_sec())
 
         min_hits = anpr_settings.min_track_hits()
