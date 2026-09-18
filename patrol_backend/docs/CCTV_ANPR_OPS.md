@@ -1,6 +1,8 @@
 # CCTV ANPR — Ops runbook (Phases 3–5)
 
-See also: [`CCTV_ANPR_FULL_PLAN.md`](CCTV_ANPR_FULL_PLAN.md)
+See also:
+- [`CCTV_ANPR_FULL_PLAN.md`](CCTV_ANPR_FULL_PLAN.md)
+- [`CCTV_ANPR_GEOMETRY_API.md`](CCTV_ANPR_GEOMETRY_API.md) — ROI / line create·read·edit·delete (web + mobile; existing camera APIs)
 
 ---
 
