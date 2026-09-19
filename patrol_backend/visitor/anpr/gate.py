@@ -45,50 +45,25 @@ def synthetic_ic(plate: str) -> str:
 
 def _cctv_visit_date(location) -> "date":
     """
-    Local calendar day for ANPR check-in.
+    Same calendar day as walk-in registration: org admin timezone 'today'.
 
-    Django TIME_ZONE is UTC, so timezone.now().date() / localtime().date() are UTC
-    midnight boundaries — wrong for IST sites (late-evening IST check-ins land on
-    the previous UTC calendar day). Prefer location admin timezone, else Asia/Kolkata.
+    Django TIME_ZONE is UTC, so timezone.now().date() is the UTC day and wrong for
+    IST sites (e.g. 02:16 IST on the 19th is still the 18th in UTC).
     """
-    import pytz
+    from patrol_backend.utils.timezone_utils import (
+        get_user_today,
+        get_user_timezone_from_request,
+    )
 
-    tz_name = "Asia/Kolkata"
-    if location is not None:
-        try:
-            from authapp.models import User as AuthUser
+    class _DummyUser:
+        is_authenticated = False
 
-            admin = (
-                AuthUser.objects.filter(
-                    location_id=location.id,
-                    role="admin",
-                    is_deleted=False,
-                )
-                .exclude(timezone__isnull=True)
-                .exclude(timezone="")
-                .first()
-            )
-            if admin and admin.timezone:
-                tz_name = admin.timezone
-            else:
-                any_user = (
-                    AuthUser.objects.filter(
-                        location_id=location.id,
-                        is_deleted=False,
-                    )
-                    .exclude(timezone__isnull=True)
-                    .exclude(timezone="")
-                    .first()
-                )
-                if any_user and any_user.timezone:
-                    tz_name = any_user.timezone
-        except Exception:
-            pass
-    try:
-        tz = pytz.timezone(tz_name)
-    except Exception:
-        tz = pytz.timezone("Asia/Kolkata")
-    return timezone.now().astimezone(tz).date()
+    class _DummyRequest:
+        user = _DummyUser()
+
+    location_id = str(location.id) if location is not None else None
+    user_tz = get_user_timezone_from_request(_DummyRequest(), location_id=location_id)
+    return get_user_today(user_tz)
 
 
 def _cooldown_key(site_id: str, plate: str) -> str:
