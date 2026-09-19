@@ -43,6 +43,54 @@ def synthetic_ic(plate: str) -> str:
     return f"CCTV-{plate}"[:64]
 
 
+def _cctv_visit_date(location) -> "date":
+    """
+    Local calendar day for ANPR check-in.
+
+    Django TIME_ZONE is UTC, so timezone.now().date() / localtime().date() are UTC
+    midnight boundaries — wrong for IST sites (late-evening IST check-ins land on
+    the previous UTC calendar day). Prefer location admin timezone, else Asia/Kolkata.
+    """
+    import pytz
+
+    tz_name = "Asia/Kolkata"
+    if location is not None:
+        try:
+            from authapp.models import User as AuthUser
+
+            admin = (
+                AuthUser.objects.filter(
+                    location_id=location.id,
+                    role="admin",
+                    is_deleted=False,
+                )
+                .exclude(timezone__isnull=True)
+                .exclude(timezone="")
+                .first()
+            )
+            if admin and admin.timezone:
+                tz_name = admin.timezone
+            else:
+                any_user = (
+                    AuthUser.objects.filter(
+                        location_id=location.id,
+                        is_deleted=False,
+                    )
+                    .exclude(timezone__isnull=True)
+                    .exclude(timezone="")
+                    .first()
+                )
+                if any_user and any_user.timezone:
+                    tz_name = any_user.timezone
+        except Exception:
+            pass
+    try:
+        tz = pytz.timezone(tz_name)
+    except Exception:
+        tz = pytz.timezone("Asia/Kolkata")
+    return timezone.now().astimezone(tz).date()
+
+
 def _cooldown_key(site_id: str, plate: str) -> str:
     return f"anpr:cooldown:{site_id}:{plate}"
 
@@ -306,7 +354,7 @@ def apply_gate_event(
             purpose_of_visit="CCTV gate",
             vehicle_number=plate,
             vehicle_type=vehicle_type,
-            visit_date=now.date(),
+            visit_date=_cctv_visit_date(location),
             check_in_time=now,
             qr_token=make_qr_token(),
             qr_expired=True,

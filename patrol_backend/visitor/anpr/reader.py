@@ -57,7 +57,21 @@ def _open_rtsp(url: str) -> Optional[cv2.VideoCapture]:
     if not cap.isOpened():
         cap.release()
         return None
+    # Prefer newest frame; large OpenCV buffers are how overnight stills get stuck
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
     return cap
+
+
+def _frame_fingerprint(frame) -> Optional[bytes]:
+    """Tiny downscale fingerprint — identical bytes ⇒ frozen / duplicate RTSP frame."""
+    try:
+        small = cv2.resize(frame, (32, 18), interpolation=cv2.INTER_AREA)
+        return small.tobytes()
+    except Exception:
+        return None
 
 
 def _pending_dir() -> str:
@@ -90,6 +104,12 @@ class CameraWorker:
         self._tick_count = 0
         self._last_status_log = 0.0
         self._plates_loaded_logged = False
+        # Frozen-RTSP detection: same downscaled fingerprint for too long → reconnect
+        self._last_frame_fp = None
+        self._frame_fp_same_since = 0.0
+        self._freeze_reconnect_sec = float(
+            os.environ.get("ANPR_FREEZE_RECONNECT_SEC", "20") or 20
+        )
         if self.gate_mode == "line_direction" and self.line is None:
             logger.warning(
                 "[ANPR_READER] camera=%s gate_mode=line_direction but no virtual line — "
@@ -98,12 +118,21 @@ class CameraWorker:
             )
 
     def close(self) -> None:
-        if self.cap is not None:
-            try:
+        self._drop_capture(0.0, reset_tracker=False)
+
+    def _drop_capture(self, reconnect_in: float = 3.0, *, reset_tracker: bool = False) -> None:
+        try:
+            if self.cap is not None:
                 self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
+        except Exception:
+            pass
+        self.cap = None
+        self.reconnect_at = time.monotonic() + max(0.0, reconnect_in)
+        self._last_frame_fp = None
+        self._frame_fp_same_since = 0.0
+        if reset_tracker:
+            # Drop phantom tracks tied to a frozen overnight frame
+            self.tracker = SimpleTracker(camera_key=str(self.camera.id)[:8])
 
     def ensure_capture(self) -> bool:
         now = time.monotonic()
@@ -122,21 +151,37 @@ class CameraWorker:
     def read_latest(self):
         if not self.ensure_capture():
             return None
-        # Drain a few frames to reduce lag
+        # Drain RTSP buffer so we process near-live frames (stuck buffer = spam on old plate)
+        drain_n = int(os.environ.get("ANPR_RTSP_DRAIN_FRAMES", "12") or 12)
+        drain_n = max(3, min(drain_n, 30))
         ok, frame = False, None
-        for _ in range(3):
+        for _ in range(drain_n):
             ok, frame = self.cap.read()
             if not ok:
                 break
         if not ok or frame is None:
             logger.warning("[ANPR_READER] read fail camera=%s — reconnect", self.camera.id)
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
-            self.reconnect_at = time.monotonic() + 3.0
+            self._drop_capture(3.0, reset_tracker=True)
             return None
+
+        # Detect frozen stream (OpenCV keeps returning the same last frame)
+        fp = _frame_fingerprint(frame)
+        now_m = time.monotonic()
+        if fp is not None:
+            if fp == self._last_frame_fp:
+                if self._frame_fp_same_since <= 0:
+                    self._frame_fp_same_since = now_m
+                elif (now_m - self._frame_fp_same_since) >= self._freeze_reconnect_sec:
+                    logger.warning(
+                        "[ANPR_READER] frozen RTSP camera=%s for %.0fs — reconnect",
+                        self.camera.id,
+                        now_m - self._frame_fp_same_since,
+                    )
+                    self._drop_capture(2.0, reset_tracker=True)
+                    return None
+            else:
+                self._last_frame_fp = fp
+                self._frame_fp_same_since = 0.0
         return frame
 
     def process_tick(self, frame) -> None:
@@ -229,32 +274,13 @@ class CameraWorker:
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         sharp = _sharpness(gray)
-        rearm_after = float(anpr_settings.cooldown_sec())
 
         min_hits = anpr_settings.min_track_hits()
         for tr in tracks:
-            # After OCR enqueue, parked cars stay matched to same track forever —
-            # re-arm after gate cooldown so toggle can fire check-in again.
-            if (
-                tr.state in ("OCR_QUEUED", "COOLDOWN")
-                and tr.queued_at > 0
-                and (now_m - tr.queued_at) >= rearm_after
-            ):
-                logger.info(
-                    "[ANPR_READER] rearm track=%s camera=%s after %.0fs",
-                    tr.track_id,
-                    self.camera.id,
-                    rearm_after,
-                )
-                tr.state = "STABLE"
-                tr.crossed = False
-                tr.cross_dir = 0
-                tr.best_jpeg = None
-                tr.best_evidence_jpeg = None
-                tr.best_sharpness = -1.0
-                tr.best_meta = {}
-                tr.hits = min_hits  # need a few more frames before parked fallback
-                tr.queued_at = 0.0
+            # Do NOT re-arm OCR_QUEUED/COOLDOWN while the same track is still visible.
+            # Parked bikes / stuck RTSP frames kept matching forever and rearmed every
+            # cooldown_sec → overnight IN/OUT spam on the same plate+image.
+            # A new visit requires the track to drop (misses) then a fresh STABLE track.
 
             # Update best frame while tracking
             if tr.state in ("CANDIDATE", "STABLE") and sharp >= tr.best_sharpness:

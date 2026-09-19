@@ -34,30 +34,36 @@ def resolve_location_for_request(request, location_id=None):
 
 def _date_range_q(start_date, end_date, start_utc, end_utc):
     """
-    Filter by visit_date when set (day the visit is for).
-    Fallback when visit_date is null: check_in_time, else created_on.
+    Activity-day filter in the requester's timezone window (start_utc..end_utc).
+
+    - Already checked in → match check_in_time (real gate activity day).
+    - Planned / not yet checked in → match visit_date calendar day.
+    - Legacy rows with neither → match created_on.
+
+    Preferring visit_date for checked-in ANPR rows caused custom date=18 to also
+    return 19th-IST check-ins when visit_date was stamped from UTC midnight.
     """
     from django.db.models import Q
 
-    end_exclusive = end_utc + timedelta(days=1)
+    # convert_date_range_to_utc already ends at local 23:59:59.999999 → UTC
     return (
-        Q(visit_date__gte=start_date, visit_date__lte=end_date)
+        Q(check_in_time__gte=start_utc, check_in_time__lte=end_utc)
         | Q(
-            visit_date__isnull=True,
-            check_in_time__gte=start_utc,
-            check_in_time__lt=end_exclusive,
+            check_in_time__isnull=True,
+            visit_date__gte=start_date,
+            visit_date__lte=end_date,
         )
         | Q(
-            visit_date__isnull=True,
             check_in_time__isnull=True,
+            visit_date__isnull=True,
             created_on__gte=start_utc,
-            created_on__lt=end_exclusive,
+            created_on__lte=end_utc,
         )
     )
 
 
 def apply_checkin_date_filter(queryset, request, location_id, date_filter, start_date=None, end_date=None):
-    """Filter by visit_date (primary), else check_in_time / created_on."""
+    """Filter entries by check_in activity day (or planned visit_date if not checked in)."""
     user_tz = get_user_timezone_from_request(request, location_id=location_id)
     user_today = get_user_today(user_tz)
     date_filter = (date_filter or "today").lower()
