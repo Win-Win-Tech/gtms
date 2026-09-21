@@ -5,6 +5,26 @@ from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, 
 from .models import Visitor, VisitorAsset, VisitorEntry
 
 
+def entry_needs_details(entry) -> bool:
+    """
+    True when a CCTV entry still needs real visitor name + phone.
+
+    ANPR stores the plate as visitor_name and leaves phone empty — treat plate
+    (or blank) as "name not filled". Default False for non-CCTV.
+    """
+    if getattr(entry, "entry_source", None) != VisitorEntry.ENTRY_CCTV:
+        return False
+    visitor = getattr(entry, "visitor", None)
+    name = (getattr(visitor, "visitor_name", None) or "").strip() if visitor else ""
+    phone = (getattr(visitor, "phone_number", None) or "").strip() if visitor else ""
+    plate = (getattr(entry, "vehicle_number", None) or "").strip()
+    name_norm = "".join(name.upper().split())
+    plate_norm = "".join(plate.upper().split())
+    name_missing = (not name) or (bool(plate_norm) and name_norm == plate_norm)
+    phone_missing = not phone
+    return name_missing or phone_missing
+
+
 def _abs_media_url(file_field, request):
     if not file_field:
         return None
@@ -77,6 +97,7 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
     qr_image_url = serializers.SerializerMethodField()
     pass_image_url = serializers.SerializerMethodField()
     qr_usable = serializers.SerializerMethodField()
+    needs_details = serializers.SerializerMethodField()
     assets = VisitorAssetSerializer(many=True, read_only=True)
 
     check_in_time = serializers.SerializerMethodField()
@@ -120,6 +141,7 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
             "pass_image_url",
             "qr_expired",
             "qr_usable",
+            "needs_details",
             "approved_by_id",
             "approved_by_name",
             "approved_on",
@@ -168,6 +190,9 @@ class VisitorEntrySerializer(serializers.ModelSerializer):
 
     def get_qr_usable(self, obj):
         return obj.is_qr_usable
+
+    def get_needs_details(self, obj):
+        return entry_needs_details(obj)
 
     def get_check_in_time(self, obj):
         return _fmt_dt(obj.check_in_time, self.context.get("request"), self._loc_id(obj))

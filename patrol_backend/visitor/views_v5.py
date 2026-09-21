@@ -24,6 +24,7 @@ from .views import (
     VisitorCheckInView,
     VisitorCheckOutView,
     VisitorCompleteInviteView,
+    VisitorEntryContactDetailsView,
     VisitorInviteCreateView,
     VisitorPassDownloadView,
     VisitorQrScanView,
@@ -253,6 +254,36 @@ class VisitorEntryDetailViewV5(APIView):
             return Response(_v5_entry_payload(entry, request))
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
+
+
+class VisitorEntryContactDetailsViewV5(VisitorEntryContactDetailsView):
+    """PATCH/POST /visitors/v5/entries/<id>/contact-details/ — CCTV name + phone."""
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [FormParser, JSONParser, MultiPartParser]
+
+    def _run(self, request, entry_id, *, method):
+        try:
+            entry = _base_entry_qs().filter(id=entry_id).first()
+            if not entry:
+                return Response(
+                    {"error": "Visitor entry not found"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            _assert_entry_site_access(request, entry)
+        except (ValidationError, PermissionDenied) as exc:
+            return _v5_error(exc)
+        if method == "patch":
+            response = super().patch(request, entry_id)
+        else:
+            response = super().post(request, entry_id)
+        return _attach_site_from_response(response, request, site=None)
+
+    def patch(self, request, entry_id):
+        return self._run(request, entry_id, method="patch")
+
+    def post(self, request, entry_id):
+        return self._run(request, entry_id, method="post")
 
 
 class VisitorSearchViewV5(VisitorSearchView):

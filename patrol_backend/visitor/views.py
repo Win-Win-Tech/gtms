@@ -1211,6 +1211,84 @@ class VisitorEntryDetailView(APIView):
         )
 
 
+class VisitorEntryContactDetailsView(APIView):
+    """
+    PATCH/POST /visitors/entries/<id>/contact-details/
+
+    CCTV rows are created with plate as name and empty phone. This endpoint
+    updates only visitor_name + phone_number on the linked Visitor.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+
+    @transaction.atomic
+    def patch(self, request, entry_id):
+        return self._update(request, entry_id)
+
+    @transaction.atomic
+    def post(self, request, entry_id):
+        return self._update(request, entry_id)
+
+    def _update(self, request, entry_id):
+        try:
+            entry = _base_entry_qs().select_for_update().select_related("visitor").get(id=entry_id)
+        except VisitorEntry.DoesNotExist:
+            return Response({"error": "Entry not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _can_access_entry(request, entry):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        if entry.entry_source != VisitorEntry.ENTRY_CCTV:
+            return Response(
+                {"error": "Contact details can only be updated for CCTV entries"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        visitor_name = (request.data.get("visitor_name") or "").strip()
+        phone_number = (request.data.get("phone_number") or "").strip()
+        if not visitor_name:
+            return Response(
+                {"error": "visitor_name is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not phone_number:
+            return Response(
+                {"error": "phone_number is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        phone_digits = "".join(ch for ch in phone_number if ch.isdigit())
+        if phone_digits != phone_number or len(phone_digits) < 7:
+            return Response(
+                {"error": "phone_number must be digits only (min 7)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        phone_number = phone_digits[:32]
+
+        plate = (entry.vehicle_number or "").strip()
+        if plate and "".join(visitor_name.upper().split()) == "".join(plate.upper().split()):
+            return Response(
+                {"error": "visitor_name must be the person name, not the vehicle number"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        visitor = entry.visitor
+        if not visitor:
+            return Response(
+                {"error": "Visitor record missing for this entry"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        visitor.visitor_name = visitor_name[:255]
+        visitor.phone_number = phone_number[:32]
+        visitor.save(update_fields=["visitor_name", "phone_number", "modified_on"])
+
+        entry = _base_entry_qs().get(id=entry.id)
+        return Response(
+            VisitorEntrySerializer(entry, context={"request": request}).data
+        )
+
+
 class VisitorEntryExportView(APIView):
     permission_classes = [IsAuthenticated]
 

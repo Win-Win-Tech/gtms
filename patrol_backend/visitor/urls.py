@@ -11,6 +11,7 @@ from .views import (
     VisitorEntryExportPdfView,
     VisitorEntryExportView,
     VisitorEntryListView,
+    VisitorEntryContactDetailsView,
     VisitorInviteCreateView,
     VisitorPassDownloadView,
     VisitorQrScanView,
@@ -31,6 +32,7 @@ from .views_v5 import (
     VisitorCheckInViewV5,
     VisitorCheckOutViewV5,
     VisitorCompleteInviteViewV5,
+    VisitorEntryContactDetailsViewV5,
     VisitorEntryDetailViewV5,
     VisitorEntryExportPdfViewV5,
     VisitorEntryExportViewV5,
@@ -70,6 +72,11 @@ urlpatterns = [
         "entries/<uuid:entry_id>/",
         VisitorEntryDetailView.as_view(),
         name="visitor-entries-detail",
+    ),
+    path(
+        "entries/<uuid:entry_id>/contact-details/",
+        VisitorEntryContactDetailsView.as_view(),
+        name="visitor-entries-contact-details",
     ),
     path(
         "entries/<uuid:entry_id>/approve/",
@@ -149,6 +156,11 @@ urlpatterns = [
         "v5/entries/<uuid:entry_id>/",
         VisitorEntryDetailViewV5.as_view(),
         name="visitor-entries-detail-v5",
+    ),
+    path(
+        "v5/entries/<uuid:entry_id>/contact-details/",
+        VisitorEntryContactDetailsViewV5.as_view(),
+        name="visitor-entries-contact-details-v5",
     ),
     path(
         "v5/entries/<uuid:entry_id>/approve/",

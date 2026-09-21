@@ -190,7 +190,8 @@ def apply_gate_event(
             visitor_name=plate,
             phone_number="",
         )
-    elif visitor.visitor_name != plate:
+    elif visitor.visitor_name != plate and not (visitor.phone_number or "").strip():
+        # Keep manually filled contact name once phone was set via contact-details API
         visitor.visitor_name = plate
         visitor.save(update_fields=["visitor_name", "modified_on"])
 
@@ -246,16 +247,15 @@ def apply_gate_event(
             plate = other or plate
             visitor = best.visitor
             ic = synthetic_ic(plate)
-            if visitor.visitor_name != plate or visitor.ic_passport_number != ic:
-                visitor.visitor_name = plate
+            if visitor.ic_passport_number != ic:
                 visitor.ic_passport_number = ic
-                visitor.save(
-                    update_fields=[
-                        "visitor_name",
-                        "ic_passport_number",
-                        "modified_on",
-                    ]
-                )
+                visitor.save(update_fields=["ic_passport_number", "modified_on"])
+            if (
+                visitor.visitor_name != plate
+                and not (visitor.phone_number or "").strip()
+            ):
+                visitor.visitor_name = plate
+                visitor.save(update_fields=["visitor_name", "modified_on"])
 
     mode = (direction_mode or "toggle").lower()
     if mode not in ("toggle", "in", "out"):
