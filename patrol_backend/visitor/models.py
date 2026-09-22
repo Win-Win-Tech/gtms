@@ -170,6 +170,11 @@ class VisitorEntry(models.Model):
 
     check_in_time = models.DateTimeField(null=True, blank=True)
     check_out_time = models.DateTimeField(null=True, blank=True)
+    overstay_alert_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When vehicle overstay SOS was sent (once per checked-in visit).",
+    )
 
     qr_token = models.CharField(max_length=64, unique=True, db_index=True)
     qr_image = models.ImageField(upload_to="visitor_qr/", null=True, blank=True)
@@ -239,6 +244,7 @@ class VisitorEntry(models.Model):
             models.Index(fields=["location", "check_in_time"]),
             models.Index(fields=["status", "check_in_time"]),
             models.Index(fields=["host", "status"]),
+            models.Index(fields=["status", "overstay_alert_sent_at", "check_in_time"]),
         ]
 
     def __str__(self):
@@ -336,6 +342,54 @@ class VisitorLookupOption(models.Model):
         if self.label:
             self.label = self.label.strip()
         super().save(*args, **kwargs)
+
+
+class VehicleOverstayWhitelist(models.Model):
+    """Org-wide plates that never get vehicle overstay SOS."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        related_name="vehicle_overstay_whitelist",
+    )
+    vehicle_number = models.CharField(max_length=32, db_index=True)
+    notes = models.CharField(max_length=255, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vehicle_overstay_whitelist_created",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    is_deleted = models.BooleanField(default=False)
+    deleted_on = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vehicle_overstay_whitelist_deleted",
+    )
+
+    class Meta:
+        ordering = ["-created_on"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["location", "vehicle_number"],
+                condition=models.Q(is_deleted=False),
+                name="unique_overstay_whitelist_plate_per_location_active",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["location", "is_deleted"]),
+            models.Index(fields=["location", "vehicle_number"]),
+        ]
+
+    def __str__(self):
+        return f"{self.vehicle_number} ({self.location_id})"
 
 
 @receiver(post_save, sender=VisitorLookupOption)

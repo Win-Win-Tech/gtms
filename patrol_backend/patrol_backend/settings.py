@@ -362,6 +362,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'livetracking.tasks.check_location_missing_alerts',
         'schedule': crontab(minute='*/2'),
     },
+    'check-vehicle-overstay': {
+        'task': 'visitor.tasks.check_vehicle_overstay',
+        'schedule': crontab(minute='*/5'),
+    },
     'cleanup-old-media-files': {
         'task': 'dashboard.tasks.cleanup_old_media_files',
         'schedule': crontab(day_of_week="Sunday", hour=0,minute=0),

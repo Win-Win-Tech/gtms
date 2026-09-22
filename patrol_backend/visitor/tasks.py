@@ -1,6 +1,20 @@
-"""Celery task imports for the visitor app (autodiscover)."""
+"""Celery tasks for visitor module (overstay, etc.)."""
 
-# Ensure ANPR tasks are registered when Celery loads `visitor.tasks`
-from visitor.anpr.tasks import process_anpr_frame  # noqa: F401
+import logging
 
-__all__ = ["process_anpr_frame"]
+from celery import shared_task
+
+from visitor.overstay import process_vehicle_overstay
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(name="visitor.tasks.check_vehicle_overstay")
+def check_vehicle_overstay(location_id=None):
+    """
+    Celery Beat: raise vehicle overstay SOS for checked-in vehicles
+    past SiteSetting vehicle_overstay_hours (org-wide whitelist skipped).
+    """
+    summary = process_vehicle_overstay(location_id=location_id)
+    logger.info("[CELERY] check_vehicle_overstay %s", summary)
+    return summary
