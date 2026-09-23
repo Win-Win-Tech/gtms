@@ -45,12 +45,14 @@ class NotificationLog(models.Model):
     TYPE_VISITOR_CANCELLED = "visitor_cancelled"
     TYPE_VISITOR_REVERTED = "visitor_reverted"
     TYPE_VISITOR_RESCHEDULED = "visitor_rescheduled"
+    TYPE_VEHICLE_OVERSTAY = "vehicle_overstay"
     TYPE_CHOICES = [
         (TYPE_VISITOR_PENDING, "Visitor pending approval"),
         (TYPE_VISITOR_APPROVED, "Visitor approved"),
         (TYPE_VISITOR_CANCELLED, "Visitor cancelled"),
         (TYPE_VISITOR_REVERTED, "Visitor reverted"),
         (TYPE_VISITOR_RESCHEDULED, "Visitor rescheduled"),
+        (TYPE_VEHICLE_OVERSTAY, "Vehicle overstay"),
     ]
 
     CHANNEL_PUSH = "push"

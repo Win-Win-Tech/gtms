@@ -236,3 +236,62 @@ def notify_visitor_host_action(entry, notif_type: str, title: str, body: str, ex
             notif_type,
             getattr(entry, "id", None),
         )
+
+
+def notify_vehicle_overstay(entry, recipients) -> int:
+    """
+    Write NotificationLog + FCM for each overstay recipient.
+    Returns count of logs created (0 if none / failure).
+    """
+    from visitor.anpr.gate import normalize_plate
+
+    if not entry or not recipients:
+        return 0
+
+    plate = normalize_plate(getattr(entry, "vehicle_number", "") or "") or (
+        (getattr(entry, "vehicle_number", None) or "UNKNOWN").strip().upper()
+    )
+    site = getattr(entry, "site", None)
+    site_name = getattr(site, "name", None) or "site"
+    visitor = getattr(entry, "visitor", None)
+    visitor_name = (getattr(visitor, "visitor_name", None) or "").strip()
+    if visitor_name and normalize_plate(visitor_name) == plate:
+        visitor_name = ""
+
+    title = "Vehicle overstay"
+    body_parts = [f"Vehicle {plate} overstay at {site_name}."]
+    if visitor_name:
+        body_parts.append(f"Visitor: {visitor_name}.")
+    check_in = getattr(entry, "check_in_time", None)
+    if check_in:
+        body_parts.append(f"Check-in: {check_in.isoformat()}.")
+    body = " ".join(body_parts)
+
+    extra = {
+        "vehicle_number": plate,
+        "site_id": str(site.id) if site else "",
+        "site_name": site_name,
+    }
+    if check_in:
+        extra["check_in_time"] = check_in.isoformat()
+
+    created = 0
+    for user in recipients:
+        try:
+            log = notify_user(
+                user,
+                NotificationLog.TYPE_VEHICLE_OVERSTAY,
+                title,
+                body,
+                data=_entry_payload(entry, NotificationLog.TYPE_VEHICLE_OVERSTAY, extra),
+                entry=entry,
+            )
+            if log is not None:
+                created += 1
+        except Exception:
+            logger.exception(
+                "notify_vehicle_overstay failed entry=%s user=%s",
+                getattr(entry, "id", None),
+                getattr(user, "id", None),
+            )
+    return created

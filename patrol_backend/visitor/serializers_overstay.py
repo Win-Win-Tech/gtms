@@ -2,7 +2,7 @@ from rest_framework import serializers
 
 from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, to_user_timezone
 
-from .models import VehicleOverstayWhitelist
+from .models import SiteVehicleOverstayRecipient, VehicleOverstayWhitelist
 
 
 class VehicleOverstayWhitelistSerializer(serializers.ModelSerializer):
@@ -34,3 +34,21 @@ class VehicleOverstayWhitelistSerializer(serializers.ModelSerializer):
         user_tz = get_user_timezone_from_request(request, location_id=loc_id)
         local = to_user_timezone(obj.created_on, user_tz)
         return local.isoformat() if local else None
+
+
+class SiteVehicleOverstayRecipientSerializer(serializers.ModelSerializer):
+    site_id = serializers.UUIDField(source="site.id", read_only=True)
+    site_name = serializers.CharField(source="site.name", read_only=True)
+    recipient_role_id = serializers.IntegerField(source="recipient_role.id", read_only=True)
+    recipient_role_name = serializers.CharField(source="recipient_role.name", read_only=True)
+
+    class Meta:
+        model = SiteVehicleOverstayRecipient
+        fields = [
+            "id",
+            "site_id",
+            "site_name",
+            "recipient_role_id",
+            "recipient_role_name",
+        ]
+        read_only_fields = fields

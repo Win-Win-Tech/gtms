@@ -2,6 +2,8 @@
 
 Org-wide overstay detection for **still checked-in** vehicles. SOS delivery to roles is **Phase 3**.
 
+Full phased plan (status + Phase 3 scope): [`VEHICLE_OVERSTAY_SOS_PLAN.md`](./VEHICLE_OVERSTAY_SOS_PLAN.md)
+
 | | |
 |---|---|
 | **Auth** | `Authorization: Bearer <JWT>` |

@@ -52,6 +52,14 @@ REPORT_CATALOG = [
         "default_schedule": Item.SCHEDULE_DAILY,
     },
     {
+        "code": Item.REPORT_VEHICLE_OVERSTAY,
+        "label": "Vehicle Overstay",
+        "supports_pdf": True,
+        "supports_excel": True,
+        "supports_site_wise": True,
+        "default_schedule": Item.SCHEDULE_DAILY,
+    },
+    {
         "code": Item.REPORT_MONTHLY_ATTENDANCE,
         "label": "Monthly Attendance Summary",
         "supports_pdf": False,

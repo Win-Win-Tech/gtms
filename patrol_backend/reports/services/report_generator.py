@@ -537,6 +537,76 @@ def _vehicle_generate(location_id, period, site_id, request, send_pdf, send_exce
 
 
 # ---------------------------------------------------------------------------
+# Vehicle overstay
+# ---------------------------------------------------------------------------
+
+def _vehicle_overstay_data(location_id, period, site_id, request, include_whitelist=False):
+    from visitor.vehicle_overstay_report import build_vehicle_overstay_report
+
+    start, end = _period_dates(period)
+    return build_vehicle_overstay_report(
+        request,
+        str(location_id),
+        date_filter="custom",
+        start_date_str=start,
+        end_date_str=end,
+        site_id=str(site_id) if site_id else None,
+        include_whitelist=include_whitelist,
+    )
+
+
+def _vehicle_overstay_has_data(location_id, period, site_id, request):
+    try:
+        data = _vehicle_overstay_data(location_id, period, site_id, request, include_whitelist=False)
+    except Exception:
+        logger.exception("vehicle overstay has_data failed")
+        return False
+    return (data.get("total") or 0) > 0
+
+
+def _vehicle_overstay_generate(location_id, period, site_id, request, send_pdf, send_excel, label):
+    from visitor.vehicle_overstay_report import (
+        generate_vehicle_overstay_excel,
+        generate_vehicle_overstay_pdf,
+    )
+
+    if not _vehicle_overstay_has_data(location_id, period, site_id, request):
+        return []
+    data = _vehicle_overstay_data(location_id, period, site_id, request, include_whitelist=False)
+
+    attachments = []
+    start, _ = _period_dates(period)
+    base = f"vehicle_overstay_{_safe_name(label)}_{start}"
+    row_count = data.get("total") or 0
+
+    if send_excel:
+        content, _fname = _http_to_bytes(generate_vehicle_overstay_excel(data))
+        attachments.append(
+            {
+                "filename": f"{base}.xlsx",
+                "content": content,
+                "mime": MIME_XLSX,
+                "format": "excel",
+                "row_count": row_count,
+                "display_name": f"Vehicle Overstay ({label})",
+            }
+        )
+    if send_pdf:
+        content, filename = generate_vehicle_overstay_pdf(data, request=request)
+        attachments.append(
+            {
+                "filename": filename if str(filename).endswith(".pdf") else f"{base}.pdf",
+                "content": content,
+                "mime": MIME_PDF,
+                "format": "pdf",
+                "row_count": row_count,
+                "display_name": f"Vehicle Overstay ({label})",
+            }
+        )
+    return attachments
+
+
+# ---------------------------------------------------------------------------
 # Monthly attendance
 # ---------------------------------------------------------------------------
 
@@ -659,6 +729,7 @@ _HANDLERS = {
     Item.REPORT_INCIDENT: (_incident_has_data, _incident_generate),
     Item.REPORT_VISITOR_ENTRIES: (_visitor_has_data, _visitor_generate),
     Item.REPORT_VEHICLE_MOVEMENT: (_vehicle_has_data, _vehicle_generate),
+    Item.REPORT_VEHICLE_OVERSTAY: (_vehicle_overstay_has_data, _vehicle_overstay_generate),
     Item.REPORT_MONTHLY_ATTENDANCE: (_monthly_att_has_data, _monthly_att_generate),
     Item.REPORT_MONTHLY_LOCATION: (_monthly_loc_has_data, _monthly_loc_generate),
 }

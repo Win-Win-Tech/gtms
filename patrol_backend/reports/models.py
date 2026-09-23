@@ -95,6 +95,7 @@ class LocationReportEmailItem(models.Model):
     REPORT_INCIDENT = "incident"
     REPORT_VISITOR_ENTRIES = "visitor_entries"
     REPORT_VEHICLE_MOVEMENT = "vehicle_movement"
+    REPORT_VEHICLE_OVERSTAY = "vehicle_overstay"
     REPORT_MONTHLY_ATTENDANCE = "monthly_attendance"
     REPORT_MONTHLY_LOCATION = "monthly_location"
     REPORT_CODE_CHOICES = (
@@ -104,6 +105,7 @@ class LocationReportEmailItem(models.Model):
         (REPORT_INCIDENT, "Incident Report"),
         (REPORT_VISITOR_ENTRIES, "Visitor Entries"),
         (REPORT_VEHICLE_MOVEMENT, "Vehicle Movement"),
+        (REPORT_VEHICLE_OVERSTAY, "Vehicle Overstay"),
         (REPORT_MONTHLY_ATTENDANCE, "Monthly Attendance Summary"),
         (REPORT_MONTHLY_LOCATION, "Monthly Location Summary"),
     )

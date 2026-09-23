@@ -32,6 +32,12 @@ from .vehicle_movement_report import (
     generate_vehicle_movement_excel,
     generate_vehicle_movement_pdf,
 )
+from .vehicle_overstay_report import (
+    _parse_bool,
+    build_vehicle_overstay_report,
+    generate_vehicle_overstay_excel,
+    generate_vehicle_overstay_pdf,
+)
 from .utils import (
     apply_checkin_date_filter,
     make_qr_token,
@@ -1696,6 +1702,93 @@ class VehicleMovementReportExportPdfView(APIView):
             return error_response
         try:
             content, filename = generate_vehicle_movement_pdf(data, request)
+        except ImportError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+def _vehicle_overstay_report_from_request(request, *, site_id=None):
+    location_id_param = request.query_params.get("location_id") or request.query_params.get(
+        "location"
+    )
+    location_id, err = resolve_location_for_request(request, location_id_param)
+    if err:
+        return None, Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+    if not location_id:
+        return None, Response(
+            {"error": "location_id is required"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    date_filter = request.query_params.get("date_filter") or "today"
+    include_whitelist = _parse_bool(
+        request.query_params.get("include_whitelist"), default=False
+    )
+    search = request.query_params.get("search") or request.query_params.get("q")
+    status_filter = request.query_params.get("status") or "all"
+    vehicle_type = request.query_params.get("vehicle_type")
+
+    try:
+        data = build_vehicle_overstay_report(
+            request,
+            location_id,
+            date_filter=date_filter,
+            start_date_str=request.query_params.get("start_date"),
+            end_date_str=request.query_params.get("end_date"),
+            start_time_str=request.query_params.get("start_time"),
+            end_time_str=request.query_params.get("end_time"),
+            site_id=site_id,
+            include_whitelist=include_whitelist,
+            search=search,
+            status_filter=status_filter,
+            vehicle_type=vehicle_type,
+        )
+    except ValueError as exc:
+        return None, Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return data, None
+
+
+class VehicleOverstayReportView(APIView):
+    """GET /visitors/reports/vehicle-overstay/"""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request(request)
+        if error_response:
+            return error_response
+        return Response(data)
+
+
+class VehicleOverstayReportExportView(APIView):
+    """GET /visitors/reports/vehicle-overstay/export/"""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request(request)
+        if error_response:
+            return error_response
+        return generate_vehicle_overstay_excel(data)
+
+
+class VehicleOverstayReportExportPdfView(APIView):
+    """GET /visitors/reports/vehicle-overstay/export-pdf/"""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request(request)
+        if error_response:
+            return error_response
+        try:
+            content, filename = generate_vehicle_overstay_pdf(data, request)
         except ImportError as exc:
             return Response(
                 {"error": str(exc)},

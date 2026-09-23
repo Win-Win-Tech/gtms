@@ -392,6 +392,36 @@ class VehicleOverstayWhitelist(models.Model):
         return f"{self.vehicle_number} ({self.location_id})"
 
 
+class SiteVehicleOverstayRecipient(models.Model):
+    """Per-site roles that receive vehicle overstay SOS (TrackingAlert)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.CASCADE,
+        related_name="vehicle_overstay_recipients",
+    )
+    recipient_role = models.ForeignKey(
+        "authapp.Role",
+        on_delete=models.CASCADE,
+        related_name="site_vehicle_overstay_as_recipient",
+        help_text="Role that should receive vehicle overstay SOS for this site",
+    )
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["site__name", "recipient_role__name"]
+        unique_together = ("site", "recipient_role")
+        indexes = [
+            models.Index(fields=["site"]),
+        ]
+
+    def __str__(self):
+        role_name = getattr(self.recipient_role, "name", self.recipient_role_id)
+        return f"{self.site_id} → {role_name}"
+
+
 @receiver(post_save, sender=VisitorLookupOption)
 def propagate_new_global_lookup_option(sender, instance, created, **kwargs):
     """When a global template is created, copy it to all existing locations."""

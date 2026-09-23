@@ -21,12 +21,18 @@ from .views import (
     VehicleMovementReportExportPdfView,
     VehicleMovementReportExportView,
     VehicleMovementReportView,
+    VehicleOverstayReportExportPdfView,
+    VehicleOverstayReportExportView,
+    VehicleOverstayReportView,
 )
 from .views_ai import VisitorAiExtractV2View, VisitorAiExtractView
 from .views_v5 import (
     VehicleMovementReportExportPdfViewV5,
     VehicleMovementReportExportViewV5,
     VehicleMovementReportViewV5,
+    VehicleOverstayReportExportPdfViewV5,
+    VehicleOverstayReportExportViewV5,
+    VehicleOverstayReportViewV5,
     VisitorApproveViewV5,
     VisitorCancelViewV5,
     VisitorCheckInViewV5,
@@ -46,6 +52,7 @@ from .views_v5 import (
 )
 from .views_lookup import VisitorLookupOptionViewSet
 from .views_overstay import (
+    SiteVehicleOverstayRecipientView,
     VehicleOverstayVehicleSuggestView,
     VehicleOverstayWhitelistDetailView,
     VehicleOverstayWhitelistListCreateView,
@@ -129,6 +136,21 @@ urlpatterns = [
         name="visitor-vehicle-movement-export-pdf",
     ),
     path(
+        "reports/vehicle-overstay/",
+        VehicleOverstayReportView.as_view(),
+        name="visitor-vehicle-overstay-report",
+    ),
+    path(
+        "reports/vehicle-overstay/export/",
+        VehicleOverstayReportExportView.as_view(),
+        name="visitor-vehicle-overstay-export",
+    ),
+    path(
+        "reports/vehicle-overstay/export-pdf/",
+        VehicleOverstayReportExportPdfView.as_view(),
+        name="visitor-vehicle-overstay-export-pdf",
+    ),
+    path(
         "overstay-whitelist/",
         VehicleOverstayWhitelistListCreateView.as_view(),
         name="visitor-overstay-whitelist",
@@ -142,6 +164,11 @@ urlpatterns = [
         "overstay-whitelist/<uuid:whitelist_id>/",
         VehicleOverstayWhitelistDetailView.as_view(),
         name="visitor-overstay-whitelist-detail",
+    ),
+    path(
+        "overstay-alert-recipients/",
+        SiteVehicleOverstayRecipientView.as_view(),
+        name="visitor-overstay-alert-recipients",
     ),
     # --- v5 (site-wise) ---
     path("v5/search/", VisitorSearchViewV5.as_view(), name="visitor-search-v5"),
@@ -228,6 +255,21 @@ urlpatterns = [
         name="visitor-vehicle-movement-export-pdf-v5",
     ),
     path(
+        "v5/reports/vehicle-overstay/",
+        VehicleOverstayReportViewV5.as_view(),
+        name="visitor-vehicle-overstay-report-v5",
+    ),
+    path(
+        "v5/reports/vehicle-overstay/export/",
+        VehicleOverstayReportExportViewV5.as_view(),
+        name="visitor-vehicle-overstay-export-v5",
+    ),
+    path(
+        "v5/reports/vehicle-overstay/export-pdf/",
+        VehicleOverstayReportExportPdfViewV5.as_view(),
+        name="visitor-vehicle-overstay-export-pdf-v5",
+    ),
+    path(
         "v5/overstay-whitelist/",
         VehicleOverstayWhitelistListCreateView.as_view(),
         name="visitor-overstay-whitelist-v5",
@@ -241,6 +283,11 @@ urlpatterns = [
         "v5/overstay-whitelist/<uuid:whitelist_id>/",
         VehicleOverstayWhitelistDetailView.as_view(),
         name="visitor-overstay-whitelist-detail-v5",
+    ),
+    path(
+        "v5/overstay-alert-recipients/",
+        SiteVehicleOverstayRecipientView.as_view(),
+        name="visitor-overstay-alert-recipients-v5",
     ),
     path("", include(router.urls)),
 ]

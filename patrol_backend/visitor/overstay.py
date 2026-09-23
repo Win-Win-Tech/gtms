@@ -1,18 +1,21 @@
-"""Vehicle overstay detection (Phase 2). Alert delivery wired in Phase 3."""
+"""Vehicle overstay detection + visitor NotificationLog delivery."""
 
 from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
 from django.db.models import Q
 from django.utils import timezone
 
+from authapp.models import User
+from authapp.site_access import users_queryset_for_site
+from notifications.services import notify_vehicle_overstay
 from scheduler.models import SiteSetting
 
 from .anpr.gate import normalize_plate
-from .models import VehicleOverstayWhitelist, VisitorEntry
+from .models import SiteVehicleOverstayRecipient, VehicleOverstayWhitelist, VisitorEntry
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +47,78 @@ def is_plate_whitelisted(location_id, vehicle_number: str) -> bool:
     ).exists()
 
 
+def get_overstay_recipients_for_site(site) -> List[User]:
+    """
+    Users who receive overstay SOS:
+    - Configured SiteVehicleOverstayRecipient roles with site access
+    - Always: org Admin users for the site's location (Admin is not configurable in UI)
+    """
+    if site is None:
+        return []
+
+    role_names = [
+        name
+        for name in SiteVehicleOverstayRecipient.objects.filter(site=site)
+        .select_related("recipient_role")
+        .values_list("recipient_role__name", flat=True)
+        if name and str(name).lower() != "admin"
+    ]
+
+    role_users: List[User] = []
+    if role_names:
+        role_filter = Q()
+        for name in role_names:
+            role_filter |= Q(role__iexact=name)
+        role_users = list(
+            users_queryset_for_site(site)
+            .filter(role_filter, is_active=True, is_deleted=False)
+            .distinct()
+        )
+
+    location_id = getattr(site, "location_id", None)
+    admin_users: List[User] = []
+    if location_id:
+        admin_users = list(
+            User.objects.filter(
+                location_id=location_id,
+                role__iexact="admin",
+                is_active=True,
+                is_deleted=False,
+            )
+        )
+
+    return list({u.id: u for u in (role_users + admin_users)}.values())
+
+
 def try_send_vehicle_overstay_alert(entry: VisitorEntry) -> bool:
     """
-    Phase 3: create TrackingAlert + notify configured site roles.
-    Phase 2 stub: no recipients yet → return False (do not mark sent).
+    Notify configured roles + org Admin via NotificationLog + FCM.
+    Returns False when site missing or no recipients (caller leaves overstay_alert_sent_at null).
     """
-    return False
+    site = getattr(entry, "site", None)
+    if site is None:
+        logger.debug("[OVERSTAY] skip notify — no site entry=%s", entry.id)
+        return False
+
+    recipients = get_overstay_recipients_for_site(site)
+    if not recipients:
+        logger.debug(
+            "[OVERSTAY] skip notify — no recipients (roles/admin) site=%s entry=%s",
+            site.id,
+            entry.id,
+        )
+        return False
+
+    # With no configured roles, Admin alone still receives SOS.
+    created = notify_vehicle_overstay(entry, recipients)
+    return created > 0
 
 
 def process_vehicle_overstay(*, location_id=None) -> Dict[str, Any]:
     """
     Find checked-in vehicles past the org overstay threshold and attempt alert once.
 
-    Leaves overstay_alert_sent_at null when notify fails (e.g. no Phase 3 recipients),
+    Leaves overstay_alert_sent_at null when notify fails (e.g. no recipients),
     so the next run can still send after roles are configured.
     """
     now = timezone.now()

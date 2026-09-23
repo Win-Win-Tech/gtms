@@ -18,6 +18,10 @@ from .vehicle_movement_report import (
     generate_vehicle_movement_excel,
     generate_vehicle_movement_pdf,
 )
+from .vehicle_overstay_report import (
+    generate_vehicle_overstay_excel,
+    generate_vehicle_overstay_pdf,
+)
 from .views import (
     VisitorApproveView,
     VisitorCancelView,
@@ -35,6 +39,7 @@ from .views import (
     _can_access_entry,
     _filtered_entries,
     _is_host_or_super,
+    _vehicle_overstay_report_from_request,
 )
 
 
@@ -507,3 +512,70 @@ class VehicleMovementReportExportPdfViewV5(APIView):
         if error_response:
             return error_response
         return generate_vehicle_movement_pdf(data, request=request)
+
+
+def _vehicle_overstay_report_from_request_v5(request):
+    site = None
+    raw_site = request.query_params.get("site_id")
+    if raw_site and str(raw_site).lower() not in ("all", "null", "undefined"):
+        try:
+            site = get_site_or_error(raw_site)
+            assert_caller_can_access_site(request.user, site)
+        except (ValidationError, PermissionDenied) as exc:
+            detail = getattr(exc, "detail", None) or str(exc)
+            return None, Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+    data, error_response = _vehicle_overstay_report_from_request(
+        request, site_id=str(site.id) if site else None
+    )
+    if error_response:
+        return None, error_response
+    if site and data.get("location_id") and str(site.location_id) != str(data["location_id"]):
+        return None, Response(
+            {"error": "Site does not belong to that organisation."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    data["site_id"] = str(site.id) if site else None
+    data["site_name"] = site.name if site else None
+    return data, None
+
+
+class VehicleOverstayReportViewV5(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request_v5(request)
+        if error_response:
+            return error_response
+        return Response(data)
+
+
+class VehicleOverstayReportExportViewV5(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request_v5(request)
+        if error_response:
+            return error_response
+        return generate_vehicle_overstay_excel(data)
+
+
+class VehicleOverstayReportExportPdfViewV5(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        data, error_response = _vehicle_overstay_report_from_request_v5(request)
+        if error_response:
+            return error_response
+        try:
+            content, filename = generate_vehicle_overstay_pdf(data, request)
+        except ImportError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        from django.http import HttpResponse
+
+        response = HttpResponse(content, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response

@@ -1,5 +1,6 @@
 """Vehicle overstay whitelist APIs."""
 
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -9,8 +10,11 @@ from rest_framework.views import APIView
 from scheduler.models import Location
 
 from .anpr.gate import normalize_plate
-from .models import VehicleOverstayWhitelist, VisitorEntry
-from .serializers_overstay import VehicleOverstayWhitelistSerializer
+from .models import SiteVehicleOverstayRecipient, VehicleOverstayWhitelist, VisitorEntry
+from .serializers_overstay import (
+    SiteVehicleOverstayRecipientSerializer,
+    VehicleOverstayWhitelistSerializer,
+)
 from .utils import resolve_location_for_request
 
 
@@ -250,3 +254,138 @@ class VehicleOverstayVehicleSuggestView(APIView):
             seen.add(plate)
             results.append(plate)
         return Response({"results": results})
+
+
+class SiteVehicleOverstayRecipientView(APIView):
+    """
+    GET  /visitors/overstay-alert-recipients/?site_id=
+    PUT  /visitors/overstay-alert-recipients/  { site_id, role_ids: [...] }
+    Replaces the full role list for that site.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from authapp.site_access import assert_caller_can_access_site, get_site_or_error
+
+        site_id = (request.query_params.get("site_id") or "").strip()
+        if not site_id:
+            return Response(
+                {"error": "site_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            site = get_site_or_error(site_id)
+            assert_caller_can_access_site(request.user, site)
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        location_id, err = resolve_location_for_request(request, str(site.location_id))
+        if err:
+            return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+        if str(site.location_id) != str(location_id):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        rows = (
+            SiteVehicleOverstayRecipient.objects.filter(site=site)
+            .select_related("site", "recipient_role")
+            .order_by("recipient_role__name")
+        )
+        data = SiteVehicleOverstayRecipientSerializer(rows, many=True).data
+        return Response(
+            {
+                "site_id": str(site.id),
+                "site_name": site.name,
+                "role_ids": [str(r.recipient_role_id) for r in rows],
+                "results": data,
+            }
+        )
+
+    def put(self, request):
+        from authapp.models import Role
+        from authapp.site_access import assert_caller_can_access_site, get_site_or_error
+        from django.db import transaction
+
+        site_id = request.data.get("site_id")
+        if not site_id:
+            return Response(
+                {"error": "site_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            site = get_site_or_error(site_id)
+            assert_caller_can_access_site(request.user, site)
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        location_id, err = resolve_location_for_request(request, str(site.location_id))
+        if err:
+            return Response({"error": err}, status=status.HTTP_400_BAD_REQUEST)
+        if str(site.location_id) != str(location_id):
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        raw_ids = request.data.get("role_ids")
+        if raw_ids is None:
+            return Response(
+                {"error": "role_ids is required (array)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(raw_ids, list):
+            return Response(
+                {"error": "role_ids must be an array"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        role_ids = []
+        seen = set()
+        for rid in raw_ids:
+            key = str(rid).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            role_ids.append(key)
+
+        roles = list(
+            Role.objects.filter(id__in=role_ids).filter(
+                Q(location_id=site.location_id) | Q(location__isnull=True)
+            )
+        )
+        found = {str(r.id) for r in roles}
+        missing = [rid for rid in role_ids if rid not in found]
+        if missing:
+            return Response(
+                {"error": f"Unknown role(s) for this organisation: {', '.join(missing)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            SiteVehicleOverstayRecipient.objects.filter(site=site).exclude(
+                recipient_role_id__in=[r.id for r in roles]
+            ).delete()
+            existing = set(
+                SiteVehicleOverstayRecipient.objects.filter(site=site).values_list(
+                    "recipient_role_id", flat=True
+                )
+            )
+            to_create = [
+                SiteVehicleOverstayRecipient(site=site, recipient_role=r)
+                for r in roles
+                if r.id not in existing
+            ]
+            if to_create:
+                SiteVehicleOverstayRecipient.objects.bulk_create(to_create)
+
+        rows = (
+            SiteVehicleOverstayRecipient.objects.filter(site=site)
+            .select_related("site", "recipient_role")
+            .order_by("recipient_role__name")
+        )
+        data = SiteVehicleOverstayRecipientSerializer(rows, many=True).data
+        return Response(
+            {
+                "site_id": str(site.id),
+                "site_name": site.name,
+                "role_ids": [str(r.recipient_role_id) for r in rows],
+                "results": data,
+            }
+        )
