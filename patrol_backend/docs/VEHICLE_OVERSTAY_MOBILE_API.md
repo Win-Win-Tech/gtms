@@ -159,38 +159,8 @@ Org-wide plates **skipped by Celery SOS**. Report can still include them when `i
 
 ---
 
-## 4. Device token (required for FCM)
 
-Register before overstay (or any) pushes can reach the device.
-
-### `POST /notifications/device-token/`
-
-```json
-{
-  "token": "<FCM_DEVICE_TOKEN>",
-  "device_type": "android",
-  "device_id": "optional-stable-device-id",
-  "app_version": "1.0.0"
-}
-```
-
-| Field | Values |
-|-------|--------|
-| `device_type` | `android` \| `ios` \| `web` |
-
-**200 / 201** — device token object.
-
-### `DELETE /notifications/device-token/`
-
-Body or query: `token=<FCM_DEVICE_TOKEN>`
-
-```json
-{ "deactivated": true }
-```
-
----
-
-## 5. Notifications — list / read (inbox)
+## 4. Notifications — list / read (inbox)
 
 Overstay alerts appear in the same visitor notification inbox as approve/cancel.
 
@@ -262,7 +232,7 @@ Marks one notification read. **200** → same notification object with `read_at`
 
 ---
 
-## 6. Notification / FCM payload (`vehicle_overstay`)
+## 5. Notification / FCM payload (`vehicle_overstay`)
 
 ### When it fires
 
@@ -309,7 +279,7 @@ type == "vehicle_overstay"  →  open visitor entry by data.entry_id
 
 ---
 
-## 7. Overstay report APIs
+## 6. Overstay report APIs
 
 All report endpoints share the same query params. Prefer **v5**.
 
@@ -421,7 +391,7 @@ Mobile: download as blob / file; do not parse as JSON unless error (`application
 
 ---
 
-## 8. Quick reference (mobile checklist)
+## 7. Quick reference (mobile checklist)
 
 | Feature | Method | Path |
 |---------|--------|------|
