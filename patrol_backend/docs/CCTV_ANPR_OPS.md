@@ -238,7 +238,8 @@ Healthy Celery: `celery@… ready` and registered task `visitor.anpr.tasks.proce
 | Reader runs as **gunicorn** | Wrong ExecStart | Must be `python manage.py run_anpr_reader` |
 | `MySQL server has gone away` | Stale DB pool after idle | Deploy latest reader; keep `DB_POOL_RECYCLE≤280`; restart reader |
 | Celery inactive, reader OK | No OCR → no check-in/out | Fix/start `patrol-anpr-celery` |
-| `Received unregistered task ... process_anpr_frame` | Nested `visitor.anpr.tasks` not auto-discovered; or wrong worker ate the message | Deploy `patrol_backend/celery.py` that imports anpr tasks when `ANPR_ENABLED=true`; restart `patrol-anpr-celery`; ensure default worker uses `-Q celery` (not all queues) and unique `-n` |
+| `Received unregistered task ... process_anpr_frame` | Nested `visitor.anpr.tasks` not auto-discovered; or wrong worker ate the message | Ensure `ANPR_ENABLED=true` on ANPR Celery; `visitor.apps` + `CELERY_IMPORTS` register the task after Django ready; restart `patrol-anpr-celery`; default worker must use `-Q celery` and a unique `-n` |
+| `AppRegistryNotReady` on anpr reader/celery after celery.py change | Eager `import visitor.anpr.tasks` inside `celery.py` (loaded from `patrol_backend/__init__` before `django.setup`) | Do **not** import ANPR tasks in `celery.py`; use `VisitorConfig.ready()` / `CELERY_IMPORTS` instead |
 
 After deploying reader code:
 

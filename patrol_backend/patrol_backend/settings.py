@@ -492,3 +492,7 @@ ANPR_CAMERA_REFRESH_SEC = int(os.environ.get("ANPR_CAMERA_REFRESH_SEC", "300"))
 CELERY_TASK_ROUTES = {
     "visitor.anpr.tasks.process_anpr_frame": {"queue": ANPR_QUEUE},
 }
+# Explicit import list (Celery loads after Django setup — safe).
+# Complements visitor.apps.VisitorConfig.ready() when ANPR_ENABLED=true.
+# Do not import visitor.anpr.tasks from celery.py (AppRegistryNotReady via __init__).
+CELERY_IMPORTS = ("visitor.anpr.tasks",) if ANPR_ENABLED else ()
