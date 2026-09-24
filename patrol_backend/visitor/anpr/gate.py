@@ -340,15 +340,6 @@ def apply_gate_event(
             evidence_path=evidence_path,
             plate=plate,
         )
-        # Also as "additional" so Visitors list Entry Photos column shows it
-        # (same as manual registration vehicle photos).
-        if asset_id:
-            _attach_anpr_evidence(
-                entry,
-                asset_type=VisitorAsset.ASSET_ADDITIONAL,
-                evidence_path=evidence_path,
-                plate=plate,
-            )
         set_cooldown(str(site.id), plate)
         logger.info(
             "[ANPR_GATE] CHECK_IN plate=%s entry=%s site=%s conf=%s gate_mode=%s cross_dir=%s "
