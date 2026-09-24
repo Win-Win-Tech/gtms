@@ -135,7 +135,17 @@ def kiosk_apply_punch(
     Serializes punches per guard/shift day (select_for_update); other guards run in parallel.
     Returns (action_mode, attendance, log, http_status).
     """
+    import time as _time
+
     from dashboard.models import CheckInLog
+
+    _pt = _time.perf_counter()
+
+    def _step_ms(label, ref):
+        ms = int((_time.perf_counter() - ref) * 1000)
+        total = int((_time.perf_counter() - _pt) * 1000)
+        logger.info("[KIOSK_PUNCH] step=%s ms=%d total_ms=%d user=%s", label, ms, total, getattr(user, "id", "?"))
+        return _time.perf_counter()
 
     log_filter = build_log_window_filter(
         user, assignment, shift, org_location, search_start_utc, search_end_utc
@@ -146,13 +156,16 @@ def kiosk_apply_punch(
     now = timezone.now()
 
     with transaction.atomic():
+        _t = _time.perf_counter()
         attendance = lock_or_create_attendance_for_shift_day(
             user, assignment, shift, org_location, shift_start_date
         )
+        _t = _step_ms("lock_attendance", _t)
 
         latest_checkin, latest_checkout, has_open_session = get_kiosk_session_state(
             user, assignment, shift, org_location, search_start_utc, search_end_utc
         )
+        _t = _step_ms("session_state", _t)
 
         recent_checkin = (
             CheckInLog.objects.filter(**log_filter, type="checkin")
@@ -185,6 +198,7 @@ def kiosk_apply_punch(
                 action_mode="checkin",
                 refresh_fn=refresh_fn,
             )
+            _step_ms("duplicate_punch_return", _t)
             return "checkin", attendance, recent_checkin, 200
 
         action_mode = "checkout" if has_open_session else "checkin"
@@ -208,6 +222,7 @@ def kiosk_apply_punch(
                     min_checkout_minutes=min_checkout_minutes,
                 )
 
+        _t = _time.perf_counter()
         log = CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -219,6 +234,7 @@ def kiosk_apply_punch(
             site=matched_site,
         )
         log.image.save(img_name, ContentFile(raw_bytes), save=True)
+        _t = _step_ms("create_log+save_image", _t)
 
         skip_sibling = getattr(settings, "FACE_KIOSK_SKIP_SIBLING_RECONCILE", True)
         apply_v4_attendance_after_log(
@@ -239,6 +255,8 @@ def kiosk_apply_punch(
             refresh_fn=refresh_fn,
             skip_sibling_reconcile=skip_sibling,
         )
+        _t = _step_ms("apply_attendance", _t)
+
         if refresh_fn is None:
             ensure_punch_sites(attendance, matched_site, log_filter)
             update_fields = ["modified_on"]
@@ -253,8 +271,11 @@ def kiosk_apply_punch(
             if matched_site and attendance.site_id == matched_site.pk:
                 update_fields.append("site")
             attendance.save(update_fields=update_fields)
+            _step_ms("save_attendance_counts", _t)
+
         http_status = 200 if action_mode == "checkout" else 201
 
+    _step_ms("total_punch_done", _pt)
     return action_mode, attendance, log, http_status
 
 

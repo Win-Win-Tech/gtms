@@ -2192,17 +2192,38 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         - Mandatory geofence validation
         - One endpoint auto-handles checkin / checkout
         """
+        import time as _time
         from patrol_backend.utils.face_utils import is_face_attendance_available
         from patrol_backend.utils.face_index import identify_user_in_location
         from patrol_backend.utils.timezone_utils import get_user_timezone
+
+        _t_start = _time.perf_counter()
+
+        actor = request.user
+        actor_id = str(getattr(actor, "id", "unknown"))
+        requested_location_id = request.data.get("location_id") or ""
+        logger.info(
+            "[KIOSK] request received actor=%s location_id=%s",
+            actor_id,
+            requested_location_id or "(not provided)",
+        )
+
+        def _elapsed_ms():
+            return int((_time.perf_counter() - _t_start) * 1000)
 
         def _kiosk_error(code, message, http_status=status.HTTP_400_BAD_REQUEST, extra=None):
             body = {"success": False, "code": code, "message": message}
             if extra:
                 body.update(extra)
+            logger.warning(
+                "[KIOSK] error actor=%s code=%s http_status=%s elapsed_ms=%d",
+                actor_id,
+                code,
+                http_status,
+                _elapsed_ms(),
+            )
             return Response(body, status=http_status)
 
-        actor = request.user
         actor_role = (getattr(actor, "role", "") or "").strip().lower()
         if not (getattr(actor, "is_superuser", False) or actor_role == "admin"):
             return _kiosk_error(
@@ -2265,9 +2286,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if not raw_bytes:
             return _kiosk_error("face_image_required", "Face image is required")
 
+        _t_face = _time.perf_counter()
         matched_user_id, face_code, _face_distance = identify_user_in_location(
             str(org_location.id),
             raw_bytes,
+        )
+        logger.info(
+            "[KIOSK] face match actor=%s location=%s elapsed_ms=%d face_ms=%d matched_user=%s code=%s dist=%s",
+            actor_id,
+            scoped_location_id,
+            _elapsed_ms(),
+            int((_time.perf_counter() - _t_face) * 1000),
+            matched_user_id or "none",
+            face_code or "ok",
+            f"{_face_distance:.4f}" if _face_distance is not None else "n/a",
         )
         if not matched_user_id:
             if face_code == "face_not_detected":
@@ -2368,6 +2400,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
             defer_refresh = getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", False)
             try:
+                _t_punch = _time.perf_counter()
                 action_mode, attendance, log, status_code = kiosk_apply_punch(
                     user=user,
                     assignment=assignment,
@@ -2406,6 +2439,15 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         "remaining_seconds": exc.remaining,
                     },
                 )
+
+            logger.info(
+                "[KIOSK] punch done actor=%s user=%s action=%s punch_ms=%d total_elapsed_ms=%d",
+                actor_id,
+                str(user.id),
+                action_mode,
+                int((_time.perf_counter() - _t_punch) * 1000),
+                _elapsed_ms(),
+            )
 
             if defer_refresh:
                 defer_attendance_v3_refresh(
@@ -2469,6 +2511,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     payload["has_shift"] = True
                     payload["user_id"] = str(user.id)
 
+            logger.info(
+                "[KIOSK] success (fast-path) actor=%s user=%s action=%s http_status=%d total_elapsed_ms=%d",
+                actor_id,
+                str(user.id),
+                action_mode,
+                status_code,
+                _elapsed_ms(),
+            )
             return Response(
                 {
                     "success": True,
@@ -2684,6 +2734,14 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             payload["has_shift"] = True
             payload["user_id"] = str(user.id)
 
+        logger.info(
+            "[KIOSK] success (slow-path) actor=%s user=%s action=%s http_status=%d total_elapsed_ms=%d",
+            actor_id,
+            str(user.id),
+            action_mode,
+            status_code,
+            _elapsed_ms(),
+        )
         return Response(
             {
                 "success": True,
