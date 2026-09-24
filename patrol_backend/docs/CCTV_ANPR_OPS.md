@@ -238,6 +238,7 @@ Healthy Celery: `celery@… ready` and registered task `visitor.anpr.tasks.proce
 | Reader runs as **gunicorn** | Wrong ExecStart | Must be `python manage.py run_anpr_reader` |
 | `MySQL server has gone away` | Stale DB pool after idle | Deploy latest reader; keep `DB_POOL_RECYCLE≤280`; restart reader |
 | Celery inactive, reader OK | No OCR → no check-in/out | Fix/start `patrol-anpr-celery` |
+| `Received unregistered task ... process_anpr_frame` | Nested `visitor.anpr.tasks` not auto-discovered; or wrong worker ate the message | Deploy `patrol_backend/celery.py` that imports anpr tasks when `ANPR_ENABLED=true`; restart `patrol-anpr-celery`; ensure default worker uses `-Q celery` (not all queues) and unique `-n` |
 
 After deploying reader code:
 
