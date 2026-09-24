@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import logging.handlers  # noqa: F401 – required for RotatingFileHandler in LOGGING config
 import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -398,6 +399,24 @@ LOGGING = {
             '()': 'django.utils.log.RequireDebugTrue',
         },
     },
+    'formatters': {
+        'verbose': {
+            'format': '[{levelname}] {asctime} {name} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+        'simple': {
+            'format': '[{levelname}] {asctime} {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+        'kiosk': {
+            # Compact single-line format: timestamp | level | message
+            'format': '{asctime} | {levelname:<7} | {message}',
+            'style': '{',
+            'datefmt': '%Y-%m-%d %H:%M:%S',
+        },
+    },
     'handlers': {
         'console': {
             'level': 'INFO',
@@ -409,6 +428,16 @@ LOGGING = {
             'class': 'logging.FileHandler',
             'filename': os.path.join(BASE_DIR, 'logs', 'django.log'),
             'formatter': 'verbose',
+        },
+        # Dedicated rotating log for kiosk face-attendance requests
+        'kiosk_file': {
+            'level': 'INFO',
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': os.path.join(BASE_DIR, 'logs', 'kiosk-face.log'),
+            'maxBytes': 10 * 1024 * 1024,   # 10 MB per file
+            'backupCount': 7,                # keep last 7 rotated files (~70 MB max)
+            'formatter': 'kiosk',
+            'encoding': 'utf-8',
         },
     },
     'root': {
@@ -431,6 +460,12 @@ LOGGING = {
             'handlers': ['console', 'file'],
             'level': 'INFO',
             'propagate': False,
+        },
+        # Kiosk face-attendance — goes to kiosk-face.log AND console (not django.log)
+        'dashboard.kiosk': {
+            'handlers': ['kiosk_file', 'console'],
+            'level': 'INFO',
+            'propagate': False,   # don't bubble up to 'dashboard' → django.log
         },
         'scheduler': {
             'handlers': ['console', 'file'],

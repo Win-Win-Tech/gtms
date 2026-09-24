@@ -23,6 +23,8 @@ from patrol_backend.utils.attendance_resolve import (
 )
 
 logger = logging.getLogger(__name__)
+# Writes to logs/kiosk-face.log alongside the [KIOSK] lines from views.py
+kiosk_logger = logging.getLogger("dashboard.kiosk")
 
 
 def get_kiosk_session_state(
@@ -144,7 +146,7 @@ def kiosk_apply_punch(
     def _step_ms(label, ref):
         ms = int((_time.perf_counter() - ref) * 1000)
         total = int((_time.perf_counter() - _pt) * 1000)
-        logger.info("[KIOSK_PUNCH] step=%s ms=%d total_ms=%d user=%s", label, ms, total, getattr(user, "id", "?"))
+        kiosk_logger.info("[KIOSK_PUNCH] step=%s ms=%d total_ms=%d user=%s", label, ms, total, getattr(user, "id", "?"))
         return _time.perf_counter()
 
     log_filter = build_log_window_filter(

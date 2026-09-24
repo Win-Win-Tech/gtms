@@ -71,6 +71,8 @@ from .serializers import (
 
 # Setup logger
 logger = logging.getLogger(__name__)
+# Dedicated logger → logs/kiosk-face.log (configured in settings.LOGGING)
+kiosk_logger = logging.getLogger("dashboard.kiosk")
 
 
 def _get_site_setting_int(key, location_id=None, default_value=None):
@@ -2202,7 +2204,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         actor = request.user
         actor_id = str(getattr(actor, "id", "unknown"))
         requested_location_id = request.data.get("location_id") or ""
-        logger.info(
+        kiosk_logger.info(
             "[KIOSK] request received actor=%s location_id=%s",
             actor_id,
             requested_location_id or "(not provided)",
@@ -2215,7 +2217,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             body = {"success": False, "code": code, "message": message}
             if extra:
                 body.update(extra)
-            logger.warning(
+            kiosk_logger.warning(
                 "[KIOSK] error actor=%s code=%s http_status=%s elapsed_ms=%d",
                 actor_id,
                 code,
@@ -2291,7 +2293,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             str(org_location.id),
             raw_bytes,
         )
-        logger.info(
+        kiosk_logger.info(
             "[KIOSK] face match actor=%s location=%s elapsed_ms=%d face_ms=%d matched_user=%s code=%s dist=%s",
             actor_id,
             scoped_location_id,
@@ -2440,7 +2442,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-            logger.info(
+            kiosk_logger.info(
                 "[KIOSK] punch done actor=%s user=%s action=%s punch_ms=%d total_elapsed_ms=%d",
                 actor_id,
                 str(user.id),
@@ -2511,7 +2513,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     payload["has_shift"] = True
                     payload["user_id"] = str(user.id)
 
-            logger.info(
+            kiosk_logger.info(
                 "[KIOSK] success (fast-path) actor=%s user=%s action=%s http_status=%d total_elapsed_ms=%d",
                 actor_id,
                 str(user.id),
@@ -2734,7 +2736,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             payload["has_shift"] = True
             payload["user_id"] = str(user.id)
 
-        logger.info(
+        kiosk_logger.info(
             "[KIOSK] success (slow-path) actor=%s user=%s action=%s http_status=%d total_elapsed_ms=%d",
             actor_id,
             str(user.id),
