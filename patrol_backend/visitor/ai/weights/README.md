@@ -35,3 +35,11 @@ If neither local file nor env is set, code may try Ultralytics Hub
 **If Hub fails:** detection falls back to **vehicle YOLO** (`yolov8n.pt`)
 so ANPR can still track cars; OCR uses the vehicle crop / lower band.
 For best plate accuracy, add a real plate `.pt` file here.
+
+## Plate super-resolution (FSRCNN)
+
+`FSRCNN_x2.pb` / `FSRCNN_x4.pb` (~40 KB each, committed) upscale small plate
+crops before OCR (`visitor/ai/plate_enhance.py`, ~20–40 ms on CPU).
+Source: https://github.com/Saafke/FSRCNN_Tensorflow/tree/master/models
+
+Disable with `VISITOR_AI_PLATE_SR=0`; use another folder with `VISITOR_AI_PLATE_SR_DIR`.

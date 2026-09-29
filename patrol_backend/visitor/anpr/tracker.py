@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,16 +42,36 @@ class Track:
     best_jpeg: Optional[bytes] = None  # plate zoom — OCR only
     best_evidence_jpeg: Optional[bytes] = None  # full frame / vehicle — visitor photos
     best_meta: Dict[str, Any] = field(default_factory=dict)
+    # Runner-up plate zooms (score, jpeg, meta) for multi-frame OCR voting
+    extra_ocr: List[Tuple[float, bytes, Dict[str, Any]]] = field(default_factory=list)
     updated_at: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
     queued_at: float = 0.0  # monotonic time when OCR was enqueued
 
 
+def _box_area(b: Tuple[float, float, float, float]) -> float:
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
 class SimpleTracker:
-    def __init__(self, camera_key: str, iou_thresh: float = 0.25, max_misses: int = 5):
+    def __init__(
+        self,
+        camera_key: str,
+        iou_thresh: float = 0.25,
+        max_misses: int = 5,
+        max_jump: Optional[float] = None,
+    ):
         self.camera_key = camera_key
         self.iou_thresh = iou_thresh
         self.max_misses = max_misses
+        # Plate boxes are small: a moving plate often has zero IoU with its previous
+        # box at 1–3 detections/s. Fall back to nearest centre within this jump
+        # (normalised frame units, per missed frame it may travel further).
+        self.max_jump = (
+            float(os.environ.get("ANPR_TRACK_MAX_JUMP", "0.2") or 0.2)
+            if max_jump is None
+            else float(max_jump)
+        )
         self._next_id = 1
         self.tracks: Dict[str, Track] = {}
 
@@ -59,6 +80,30 @@ class SimpleTracker:
         self._next_id += 1
         return tid
 
+    @staticmethod
+    def _apply(tr: Track, det) -> None:
+        nx, ny, side, box_n, conf, veh_label = det
+        tr.prev_line_side = tr.line_side
+        tr.line_side = side
+        if (
+            tr.prev_line_side != 0
+            and side != 0
+            and tr.prev_line_side != side
+            and tr.state not in ("OCR_QUEUED", "COMMITTED", "COOLDOWN")
+        ):
+            tr.crossed = True
+            tr.cross_dir = side  # new side after cross
+        tr.nx, tr.ny = nx, ny
+        tr.box_norm = box_n
+        tr.conf = conf
+        if veh_label:
+            tr.vehicle_label = veh_label
+        tr.hits += 1
+        tr.misses = 0
+        tr.updated_at = time.monotonic()
+        if tr.hits >= 2 and tr.state == "CANDIDATE":
+            tr.state = "STABLE"
+
     def update(
         self,
         detections: List[
@@ -66,45 +111,52 @@ class SimpleTracker:
         ],
         # each: nx, ny, line_side, box_norm, conf, vehicle_label
     ) -> List[Track]:
-        assigned: Dict[str, bool] = {}
         used_det = set()
+        matched = set()
 
-        # Greedy match by IoU
+        # 1) Greedy match by IoU (parked / slow vehicles)
         for tid, tr in list(self.tracks.items()):
             best_j, best_iou = -1, 0.0
-            for j, (nx, ny, side, box_n, conf, veh_label) in enumerate(detections):
+            for j, det in enumerate(detections):
                 if j in used_det:
                     continue
-                score = _iou(tr.box_norm, box_n)
+                score = _iou(tr.box_norm, det[3])
                 if score > best_iou:
                     best_iou, best_j = score, j
             if best_j >= 0 and best_iou >= self.iou_thresh:
-                nx, ny, side, box_n, conf, veh_label = detections[best_j]
                 used_det.add(best_j)
-                tr.prev_line_side = tr.line_side
-                tr.line_side = side
-                if (
-                    tr.prev_line_side != 0
-                    and side != 0
-                    and tr.prev_line_side != side
-                    and tr.state not in ("OCR_QUEUED", "COMMITTED", "COOLDOWN")
-                ):
-                    tr.crossed = True
-                    tr.cross_dir = side  # new side after cross
-                tr.nx, tr.ny = nx, ny
-                tr.box_norm = box_n
-                tr.conf = conf
-                if veh_label:
-                    tr.vehicle_label = veh_label
-                tr.hits += 1
-                tr.misses = 0
-                tr.updated_at = time.monotonic()
-                if tr.hits >= 2 and tr.state == "CANDIDATE":
-                    tr.state = "STABLE"
-                assigned[tid] = True
-            else:
+                matched.add(tid)
+                self._apply(tr, detections[best_j])
+
+        # 2) Nearest centre for the rest (moving vehicles), closest pairs first
+        pairs = []
+        for tid, tr in self.tracks.items():
+            if tid in matched:
+                continue
+            limit = self.max_jump * (1.0 + 0.5 * tr.misses)
+            area_t = _box_area(tr.box_norm)
+            for j, det in enumerate(detections):
+                if j in used_det:
+                    continue
+                dist = ((det[0] - tr.nx) ** 2 + (det[1] - tr.ny) ** 2) ** 0.5
+                if dist > limit:
+                    continue
+                area_d = _box_area(det[3])
+                if area_t > 0 and area_d > 0 and not (0.33 <= area_d / area_t <= 3.0):
+                    continue
+                pairs.append((dist, tid, j))
+        for dist, tid, j in sorted(pairs):
+            if tid in matched or j in used_det:
+                continue
+            used_det.add(j)
+            matched.add(tid)
+            self._apply(self.tracks[tid], detections[j])
+
+        now = time.monotonic()
+        for tid, tr in self.tracks.items():
+            if tid not in matched:
                 tr.misses += 1
-                tr.updated_at = time.monotonic()
+                tr.updated_at = now
 
         for j, (nx, ny, side, box_n, conf, veh_label) in enumerate(detections):
             if j in used_det:

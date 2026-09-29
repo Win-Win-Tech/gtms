@@ -38,8 +38,9 @@ _MIN_ANPR_PLATE_LEN = 7
 
 def _detector_base(detector: str) -> str:
     det = (detector or "").lower().strip()
-    if det.endswith("_enhanced"):
-        return det[: -len("_enhanced")]
+    for suffix in ("_enhanced", "_stitched"):
+        if det.endswith(suffix):
+            return det[: -len(suffix)]
     return det
 
 

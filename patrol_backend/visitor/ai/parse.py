@@ -10,6 +10,7 @@ fallback when the layout is unknown.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import List, Optional, Sequence, Set, Tuple
 
@@ -413,7 +414,95 @@ _IN_STATE_PART_LOOSE_RE = re.compile(
 )
 _IN_SERIES_PART_RE = re.compile(r"^([A-Z]{1,3})[\s.\-]*(\d{1,4})$", re.IGNORECASE)
 _IN_FULL_COMPACT_RE = re.compile(r"^([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{1,4})$")
+# Bharat series: 22 BH 1234 AA
+_IN_BH_RE = re.compile(r"^(\d{2})BH(\d{4})([A-Z]{1,2})$")
 _SERIES_LETTER_FROM_DIGIT = {"5": "S", "8": "B", "0": "O"}
+
+# Indian state / UT registration codes (current + legacy still on the road).
+_IN_STATE_CODES = frozenset({
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "DD", "DL", "DN", "GA", "GJ",
+    "HP", "HR", "JH", "JK", "KA", "KL", "LA", "LD", "MH", "ML", "MN", "MP",
+    "MZ", "NL", "OD", "OR", "PB", "PY", "RJ", "SK", "TG", "TN", "TR", "TS",
+    "UA", "UK", "UP", "WB",
+})
+# Registration numbers are 1–9999; HSRP prints 4 digits (zero padded). Fewer
+# than this is almost always an OCR fragment (TN58TN58, ID60T60).
+_IN_MIN_NUMBER_DIGITS = max(1, min(4, int(os.environ.get("ANPR_MIN_PLATE_DIGITS", "3") or 3)))
+# Tie-break when an OCR-garbled state code maps to several valid codes.
+_IN_PREFERRED_STATES = tuple(
+    s.strip().upper()
+    for s in (os.environ.get("ANPR_PREFERRED_STATES", "TN") or "").split(",")
+    if s.strip()
+)
+# Single-character OCR confusions allowed when repairing a state code.
+_STATE_CHAR_CONFUSIONS = {
+    "0": "OD", "1": "TIL", "2": "Z", "4": "A", "5": "S", "6": "G", "7": "T", "8": "B",
+    "A": "4", "B": "8R", "C": "G", "D": "O0", "E": "F", "F": "EP", "G": "C6",
+    "H": "NMK", "I": "T1L", "K": "XH", "L": "I1", "M": "NH", "N": "MHW",
+    "O": "D0Q", "P": "RF", "Q": "O", "R": "PB", "S": "5", "T": "I17Y",
+    "U": "V", "V": "U", "W": "N", "X": "K", "Y": "T", "Z": "2",
+}
+
+
+def _fix_state_code(state: str) -> Optional[str]:
+    """
+    Return a valid Indian state code for ``state``, repairing at most one
+    OCR-confused character (IN → TN, TM → TN). None when no safe repair exists.
+    """
+    s = re.sub(r"[^A-Z0-9]", "", (state or "").upper())
+    if len(s) != 2:
+        return None
+    if s in _IN_STATE_CODES:
+        return s
+    fixes = set()
+    for i, ch in enumerate(s):
+        for alt in _STATE_CHAR_CONFUSIONS.get(ch, ""):
+            cand = s[:i] + alt + s[i + 1:]
+            if cand in _IN_STATE_CODES:
+                fixes.add(cand)
+    if _IN_PREFERRED_STATES:
+        # Only repair towards local states; a garbled code turning into a far-away
+        # state (AW → AN) is more likely junk than a visiting vehicle.
+        preferred = [p for p in _IN_PREFERRED_STATES if p in fixes]
+        return preferred[0] if len(preferred) == 1 else None
+    return fixes.pop() if len(fixes) == 1 else None
+
+
+def _restore_state_first_letter(letter: str) -> Optional[str]:
+    """
+    OCR often loses the first plate character against the border / a bolt
+    ("N64AF2974"). Restore it only towards a configured local state (N -> TN).
+    """
+    letter = (letter or "").upper()
+    matches = [s for s in _IN_PREFERRED_STATES if s in _IN_STATE_CODES and s[1] == letter]
+    return matches[0] if len(matches) == 1 else None
+
+
+def indian_plate_issue(plate: str) -> Optional[str]:
+    """
+    Why an Indian-shaped plate (AA99A9999) cannot be real, or None if it looks valid.
+    Plates that are not Indian-shaped (Malaysian, BH series) return None.
+    """
+    p = re.sub(r"[^A-Za-z0-9]", "", plate or "").upper()
+    if _IN_BH_RE.match(p):
+        return None
+    m = _IN_FULL_COMPACT_RE.match(p)
+    if not m:
+        return None
+    state, dist, series, number = m.groups()
+    if state not in _IN_STATE_CODES:
+        return "bad_state"
+    if int(dist) == 0:
+        return "bad_district"
+    if len(number) < _IN_MIN_NUMBER_DIGITS:
+        return "short_number"
+    # I and O are never issued in series letters (too close to 1 / 0)
+    if "I" in series or "O" in series:
+        return "bad_series"
+    # Registration painted twice (TN58 + TN58) read as state + series rows
+    if series == state and number.lstrip("0") == dist.lstrip("0"):
+        return "repeated_state"
+    return None
 
 
 def is_rejected_anpr_plate(
@@ -427,6 +516,14 @@ def is_rejected_anpr_plate(
     p = _normalize_plate_token(plate)
     if not p or len(p) < 7:
         return True
+    if indian_plate_issue(p):
+        return True
+    if _IN_BH_RE.match(p):
+        if source_lines and not any(
+            t and not _is_ocr_noise_line(t) for t, _ in source_lines
+        ):
+            return True
+        return False
     if p.endswith("SMA") and len(p) > 8:
         return True
     if _DAY_SUFFIX_RE.search(p):
@@ -511,15 +608,20 @@ def _parse_indian_state_line(raw: str) -> Optional[Tuple[str, str]]:
         m = pattern.match(raw) or pattern.match(_normalize_plate_token(raw))
         if not m:
             continue
-        state = re.sub(r"[^A-Z]", "", m.group(1).upper())
+        state = _fix_state_code(m.group(1))
         dist = _ocr_fix_district(m.group(2))
         if state and dist.isdigit() and 1 <= int(dist) <= 99:
             return state, dist
     compact = _normalize_plate_token(raw)
-    if len(compact) >= 4 and compact[:2].isalpha():
-        state = compact[:2]
+    if len(compact) == 4 and compact[:2].isalpha():
+        state = _fix_state_code(compact[:2])
         dist = _ocr_fix_district(compact[2:4])
-        if dist.isdigit() and 1 <= int(dist) <= 99:
+        if state and dist.isdigit() and 1 <= int(dist) <= 99:
+            return state, dist
+    if len(compact) == 3 and compact[0].isalpha():
+        state = _restore_state_first_letter(compact[0])
+        dist = _ocr_fix_district(compact[1:3])
+        if state and dist.isdigit() and 1 <= int(dist) <= 99:
             return state, dist
     return None
 
@@ -535,8 +637,10 @@ def _parse_indian_series_line(raw: str) -> Optional[Tuple[str, str]]:
     if m:
         series = re.sub(r"[^A-Z]", "", m.group(1).upper())
         number = _ocr_fix_digits(m.group(2))
-        if series and number:
+        # "TN58" on the second row is the registration painted again, not series+number
+        if series and len(number) >= _IN_MIN_NUMBER_DIGITS:
             return series, number
+        return None
     compact = _normalize_plate_token(raw)
     if re.fullmatch(r"5\d{4}", compact):
         return "S", _ocr_fix_digits(compact[1:])
@@ -568,9 +672,15 @@ def _format_indian_plate(state: str, dist: str, series: str, number: str) -> str
     dist = _ocr_fix_digits(dist)
     number = _ocr_fix_digits(number)
     series = re.sub(r"[^A-Z]", "", series.upper())
-    state = re.sub(r"[^A-Z]", "", state.upper())
+    state = _fix_state_code(state) or ""
+    if not state:
+        return ""
     plate = f"{state}{dist}{series}{number}"
-    if 8 <= len(plate) <= 10 and _IN_FULL_COMPACT_RE.match(plate):
+    if (
+        8 <= len(plate) <= 10
+        and _IN_FULL_COMPACT_RE.match(plate)
+        and not indian_plate_issue(plate)
+    ):
         return plate
     return ""
 
@@ -587,21 +697,24 @@ def _indian_two_line_candidates(lines: List[Tuple[str, float]]) -> List[Tuple[st
         if not parsed_state:
             continue
         state, dist = parsed_state
+        # Only the very next real row can be the series row. Skip OSD noise and
+        # tiny emblem tokens ("IND"); never pair with text further down, which
+        # on wide crops belongs to another vehicle or painted body text.
         for j in range(i + 1, min(i + 4, len(lines))):
             t2, s2 = lines[j]
             if _is_ocr_noise_line(t2 or ""):
                 continue
+            if len(_normalize_plate_token(t2 or "")) <= 3:
+                continue
             parsed_series = _parse_indian_series_line(t2 or "")
-            if not parsed_series:
-                continue
-            series, number = parsed_series
-            if not series and dist:
-                # e.g. TN.60 on line 1 and bare 2542 on line 2 — rare, skip
-                continue
-            plate = _format_indian_plate(state, dist, series, number)
-            if plate:
-                conf = float(min(0.99, (float(s1) + float(s2)) / 2.0 + 0.08))
-                out.append((plate, conf))
+            if parsed_series:
+                series, number = parsed_series
+                if series:
+                    plate = _format_indian_plate(state, dist, series, number)
+                    if plate:
+                        conf = float(min(0.99, (float(s1) + float(s2)) / 2.0 + 0.08))
+                        out.append((plate, conf))
+            break
     return out
 
 
@@ -644,10 +757,14 @@ def _plate_format_score(plate: str) -> int:
     p = _normalize_plate_token(plate)
     if not p:
         return 0
-    if _IN_FULL_COMPACT_RE.match(p):
-        return 100 + len(p)
-    if re.match(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4}$", p):
-        return 90 + len(p)
+    if _IN_BH_RE.match(p):
+        return 110 + len(p)
+    m = _IN_FULL_COMPACT_RE.match(p)
+    if m:
+        if indian_plate_issue(p):
+            # Indian shape but impossible (bad state / 2-digit number): below any real plate
+            return 20
+        return 100 + len(p) + (4 if len(m.group(4)) == 4 else 0)
     if len(p) > 11:
         return max(0, 40 - (len(p) - 11) * 8)
     if any(c.isalpha() for c in p) and any(c.isdigit() for c in p):
@@ -678,14 +795,26 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
         m = IN_PLATE_RE.search(text)
         if m:
             plate = _format_indian_plate(m.group(1), m.group(2), m.group(3), m.group(4))
-            if not plate:
-                plate = f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}".upper()
-            if 5 <= len(plate) <= 10:
+            if plate:
                 candidates.append((plate, float(score)))
 
-        m2 = re.search(r"([A-Z]{2}\d{1,2}[A-Z]{1,3}\d{1,4})", compact)
-        if m2 and 8 <= len(m2.group(1)) <= 10:
-            candidates.append((m2.group(1), float(score)))
+        m2 = re.search(r"([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{1,4})", compact)
+        if m2:
+            plate = _format_indian_plate(m2.group(1), m2.group(2), m2.group(3), m2.group(4))
+            if plate:
+                candidates.append((plate, float(score)))
+
+        m_lost = re.fullmatch(r"([A-Z])(\d{2})([A-Z]{1,3})(\d{4})", compact)
+        if m_lost:
+            state = _restore_state_first_letter(m_lost.group(1))
+            if state:
+                plate = _format_indian_plate(state, m_lost.group(2), m_lost.group(3), m_lost.group(4))
+                if plate:
+                    candidates.append((plate, float(score) * 0.85))
+
+        m_bh = re.search(r"(\d{2})\s*B\s*H\s*(\d{4})\s*([A-Z]{1,2})", compact)
+        if m_bh:
+            candidates.append((f"{m_bh.group(1)}BH{m_bh.group(2)}{m_bh.group(3)}", float(score)))
 
         m3 = MY_PLATE_RE.search(text)
         if m3:
@@ -700,8 +829,11 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
             if has_a and has_d and _plate_format_score(compact) >= 90:
                 candidates.append((compact, float(score) * 0.85))
 
-    if not candidates:
-        blob = _normalize_plate_token(_join_lines(lines))
+    # Joining every line only makes sense for a single small plate. On larger OCR
+    # results it glues text from different vehicles / body paint into one "plate".
+    useful_lines = [t for t, _ in lines if t and not _is_ocr_noise_line(t)]
+    if not candidates and len(useful_lines) <= 3:
+        blob = _normalize_plate_token(" ".join(useful_lines))
         for plate, conf in _indian_compact_candidates(blob, 0.55):
             candidates.append((plate, conf))
         for m in re.finditer(r"[A-Z0-9]{7,10}", blob):

@@ -20,8 +20,19 @@ from .detect import (
     warp_document_if_possible,
 )
 from .parse import extract_id_name, extract_id_number, extract_vehicle_number
+from .plate_enhance import (
+    enhance_plate,
+    is_two_line_shape,
+    plate_color,
+    stitch_two_line,
+    upscale_plate,
+)
 from .preprocess import load_and_resize_image, pil_to_bgr_ndarray
-from .rapid_ocr_engine import ensure_rapid_ocr_ready, run_rapid_ocr
+from .rapid_ocr_engine import (
+    ensure_rapid_ocr_ready,
+    run_rapid_ocr,
+    run_rapid_ocr_detailed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,14 +90,21 @@ def _slim_vehicle_result(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def extract_vehicle_from_bgr(bgr, hint_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def extract_vehicle_from_bgr(
+    bgr,
+    hint_meta: Dict[str, Any] | None = None,
+    *,
+    max_passes: int | None = None,
+) -> Dict[str, Any]:
     """
     Plate YOLO + RapidOCR on an in-memory BGR frame (CCTV ANPR / library reuse).
 
     Detect may run on a downscaled copy for speed; OCR crops are taken from the
     original full-resolution frame so distant CCTV plates stay readable.
 
-    hint_meta: optional ANPR reader metadata (e.g. zoom_crop=True, box_norm).
+    hint_meta: ANPR reader metadata (zoom_crop, box_norm, zoom_rect). When given,
+    the call is treated as CCTV: whole-frame OCR fallbacks are skipped.
+    max_passes: optional lower OCR budget (extra frames of the same vehicle).
     """
     import numpy as np
 
@@ -133,6 +151,7 @@ def extract_vehicle_from_bgr(bgr, hint_meta: Dict[str, Any] | None = None) -> Di
             ocr_bgr=bgr,
             box_mul=box_mul,
             hint_meta=hint_meta,
+            max_passes=max_passes,
         )
         touch_activity()
         slim = _slim_vehicle_result(result)
@@ -268,38 +287,6 @@ def _enhance_for_ocr(bgr):
     return cv2.cvtColor(boosted, cv2.COLOR_GRAY2BGR)
 
 
-def _sharpen_for_blur(bgr):
-    """Mild unsharp mask — helps soft focus / screen-photo blur without inventing glyphs."""
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return bgr
-    blur = cv2.GaussianBlur(bgr, (0, 0), sigmaX=1.2)
-    sharp = cv2.addWeighted(bgr, 1.45, blur, -0.45, 0)
-    return np.clip(sharp, 0, 255).astype(bgr.dtype)
-
-
-def _upscale_if_small(bgr, min_long_side: int = 220):
-    """Upscale tiny plate crops (far vehicle / phone-screen capture) before OCR."""
-    try:
-        import cv2
-    except ImportError:
-        return bgr
-    h, w = bgr.shape[:2]
-    longest = max(h, w)
-    if longest >= min_long_side:
-        return bgr
-    scale = min_long_side / float(max(1, longest))
-    # Cap extreme upscales (noise) but allow distant CCTV plates
-    scale = min(scale, 12.0)
-    return cv2.resize(
-        bgr,
-        (max(1, int(w * scale)), max(1, int(h * scale))),
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-
 def _is_vehicle_sized_box(box, frame) -> bool:
     """True when YOLO returned a vehicle (not a tight license-plate box)."""
     label = (getattr(box, "label", "") or "").lower()
@@ -331,6 +318,7 @@ def _crop_min_context(bgr, box, *, min_w: int, min_h: int, pad_ratio: float = 0.
     """
     Crop around a plate box ensuring a minimum context size (distant CCTV).
     pad_ratio expands relative to the box; min_w/min_h force readable OCR size.
+    Returns (crop, plate_rect) where plate_rect is the box in crop pixels.
     """
     h, w = bgr.shape[:2]
     bw = max(1, box.x2 - box.x1)
@@ -342,15 +330,16 @@ def _crop_min_context(bgr, box, *, min_w: int, min_h: int, pad_ratio: float = 0.
     x2 = min(w, box.x2 + pad_x)
     y2 = min(h, box.y2 + pad_y)
     if x2 <= x1 or y2 <= y1:
-        return bgr.copy()
-    return bgr[y1:y2, x1:x2].copy()
+        return bgr.copy(), (box.x1, box.y1, box.x2, box.y2)
+    rect = (box.x1 - x1, box.y1 - y1, box.x2 - x1, box.y2 - y1)
+    return bgr[y1:y2, x1:x2].copy(), rect
 
 
 def _plate_zone_crops(bgr, box) -> list:
     """
     Build OCR crops. For vehicle boxes, prefer lower bands (where plates sit).
     For real plate boxes: tight crop, then wider context for distant CCTV.
-    Returns list of (image, detector_name).
+    Returns list of (image, detector_name, plate_rect_in_crop_or_None).
     """
     out = []
     if _is_vehicle_sized_box(box, bgr):
@@ -358,10 +347,10 @@ def _plate_zone_crops(bgr, box) -> list:
         h_roi = roi.shape[0]
         if h_roi > 40:
             # Primary: lower ~55% of vehicle (plate zone)
-            out.append((roi[int(h_roi * 0.45) :, :], "vehicle_bottom"))
+            out.append((roi[int(h_roi * 0.45) :, :], "vehicle_bottom", None))
             # Tighter: lower ~40%
-            out.append((roi[int(h_roi * 0.60) :, :], "vehicle_lower"))
-        out.append((roi, "vehicle_full"))
+            out.append((roi[int(h_roi * 0.60) :, :], "vehicle_lower", None))
+        out.append((roi, "vehicle_full", None))
         return out
 
     fill = _box_fill_ratio(box, bgr)
@@ -370,25 +359,122 @@ def _plate_zone_crops(bgr, box) -> list:
     tiny = fill < 0.008 or max(bw, bh) < 64
 
     # Tight plate crop (still padded enough for deskew)
-    tight = _crop_min_context(
+    tight, tight_rect = _crop_min_context(
         bgr, box, min_w=120 if tiny else 80, min_h=64 if tiny else 40, pad_ratio=0.45
     )
     tight = _deskew_plate_roi(tight)
-    out.append((tight, "plate_crop"))
+    out.append((tight, "plate_crop", tight_rect))
 
     # Wider context around the same plate (bike rear / car bumper)
-    wide = _crop_min_context(
+    wide, wide_rect = _crop_min_context(
         bgr, box, min_w=280 if tiny else 160, min_h=140 if tiny else 80, pad_ratio=1.2
     )
-    out.append((wide, "plate_wide"))
+    out.append((wide, "plate_wide", wide_rect))
 
     if tiny:
         # Even larger band for far scooters (still plate-centered, not full frame)
-        ctx = _crop_min_context(
+        ctx, ctx_rect = _crop_min_context(
             bgr, box, min_w=420, min_h=220, pad_ratio=2.5
         )
-        out.append((ctx, "plate_context"))
+        out.append((ctx, "plate_context", ctx_rect))
     return out
+
+
+def _plate_rows(detailed, rect=None) -> list:
+    """
+    OCR pieces -> plate text rows.
+
+    Keeps only pieces whose centre lies inside the plate box (slightly expanded),
+    so painted body text, phone numbers and neighbouring vehicles are dropped.
+    Pieces on the same row are joined left-to-right ("TN" "59" "BP" "9717" ->
+    "TN 59 BP 9717"); rows stay top-to-bottom for two-line plates.
+    Returns (rows, pieces_in_plate) as lists of (text, conf).
+    """
+    items = list(detailed or [])
+    if rect is not None:
+        x1, y1, x2, y2 = rect
+        ex = (x2 - x1) * 0.15 + 4
+        ey = (y2 - y1) * 0.35 + 4
+        kept = []
+        for text, score, (a, b, c, d) in items:
+            cx, cy = (a + c) / 2.0, (b + d) / 2.0
+            if x1 - ex <= cx <= x2 + ex and y1 - ey <= cy <= y2 + ey:
+                kept.append((text, score, (a, b, c, d)))
+        items = kept
+
+    rows: list = []
+    for text, score, (a, b, c, d) in sorted(items, key=lambda i: (i[2][1] + i[2][3]) / 2.0):
+        cy, height = (b + d) / 2.0, max(1.0, d - b)
+        for row in rows:
+            if abs(cy - row["cy"]) <= max(height, row["h"]) * 0.5:
+                row["items"].append((a, text, float(score)))
+                row["cy"] = (row["cy"] + cy) / 2.0
+                row["h"] = max(row["h"], height)
+                break
+        else:
+            rows.append({"cy": cy, "h": height, "items": [(a, text, float(score))]})
+
+    out = []
+    for row in rows:
+        pieces = sorted(row["items"])
+        text = " ".join(t for _, t, _ in pieces)
+        conf = sum(s for _, _, s in pieces) / len(pieces)
+        out.append((text, conf))
+    return out, [(t, float(s)) for t, s, _ in items]
+
+
+def _scale_rect(rect, sx: float, sy: float):
+    if rect is None:
+        return None
+    x1, y1, x2, y2 = rect
+    return (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+
+
+def _expected_plate_rect(hint_meta, w: int, h: int, reader_zoom: bool):
+    """
+    Where the tracked plate should be in the OCR image (pixels), from reader
+    metadata: box_norm is the plate in the full camera frame, zoom_rect the
+    reader's zoom crop in the same frame. None when unknown.
+    """
+    hm = hint_meta or {}
+    try:
+        bx1, by1, bx2, by2 = [float(v) for v in hm.get("box_norm") or ()]
+    except (TypeError, ValueError):
+        bx1 = None
+    if reader_zoom:
+        try:
+            zx1, zy1, zx2, zy2 = [float(v) for v in hm.get("zoom_rect") or ()]
+        except (TypeError, ValueError):
+            zx1 = None
+        if bx1 is not None and zx1 is not None:
+            zw, zh = max(1e-6, zx2 - zx1), max(1e-6, zy2 - zy1)
+            return (
+                (bx1 - zx1) / zw * w,
+                (by1 - zy1) / zh * h,
+                (bx2 - zx1) / zw * w,
+                (by2 - zy1) / zh * h,
+            )
+        # Old payloads: reader centres the zoom on the plate
+        return (w * 0.25, h * 0.25, w * 0.75, h * 0.75)
+    if bx1 is None or hm.get("evidence") not in (None, "full_frame"):
+        return None
+    return (bx1 * w, by1 * h, bx2 * w, by2 * h)
+
+
+def _choose_plate(plates, expected_rect):
+    """Plate box of the tracked vehicle: nearest to where the reader saw it."""
+    if not plates:
+        return None
+    if expected_rect is None or len(plates) == 1:
+        return plates[0]
+    ex = (expected_rect[0] + expected_rect[2]) / 2.0
+    ey = (expected_rect[1] + expected_rect[3]) / 2.0
+
+    def _dist(p):
+        cx, cy = (p.x1 + p.x2) / 2.0, (p.y1 + p.y2) / 2.0
+        return (cx - ex) ** 2 + (cy - ey) ** 2
+
+    return min(plates, key=_dist)
 
 
 _PLATE_DETECTOR_TRUST = {
@@ -412,7 +498,7 @@ def _plate_detector_trust(meta: Dict[str, Any]) -> float:
     if meta.get("fallback"):
         return -0.25
     det = (meta.get("detector") or "").lower()
-    base = det.replace("_enhanced", "")
+    base = det.replace("_enhanced", "").replace("_stitched", "")
     return _PLATE_DETECTOR_TRUST.get(base, _PLATE_DETECTOR_TRUST.get(det, 0.0))
 
 
@@ -782,6 +868,7 @@ def _pipeline_vehicle_plate_v2(
     ocr_bgr=None,
     box_mul: float = 1.0,
     hint_meta: Dict[str, Any] | None = None,
+    max_passes: int | None = None,
 ) -> Dict[str, Any]:
     """
     extract-v2 vehicle path: dedicated plate YOLO + RapidOCR.
@@ -813,28 +900,62 @@ def _pipeline_vehicle_plate_v2(
     )
 
     ocr_passes = 0
+    pass_budget = max(1, int(max_passes or MAX_PLATE_OCR_PASSES))
     attempts = []
+    # CCTV (reader metadata present): never OCR the whole frame — it mixes text
+    # from other vehicles, painted body text and the OSD into one "plate".
+    anpr_mode = hint_meta is not None
 
-    def _ocr_attempt(image, meta: Dict[str, Any], *, min_long: int | None = None) -> bool:
-        """Run RapidOCR once. Returns True when a confident plate is found."""
+    def _ocr_attempt(
+        image,
+        meta: Dict[str, Any],
+        *,
+        min_long: int | None = None,
+        plate_rect=None,
+        variant: str = "raw",
+    ) -> bool:
+        """
+        Run RapidOCR once on ``image`` (upscaled, then ``variant`` applied).
+        plate_rect (crop pixels) limits parsing to text inside the plate.
+        Returns True when a confident plate is found.
+        """
         nonlocal ocr_passes
-        if ocr_passes >= MAX_PLATE_OCR_PASSES:
+        if ocr_passes >= pass_budget or image is None or image.size == 0:
             return False
         ocr_passes += 1
         side = min_long if min_long is not None else PLATE_OCR_MIN_LONG_SIDE
-        prepared = _upscale_if_small(image, min_long_side=side)
-        lines_local = run_rapid_ocr(prepared)
+        prepared, up_method = upscale_plate(image, side)
+        rect = _scale_rect(
+            plate_rect,
+            prepared.shape[1] / float(image.shape[1]),
+            prepared.shape[0] / float(image.shape[0]),
+        )
+        if variant == "enhanced":
+            prepared = enhance_plate(prepared, rect)
+        elif variant == "stitched":
+            stitched = stitch_two_line(prepared, rect)
+            if stitched is None:
+                ocr_passes -= 1
+                return False
+            prepared, rect = stitched, None
+        detailed = run_rapid_ocr_detailed(prepared)
+        lines_local, pieces = _plate_rows(detailed, rect)
         parsed_local = extract_vehicle_number(lines_local) if lines_local else None
+        if not parsed_local and len(pieces) > len(lines_local):
+            parsed_local = extract_vehicle_number(pieces)
+        meta = {**meta, "upscale": up_method}
         attempts.append((lines_local, parsed_local, meta))
         logger.info(
-            "vehicle-plate-v2 ocr pass=%s detector=%s crop=%sx%s up_to=%s lines=%s "
-            "parsed=%s conf=%s elapsed_ms=%s texts=%s",
+            "vehicle-plate-v2 ocr pass=%s detector=%s crop=%sx%s up=%s(%s) lines=%s "
+            "dropped_outside_plate=%s parsed=%s conf=%s elapsed_ms=%s texts=%s",
             ocr_passes,
             meta.get("detector"),
-            image.shape[1] if image is not None else 0,
-            image.shape[0] if image is not None else 0,
+            image.shape[1],
+            image.shape[0],
             side,
+            up_method,
             len(lines_local or []),
+            len(detailed) - len(pieces),
             parsed_local[0] if parsed_local else None,
             round(float(parsed_local[1]), 3) if parsed_local else None,
             _elapsed_ms(t0),
@@ -901,7 +1022,10 @@ def _pipeline_vehicle_plate_v2(
 
     hit = False
     if plates:
-        best_det = plates[0]
+        expected = _expected_plate_rect(hint_meta, w, h, reader_zoom) if anpr_mode else None
+        best_det = _choose_plate(plates, expected)
+        if best_det is not plates[0]:
+            detect_meta["chosen"] = "nearest_tracked"
         best = _map_box(best_det, box_mul)
         # Clamp mapped box into OCR frame
         best.x1 = max(0, min(best.x1, ow - 1))
@@ -917,53 +1041,54 @@ def _pipeline_vehicle_plate_v2(
             "vehicle_sized": _is_vehicle_sized_box(best, ocr_frame),
             "ocr_frame": [ow, oh],
         })
+        if not detect_meta["vehicle_sized"]:
+            crop_for_color, rect_for_color = _crop_min_context(
+                ocr_frame, best, min_w=0, min_h=0, pad_ratio=0.05
+            )
+            detect_meta["plate_color"] = plate_color(crop_for_color, rect_for_color)
 
         # Vehicle YOLO fallback returns a car box — OCR lower plate zone, not whole car.
-        # Real plate YOLO returns a tight plate box — OCR tight + wide context crops.
-        for crop_img, det_name in _plate_zone_crops(ocr_frame, best):
-            if ocr_passes >= MAX_PLATE_OCR_PASSES:
-                break
-            hit = _ocr_attempt(
-                crop_img,
-                {**detect_meta, "detector": det_name},
-            ) or hit
-            if hit and det_name in (
-                "vehicle_bottom",
-                "plate_crop",
-                "plate_wide",
-                "plate_context",
-            ):
-                break
-            if ocr_passes >= MAX_PLATE_OCR_PASSES:
-                break
-            # Second pass: CLAHE + sharpen on same crop (blur / glare)
-            enhanced = _sharpen_for_blur(_enhance_for_ocr(crop_img))
-            hit = _ocr_attempt(
-                enhanced,
-                {**detect_meta, "detector": f"{det_name}_enhanced"},
-            ) or hit
-            if hit and det_name in (
-                "vehicle_bottom",
-                "plate_crop",
-                "plate_wide",
-                "plate_context",
-            ):
+        # Real plate YOLO returns a tight plate box — OCR tight + wide context crops,
+        # each raw first, then colour/glare-normalised; two-row plates also stitched.
+        two_line = not detect_meta["vehicle_sized"] and is_two_line_shape(
+            best.x2 - best.x1, best.y2 - best.y1
+        )
+        stop_on_hit = ("vehicle_bottom", "plate_crop", "plate_wide", "plate_context")
+        zones = _plate_zone_crops(ocr_frame, best)
+        for crop_img, det_name, rect in zones:
+            variants = ["raw", "enhanced"]
+            if two_line and det_name == "plate_crop":
+                variants.append("stitched")
+            for variant in variants:
+                if ocr_passes >= pass_budget:
+                    break
+                name = det_name if variant == "raw" else f"{det_name}_{variant}"
+                hit = _ocr_attempt(
+                    crop_img,
+                    {**detect_meta, "detector": name},
+                    plate_rect=rect,
+                    variant=variant,
+                ) or hit
+                if hit:
+                    break
+            if (hit and det_name in stop_on_hit) or ocr_passes >= pass_budget:
                 break
 
         # Perspective warp only if still no confident hit
-        if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
-            zone = _plate_zone_crops(ocr_frame, best)
-            base = zone[0][0] if zone else crop_with_padding(ocr_frame, best, pad_ratio=0.08)
-            warped = warp_document_if_possible(base)
+        if not hit and ocr_passes < pass_budget and zones:
+            warped = warp_document_if_possible(zones[0][0])
             if warped is not None:
                 hit = _ocr_attempt(
-                    _enhance_for_ocr(warped),
+                    warped,
                     {**detect_meta, "detector": "plate_warped"},
+                    variant="enhanced",
                 )
 
-    # Reader already sent a plate zoom JPEG — OCR the whole strip as trusted crop
-    # (YOLO often returns 0 on tight 359x129 crops even when the plate is readable).
-    if not hit and reader_zoom and ocr_passes < MAX_PLATE_OCR_PASSES:
+    # Reader already sent a plate zoom JPEG — OCR the strip as a trusted crop
+    # (YOLO often returns 0 on tight 359x129 crops even when the plate is readable),
+    # but only text around where the reader tracked the plate.
+    if not hit and reader_zoom and ocr_passes < pass_budget:
+        zoom_rect = _expected_plate_rect(hint_meta, ow, oh, True) if anpr_mode else None
         detect_meta.update({
             "detector": "reader_zoom",
             "box": [0, 0, ow - 1, oh - 1],
@@ -971,23 +1096,27 @@ def _pipeline_vehicle_plate_v2(
             "confidence": float((hint_meta or {}).get("conf") or 0.55),
             "label": "license_plate",
         })
-        hit = _ocr_attempt(
-            ocr_frame,
-            {**detect_meta, "detector": "reader_zoom"},
-        ) or hit
-        if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
+        for variant in ("raw", "enhanced"):
+            if hit or ocr_passes >= pass_budget:
+                break
             hit = _ocr_attempt(
-                _sharpen_for_blur(_enhance_for_ocr(ocr_frame)),
-                {**detect_meta, "detector": "reader_zoom_enhanced"},
+                ocr_frame,
+                {
+                    **detect_meta,
+                    "detector": "reader_zoom" if variant == "raw" else "reader_zoom_enhanced",
+                },
+                plate_rect=zoom_rect,
+                variant=variant,
             ) or hit
 
-    # No plate box (or crop OCR miss): ID-style fallbacks for close-up / screen capture
-    if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
+    # No plate box (or crop OCR miss): ID-style fallbacks for close-up / screen capture.
+    # Mobile uploads only — CCTV frames contain other vehicles and the OSD.
+    if not anpr_mode and not hit and ocr_passes < pass_budget:
         inset_list = _prepare_inset_variant(ocr_frame)
         if inset_list:
             inset_img, inset_meta = inset_list[0]
             hit = _ocr_attempt(
-                _sharpen_for_blur(_enhance_for_ocr(inset_img)),
+                inset_img,
                 {
                     **detect_meta,
                     **inset_meta,
@@ -995,11 +1124,12 @@ def _pipeline_vehicle_plate_v2(
                     "fallback": True,
                 },
                 min_long=280,
+                variant="enhanced",
             )
 
-    if not hit and ocr_passes < MAX_PLATE_OCR_PASSES:
+    if not anpr_mode and not hit and ocr_passes < pass_budget:
         hit = _ocr_attempt(
-            _sharpen_for_blur(_enhance_for_ocr(ocr_frame)),
+            ocr_frame,
             {
                 **detect_meta,
                 "detector": "full_frame_enhanced",
@@ -1007,6 +1137,7 @@ def _pipeline_vehicle_plate_v2(
                 "frame_fill_ratio": 1.0,
             },
             min_long=280,
+            variant="enhanced",
         )
 
     best_candidate, best_conf, best_meta, best_lines = _pick_plate_from_attempts(

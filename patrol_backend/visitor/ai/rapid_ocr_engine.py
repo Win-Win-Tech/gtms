@@ -101,6 +101,17 @@ def _box_center(box) -> Tuple[float, float]:
         return (0.0, 0.0)
 
 
+def _box_rect(box) -> Tuple[float, float, float, float]:
+    """Axis-aligned (x1, y1, x2, y2) for a RapidOCR 4-point box."""
+    try:
+        pts = list(box)
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception:
+        return (0.0, 0.0, 0.0, 0.0)
+
+
 def run_rapid_ocr(bgr_image) -> List[Tuple[str, float]]:
     """
     Run RapidOCR on BGR image.
@@ -109,11 +120,18 @@ def run_rapid_ocr(bgr_image) -> List[Tuple[str, float]]:
     then left→right). Reading order is required so name parsers can use
     label→next-line and "above DOB / above Nationality" layout rules.
     """
+    return [(t, s) for t, s, _ in run_rapid_ocr_detailed(bgr_image)]
+
+
+def run_rapid_ocr_detailed(
+    bgr_image,
+) -> List[Tuple[str, float, Tuple[float, float, float, float]]]:
+    """Same as run_rapid_ocr but each item also carries its (x1, y1, x2, y2) box."""
     if bgr_image is None or getattr(bgr_image, "size", 0) == 0:
         return []
 
     ocr = _get_rapid_ocr()
-    rows: List[Tuple[float, float, str, float]] = []
+    rows: List[Tuple[float, float, str, float, Tuple[float, float, float, float]]] = []
 
     try:
         # RapidOCR returns tuple (result, elapse)
@@ -137,7 +155,7 @@ def run_rapid_ocr(bgr_image) -> List[Tuple[str, float]]:
         except (ValueError, TypeError):
             score = 0.0
         cx, cy = _box_center(item[0])
-        rows.append((cy, cx, text, score))
+        rows.append((cy, cx, text, score, _box_rect(item[0])))
 
     if not rows:
         return []
@@ -149,20 +167,20 @@ def run_rapid_ocr(bgr_image) -> List[Tuple[str, float]]:
     row_tol = max(12.0, min(40.0, median_gap * 0.6 if median_gap > 0 else 18.0))
 
     rows.sort(key=lambda r: (r[0], r[1]))
-    ordered: List[Tuple[str, float]] = []
-    cluster: List[Tuple[float, float, str, float]] = []
+    ordered: List[Tuple[str, float, Tuple[float, float, float, float]]] = []
+    cluster: List[Tuple[float, float, str, float, Tuple[float, float, float, float]]] = []
     cluster_y = None
     for row in rows:
-        cy, cx, text, score = row
+        cy = row[0]
         if cluster_y is None or abs(cy - cluster_y) <= row_tol:
             cluster.append(row)
             cluster_y = cy if cluster_y is None else (cluster_y * 0.7 + cy * 0.3)
         else:
             cluster.sort(key=lambda r: r[1])
-            ordered.extend((t, s) for _, _, t, s in cluster)
+            ordered.extend((t, s, rect) for _, _, t, s, rect in cluster)
             cluster = [row]
             cluster_y = cy
     if cluster:
         cluster.sort(key=lambda r: r[1])
-        ordered.extend((t, s) for _, _, t, s in cluster)
+        ordered.extend((t, s, rect) for _, _, t, s, rect in cluster)
     return ordered

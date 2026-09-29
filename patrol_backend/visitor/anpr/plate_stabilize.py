@@ -14,6 +14,7 @@ import re
 from django.core.cache import cache
 from django.utils import timezone
 
+from visitor.ai.parse import is_rejected_anpr_plate
 from visitor.models import VisitorEntry
 
 from .gate import normalize_plate
@@ -129,6 +130,10 @@ def _best_candidate(raw: str, candidates: Iterable[str]) -> Optional[str]:
             continue
         if c == raw:
             return c
+        # Old junk reads stored before stricter parsing (e.g. TN58TN58) must not
+        # pull a valid new read towards them.
+        if is_rejected_anpr_plate(c):
+            continue
         d = edit_distance(raw, c)
         if d > _max_dist(raw, c):
             continue
@@ -284,6 +289,9 @@ def stabilize_plate(
             if plate_quality_score(cached) >= plate_quality_score(plate)
             else _prefer(cached, plate)
         )
+
+    if sticky and sticky != plate and is_rejected_anpr_plate(sticky):
+        sticky = None
 
     if sticky:
         if sticky != plate:

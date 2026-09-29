@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -52,6 +52,43 @@ def _load_bgr(jpeg_path: Optional[str], jpeg_b64: Optional[str]):
     return None
 
 
+def _vote_below_conf() -> float:
+    try:
+        return float(os.environ.get("ANPR_VOTE_BELOW_CONF", "0.95"))
+    except ValueError:
+        return 0.95
+
+
+def _ocr_plate(ocr: Dict[str, Any]) -> str:
+    if not ocr.get("found"):
+        return ""
+    return normalize_plate(ocr.get("number") or ocr.get("vehicle_number") or "")
+
+
+def _vote_plates(reads: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Pick the plate that most frames agree on (sum of OCR confidence, gate-eligible
+    reads only). One blurred/glared frame that misreads a character is outvoted by
+    two clean frames. Returns (winning OCR dict, vote summary).
+    """
+    tally: Dict[str, Dict[str, Any]] = {}
+    for ocr in reads:
+        plate = _ocr_plate(ocr)
+        if not plate or not anpr_ocr_gate_eligible(ocr)[0]:
+            continue
+        conf = float(ocr.get("confidence") or 0.0)
+        entry = tally.setdefault(plate, {"score": 0.0, "count": 0, "best": ocr})
+        entry["score"] += conf
+        entry["count"] += 1
+        if conf > float(entry["best"].get("confidence") or 0.0):
+            entry["best"] = ocr
+    summary = {p: (e["count"], round(e["score"], 3)) for p, e in tally.items()}
+    if not tally:
+        return reads[0], summary
+    winner = max(tally.values(), key=lambda e: (e["score"], e["count"]))
+    return winner["best"], summary
+
+
 @shared_task(
     name="visitor.anpr.tasks.process_anpr_frame",
     bind=True,
@@ -75,15 +112,21 @@ def process_anpr_frame(
     jpeg_b64: Optional[str] = None,
     cross_dir: int = 0,
     detect_meta: Optional[Dict[str, Any]] = None,
+    ocr_extra: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     OCR one event JPEG then apply gate. Stale frames are rejected.
 
     jpeg_path: full vehicle/frame evidence (saved on VisitorAsset).
     ocr_jpeg_path: optional plate-zoom crop for OCR only.
+    ocr_extra: runner-up plate crops of the same vehicle ([{path, meta}]); OCR'd
+        and voted on when the primary read is weak or not gate-eligible.
     gate_mode: parked_toggle | line_direction (from SiteCamera).
     """
     from scheduler.models import LocationSite, SiteCamera
+
+    ocr_extra = [e for e in (ocr_extra or []) if isinstance(e, dict) and e.get("path")]
+    temp_paths = [jpeg_path, ocr_jpeg_path] + [e["path"] for e in ocr_extra]
 
     # Drop stale pooled connections before any DB work (MySQL wait_timeout).
     close_old_connections()
@@ -99,7 +142,7 @@ def process_anpr_frame(
                 track_id,
                 camera_id,
             )
-            _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+            _cleanup_jpeg(*temp_paths)
             return {"ok": False, "reason": "stale", "age_sec": age}
 
     try:
@@ -114,7 +157,7 @@ def process_anpr_frame(
         )
     except LocationSite.DoesNotExist:
         logger.error("[ANPR_TASK] site missing id=%s", site_id)
-        _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+        _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": "site_missing"}
 
     # Prefer plate-zoom for OCR; evidence path stays full vehicle/frame.
@@ -122,12 +165,37 @@ def process_anpr_frame(
     bgr = _load_bgr(ocr_path, jpeg_b64)
     if bgr is None:
         logger.warning("[ANPR_TASK] bad jpeg track=%s path=%s", track_id, ocr_path)
-        _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+        _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": "bad_jpeg"}
 
     # Long CPU/GPU work — release DB sockets so they are not idle-killed mid-OCR.
     close_old_connections()
     ocr = extract_vehicle_from_bgr(bgr, hint_meta=detect_meta)
+
+    primary_ok = anpr_ocr_gate_eligible(ocr)[0]
+    primary_conf = float(ocr.get("confidence") or 0.0)
+    if ocr_extra and (not primary_ok or primary_conf < _vote_below_conf()):
+        reads = [ocr]
+        for extra in ocr_extra:
+            extra_bgr = _load_bgr(extra["path"], None)
+            if extra_bgr is None:
+                continue
+            try:
+                reads.append(
+                    extract_vehicle_from_bgr(
+                        extra_bgr, hint_meta=extra.get("meta") or detect_meta, max_passes=2
+                    )
+                )
+            except Exception as exc:
+                logger.warning("[ANPR_TASK] extra frame OCR failed track=%s: %s", track_id, exc)
+        ocr, votes = _vote_plates(reads)
+        logger.info(
+            "[ANPR_TASK] vote track=%s frames=%d votes=%s chosen=%s",
+            track_id,
+            len(reads),
+            votes,
+            _ocr_plate(ocr) or "-",
+        )
     close_old_connections()
 
     if not ocr.get("found"):
@@ -137,12 +205,12 @@ def process_anpr_frame(
             ocr.get("reason"),
             detect_meta,
         )
-        _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+        _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": "ocr_miss", "ocr": ocr}
 
     plate = normalize_plate(ocr.get("number") or ocr.get("vehicle_number") or "")
     if not plate:
-        _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+        _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": "empty_plate", "ocr": ocr}
 
     eligible, gate_reason = anpr_ocr_gate_eligible(ocr)
@@ -155,7 +223,7 @@ def process_anpr_frame(
             (ocr.get("detect") or {}).get("detector"),
             ocr.get("confidence"),
         )
-        _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+        _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": gate_reason, "plate": plate, "ocr": ocr}
 
     resolved, how = stabilize_plate(
@@ -192,7 +260,7 @@ def process_anpr_frame(
         ),
     )
     # Evidence was copied into VisitorAsset on success; always remove temp pending JPEGs
-    _cleanup_jpeg(jpeg_path, ocr_jpeg_path)
+    _cleanup_jpeg(*temp_paths)
     result["ocr_confidence"] = ocr.get("confidence")
     result["track_id"] = track_id
     result["camera_id"] = camera_id

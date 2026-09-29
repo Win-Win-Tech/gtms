@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone as dt_timezone
 from typing import List, Optional, Tuple
@@ -50,6 +51,52 @@ def _sharpness(gray: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def _extra_ocr_frames() -> int:
+    """Runner-up plate views sent with each event for OCR voting (0 disables)."""
+    return max(0, min(4, int(os.environ.get("ANPR_EXTRA_OCR_FRAMES", "2") or 0)))
+
+
+def _plate_quality(frame, box_norm, w: int, h: int) -> float:
+    """Sharpness of the plate region weighted by plate size (bigger = more readable)."""
+    try:
+        x1n, y1n, x2n, y2n = [float(v) for v in box_norm]
+    except (TypeError, ValueError):
+        return 0.0
+    px1, py1 = max(0, int(x1n * w)), max(0, int(y1n * h))
+    px2, py2 = min(w, int(x2n * w)), min(h, int(y2n * h))
+    if px2 - px1 < 8 or py2 - py1 < 4:
+        return 0.0
+    gray = cv2.cvtColor(frame[py1:py2, px1:px2], cv2.COLOR_BGR2GRAY)
+    return _sharpness(gray) * float(px2 - px1) ** 0.5
+
+
+def _plate_zoom(frame, box_norm, w: int, h: int):
+    """
+    Plate-centred crop for OCR (distant plates) → (image, zoom_rect_norm).
+    zoom_rect is None when the full frame is returned.
+    """
+    try:
+        x1n, y1n, x2n, y2n = [float(v) for v in box_norm]
+    except (TypeError, ValueError):
+        return frame, None
+    bw = max(0.01, x2n - x1n)
+    bh = max(0.01, y2n - y1n)
+    # Expand to ~min 28% width / 18% height of frame around plate
+    need_w = max(bw * 3.0, 0.28)
+    need_h = max(bh * 3.0, 0.18)
+    cx = (x1n + x2n) / 2.0
+    cy = (y1n + y2n) / 2.0
+    x1 = max(0.0, cx - need_w / 2.0)
+    y1 = max(0.0, cy - need_h / 2.0)
+    x2 = min(1.0, cx + need_w / 2.0)
+    y2 = min(1.0, cy + need_h / 2.0)
+    px1, py1 = int(x1 * w), int(y1 * h)
+    px2, py2 = int(x2 * w), int(y2 * h)
+    if px2 <= px1 + 20 or py2 <= py1 + 20:
+        return frame, None
+    return frame[py1:py2, px1:px2], (px1 / w, py1 / h, px2 / w, py2 / h)
+
+
 def _open_rtsp(url: str) -> Optional[cv2.VideoCapture]:
     # Force TCP via FFmpeg options when possible
     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
@@ -88,6 +135,57 @@ def _save_jpeg(bgr, track_id: str) -> str:
     return path
 
 
+class _FrameGrabber:
+    """
+    Reads the RTSP stream continuously on its own thread and keeps only the newest
+    frame. Reading only a few frames per detect tick lets the camera's stream back
+    up (old frames, timeouts); this keeps the socket drained and frames live.
+    The capture is owned and released by this thread only.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture, camera_id: str):
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        self._stop = False
+        self.failed = False
+        self._thread = threading.Thread(
+            target=self._run, name=f"anpr-grab-{str(camera_id)[:8]}", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop:
+                ok, frame = self._cap.read()
+                if not ok or frame is None:
+                    self.failed = True
+                    break
+                with self._lock:
+                    self._frame = frame
+                    self._seq += 1
+        except Exception as exc:
+            logger.warning("[ANPR_READER] grabber error: %s", exc)
+            self.failed = True
+        finally:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+
+    def latest(self):
+        with self._lock:
+            return self._frame, self._seq
+
+    def stop(self) -> None:
+        self._stop = True
+
+
+def _use_grab_thread() -> bool:
+    return (os.environ.get("ANPR_GRAB_THREAD") or "1").lower() in ("1", "true", "yes", "on")
+
+
 class CameraWorker:
     def __init__(self, camera):
         self.camera = camera
@@ -99,6 +197,9 @@ class CameraWorker:
         )
         self.tracker = SimpleTracker(camera_key=str(camera.id)[:8])
         self.cap: Optional[cv2.VideoCapture] = None
+        self.grabber: Optional[_FrameGrabber] = None
+        self._last_seq = 0
+        self._last_new_frame_at = 0.0
         self.last_detect_at = 0.0
         self.reconnect_at = 0.0
         self._tick_count = 0
@@ -121,12 +222,18 @@ class CameraWorker:
         self._drop_capture(0.0, reset_tracker=False)
 
     def _drop_capture(self, reconnect_in: float = 3.0, *, reset_tracker: bool = False) -> None:
-        try:
-            if self.cap is not None:
-                self.cap.release()
-        except Exception:
-            pass
+        if self.grabber is not None:
+            # Grabber thread releases its capture when its current read returns
+            self.grabber.stop()
+            self.grabber = None
+        else:
+            try:
+                if self.cap is not None:
+                    self.cap.release()
+            except Exception:
+                pass
         self.cap = None
+        self._last_seq = 0
         self.reconnect_at = time.monotonic() + max(0.0, reconnect_in)
         self._last_frame_fp = None
         self._frame_fp_same_since = 0.0
@@ -136,6 +243,8 @@ class CameraWorker:
 
     def ensure_capture(self) -> bool:
         now = time.monotonic()
+        if self.grabber is not None:
+            return True
         if self.cap and self.cap.isOpened():
             return True
         if now < self.reconnect_at:
@@ -146,11 +255,33 @@ class CameraWorker:
             self.reconnect_at = now + 5.0
             logger.warning("[ANPR_READER] connect failed camera=%s", self.camera.id)
             return False
+        if _use_grab_thread():
+            self.grabber = _FrameGrabber(self.cap, str(self.camera.id))
+            self._last_seq = 0
+            self._last_new_frame_at = now
         return True
 
-    def read_latest(self):
-        if not self.ensure_capture():
+    def _read_from_grabber(self):
+        now_m = time.monotonic()
+        if self.grabber.failed:
+            logger.warning("[ANPR_READER] read fail camera=%s — reconnect", self.camera.id)
+            self._drop_capture(3.0, reset_tracker=True)
             return None
+        frame, seq = self.grabber.latest()
+        if frame is None or seq == self._last_seq:
+            if now_m - self._last_new_frame_at >= self._freeze_reconnect_sec:
+                logger.warning(
+                    "[ANPR_READER] no new RTSP frame camera=%s for %.0fs — reconnect",
+                    self.camera.id,
+                    now_m - self._last_new_frame_at,
+                )
+                self._drop_capture(2.0, reset_tracker=True)
+            return None
+        self._last_seq = seq
+        self._last_new_frame_at = now_m
+        return frame
+
+    def _read_drain(self):
         # Drain RTSP buffer so we process near-live frames (stuck buffer = spam on old plate)
         drain_n = int(os.environ.get("ANPR_RTSP_DRAIN_FRAMES", "12") or 12)
         drain_n = max(3, min(drain_n, 30))
@@ -163,8 +294,16 @@ class CameraWorker:
             logger.warning("[ANPR_READER] read fail camera=%s — reconnect", self.camera.id)
             self._drop_capture(3.0, reset_tracker=True)
             return None
+        return frame
 
-        # Detect frozen stream (OpenCV keeps returning the same last frame)
+    def read_latest(self):
+        if not self.ensure_capture():
+            return None
+        frame = self._read_from_grabber() if self.grabber is not None else self._read_drain()
+        if frame is None:
+            return None
+
+        # Detect frozen stream (camera keeps sending the same picture)
         fp = _frame_fingerprint(frame)
         now_m = time.monotonic()
         if fp is not None:
@@ -183,6 +322,49 @@ class CameraWorker:
                 self._last_frame_fp = fp
                 self._frame_fp_same_since = 0.0
         return frame
+
+    def _update_best_frames(self, tr, frame, w: int, h: int) -> None:
+        """
+        Best plate view = sharp *and* large plate (Laplacian variance on the plate
+        box, not the whole frame — a sharp background says nothing about a moving
+        bike's plate). The best frame also provides the evidence photo; runner-ups
+        are kept for multi-frame OCR voting.
+        """
+        score = _plate_quality(frame, tr.box_norm, w, h)
+        extras_keep = _extra_ocr_frames()
+        is_best = score >= tr.best_sharpness
+        min_extra = min((s for s, _, _ in tr.extra_ocr), default=-1.0)
+        if not is_best and (
+            extras_keep <= 0 or (len(tr.extra_ocr) >= extras_keep and score <= min_extra)
+        ):
+            return
+
+        enc_src, zoom_rect = _plate_zoom(frame, tr.box_norm, w, h)
+        ok_ocr, buf_ocr = cv2.imencode(".jpg", enc_src, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok_ocr:
+            return
+        meta = {
+            "conf": tr.conf,
+            "box_norm": tr.box_norm,
+            "sharpness": score,
+            "label": tr.vehicle_label or "",
+            "zoom_crop": zoom_rect is not None,
+            "zoom_rect": zoom_rect,
+        }
+        if is_best:
+            ok_ev, buf_ev = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok_ev:
+                return
+            if tr.best_jpeg and extras_keep > 0:
+                tr.extra_ocr.append((tr.best_sharpness, tr.best_jpeg, dict(tr.best_meta or {})))
+            tr.best_sharpness = score
+            tr.best_jpeg = buf_ocr.tobytes()
+            tr.best_evidence_jpeg = buf_ev.tobytes()
+            tr.best_meta = meta
+        else:
+            tr.extra_ocr.append((score, buf_ocr.tobytes(), meta))
+        tr.extra_ocr.sort(key=lambda item: -item[0])
+        del tr.extra_ocr[max(0, extras_keep):]
 
     def process_tick(self, frame) -> None:
         h, w = frame.shape[:2]
@@ -272,9 +454,6 @@ class CameraWorker:
                 detect_ms,
             )
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        sharp = _sharpness(gray)
-
         min_hits = anpr_settings.min_track_hits()
         for tr in tracks:
             # Do NOT re-arm OCR_QUEUED/COOLDOWN while the same track is still visible.
@@ -282,48 +461,10 @@ class CameraWorker:
             # cooldown_sec → overnight IN/OUT spam on the same plate+image.
             # A new visit requires the track to drop (misses) then a fresh STABLE track.
 
-            # Update best frame while tracking
-            if tr.state in ("CANDIDATE", "STABLE") and sharp >= tr.best_sharpness:
-                # Plate-centered zoom for OCR (distant park); full frame kept for evidence.
-                enc_src = frame
-                bn = tr.box_norm
-                if bn and len(bn) == 4:
-                    try:
-                        x1n, y1n, x2n, y2n = [float(v) for v in bn]
-                        bw = max(0.01, x2n - x1n)
-                        bh = max(0.01, y2n - y1n)
-                        # Expand to ~min 28% width / 18% height of frame around plate
-                        need_w = max(bw * 3.0, 0.28)
-                        need_h = max(bh * 3.0, 0.18)
-                        cx = (x1n + x2n) / 2.0
-                        cy = (y1n + y2n) / 2.0
-                        x1 = max(0.0, cx - need_w / 2.0)
-                        y1 = max(0.0, cy - need_h / 2.0)
-                        x2 = min(1.0, cx + need_w / 2.0)
-                        y2 = min(1.0, cy + need_h / 2.0)
-                        px1, py1 = int(x1 * w), int(y1 * h)
-                        px2, py2 = int(x2 * w), int(y2 * h)
-                        if px2 > px1 + 20 and py2 > py1 + 20:
-                            enc_src = frame[py1:py2, px1:px2]
-                    except (TypeError, ValueError):
-                        enc_src = frame
-                ok_ocr, buf_ocr = cv2.imencode(
-                    ".jpg", enc_src, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
-                )
-                ok_ev, buf_ev = cv2.imencode(
-                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
-                )
-                if ok_ocr and ok_ev:
-                    tr.best_sharpness = sharp
-                    tr.best_jpeg = buf_ocr.tobytes()
-                    tr.best_evidence_jpeg = buf_ev.tobytes()
-                    tr.best_meta = {
-                        "conf": tr.conf,
-                        "box_norm": tr.box_norm,
-                        "sharpness": sharp,
-                        "label": tr.vehicle_label or "",
-                        "zoom_crop": enc_src is not frame,
-                    }
+            # Keep the sharpest plate views while tracking (only when seen this tick —
+            # a missed track's box points at where the plate used to be).
+            if tr.state in ("CANDIDATE", "STABLE") and tr.misses == 0:
+                self._update_best_frames(tr, frame, w, h)
 
             # Event readiness depends on gate_mode:
             # - parked_toggle: line cross OR stable/parked in ROI (testing)
@@ -447,6 +588,17 @@ class CameraWorker:
                     )
                     with open(ocr_path, "wb") as f:
                         f.write(tr.best_jpeg)
+                ocr_extra = []
+                for idx, (_, jpeg, extra_meta) in enumerate(tr.extra_ocr, start=2):
+                    extra_path = os.path.join(
+                        _pending_dir(), name.replace(".jpg", f"_ocr{idx}.jpg")
+                    )
+                    with open(extra_path, "wb") as f:
+                        f.write(jpeg)
+                    extra_meta = dict(extra_meta)
+                    if not extra_meta.get("zoom_crop"):
+                        extra_meta["evidence"] = "full_frame"
+                    ocr_extra.append({"path": extra_path, "meta": extra_meta})
             except OSError as exc:
                 logger.warning("[ANPR_READER] jpeg write failed: %s", exc)
                 continue
@@ -461,6 +613,7 @@ class CameraWorker:
                 "captured_at": datetime.now(dt_timezone.utc).isoformat(),
                 "jpeg_path": path,
                 "ocr_jpeg_path": ocr_path,
+                "ocr_extra": ocr_extra,
                 "cross_dir": int(tr.cross_dir or 0),
                 "detect_meta": meta,
             }
@@ -470,10 +623,11 @@ class CameraWorker:
                 tr.crossed = False
                 tr.best_jpeg = None
                 tr.best_evidence_jpeg = None
+                tr.extra_ocr = []
                 tr.queued_at = now_m
             else:
                 # backpressure — delete unused jpeg
-                for p in (path, ocr_path):
+                for p in [path, ocr_path] + [e["path"] for e in ocr_extra]:
                     if not p:
                         continue
                     try:
