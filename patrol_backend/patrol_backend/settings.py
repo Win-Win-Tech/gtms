@@ -512,13 +512,29 @@ MEDIAMTX_WEBRTC_BASE_URL = os.environ.get("MEDIAMTX_WEBRTC_BASE_URL", "http://12
 # CCTV ANPR (Phases 3–5) — Reader + Celery queue `anpr` (Redis broker, not RabbitMQ)
 ANPR_ENABLED = os.environ.get("ANPR_ENABLED", "false").lower() in ("1", "true", "yes")
 ANPR_MAX_CAMERAS = int(os.environ.get("ANPR_MAX_CAMERAS", "2"))
-ANPR_DETECT_FPS = float(os.environ.get("ANPR_DETECT_FPS", "1"))
+ANPR_DETECT_FPS = float(os.environ.get("ANPR_DETECT_FPS", "3"))
 ANPR_COOLDOWN_SEC = int(os.environ.get("ANPR_COOLDOWN_SEC", "60"))
 ANPR_QUEUE = os.environ.get("ANPR_QUEUE", "anpr")
 ANPR_MAX_QUEUE_DEPTH = int(os.environ.get("ANPR_MAX_QUEUE_DEPTH", "8"))
-# Must cover queue wait behind a slow task (multi-frame voting ~5 s) on a single worker.
-ANPR_STALE_FRAME_SEC = int(os.environ.get("ANPR_STALE_FRAME_SEC", "30"))
+# Max queue wait. One -c 1 worker takes ~10–30 s per event on the live CPU, so
+# vehicles arriving together wait behind each other.
+ANPR_STALE_FRAME_SEC = int(os.environ.get("ANPR_STALE_FRAME_SEC", "90"))
+# Margin (fraction of frame) around the drawn ANPR zone; bike plates hang below it.
+ANPR_ROI_MARGIN = float(os.environ.get("ANPR_ROI_MARGIN", "0.08"))
+# Retries for a vehicle still in view after an OCR miss / stale drop.
+ANPR_MISS_RETRIES = int(os.environ.get("ANPR_MISS_RETRIES", "2"))
+ANPR_RETRY_COLLECT_SEC = float(os.environ.get("ANPR_RETRY_COLLECT_SEC", "2"))
+ANPR_VOTE_BUDGET_SEC = float(os.environ.get("ANPR_VOTE_BUDGET_SEC", "20"))
 ANPR_MIN_TRACK_HITS = int(os.environ.get("ANPR_MIN_TRACK_HITS", "2"))
+# A vehicle unseen this long is sent with its best frames (fast pass-through)
+ANPR_LOST_FLUSH_SEC = float(os.environ.get("ANPR_LOST_FLUSH_SEC", "1"))
+# A new track at a read parked vehicle's spot with its plate is not re-toggled
+ANPR_PARKED_MEMORY_SEC = float(os.environ.get("ANPR_PARKED_MEMORY_SEC", "120"))
+# Idle gate: detect at full rate only while the zone changes (else every IDLE sec)
+ANPR_MOTION_GATE = os.environ.get("ANPR_MOTION_GATE", "true").lower() in ("1", "true", "yes")
+ANPR_IDLE_DETECT_SEC = float(os.environ.get("ANPR_IDLE_DETECT_SEC", "1"))
+ANPR_MOTION_HOLD_SEC = float(os.environ.get("ANPR_MOTION_HOLD_SEC", "3"))
+ANPR_MOTION_MIN_AREA = float(os.environ.get("ANPR_MOTION_MIN_AREA", "0.003"))
 ANPR_DETECT_CONF = float(os.environ.get("ANPR_DETECT_CONF", "0.18"))
 ANPR_DETECT_MAX_SIDE = int(os.environ.get("ANPR_DETECT_MAX_SIDE", "960"))
 # How often the reader reloads SiteCamera rows (diff-only; default 5 min)

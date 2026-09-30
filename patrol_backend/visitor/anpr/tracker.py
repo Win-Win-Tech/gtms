@@ -42,15 +42,36 @@ class Track:
     best_jpeg: Optional[bytes] = None  # plate zoom — OCR only
     best_evidence_jpeg: Optional[bytes] = None  # full frame / vehicle — visitor photos
     best_meta: Dict[str, Any] = field(default_factory=dict)
+    # Vehicle box (frame pixels) in the best frame — evidence once the vehicle left
+    best_vehicle: Any = None
     # Runner-up plate zooms (score, jpeg, meta) for multi-frame OCR voting
     extra_ocr: List[Tuple[float, bytes, Dict[str, Any]]] = field(default_factory=list)
     updated_at: float = field(default_factory=time.monotonic)
     created_at: float = field(default_factory=time.monotonic)
     queued_at: float = 0.0  # monotonic time when OCR was enqueued
+    attempts: int = 0  # OCR events sent for this track
+    hold_until: float = 0.0  # retry: gather fresh plate views until this time
+    result_checked_at: float = 0.0
+    plate: str = ""  # plate the worker read for this track
+    followup_armed: bool = False  # left while queued; frames held for a miss
+    # Movement since first seen: a re-detected parked vehicle never moved
+    start_nx: float = -1.0
+    start_ny: float = -1.0
+    max_shift: float = 0.0
+    # Where a read vehicle stood when committed; leaving that spot re-arms it
+    park_nx: float = -1.0
+    park_ny: float = -1.0
+    park_size: float = 0.0
+    away_hits: int = 0
 
 
 def _box_area(b: Tuple[float, float, float, float]) -> float:
     return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+
+def _centre_inside(inner: Tuple[float, float, float, float], outer: Tuple[float, float, float, float]) -> bool:
+    cx, cy = (inner[0] + inner[2]) / 2.0, (inner[1] + inner[3]) / 2.0
+    return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
 
 
 class SimpleTracker:
@@ -58,12 +79,16 @@ class SimpleTracker:
         self,
         camera_key: str,
         iou_thresh: float = 0.25,
-        max_misses: int = 5,
+        max_misses: Optional[int] = None,
         max_jump: Optional[float] = None,
+        fps: float = 1.0,
     ):
         self.camera_key = camera_key
         self.iou_thresh = iou_thresh
-        self.max_misses = max_misses
+        # A track survives ~5 s unseen whatever the detect rate (brief occlusion of a
+        # parked vehicle must not end its visit and re-toggle it).
+        self.fps = max(0.2, float(fps or 1.0))
+        self.max_misses = max_misses if max_misses is not None else max(5, round(5 * self.fps))
         # Plate boxes are small: a moving plate often has zero IoU with its previous
         # box at 1–3 detections/s. Fall back to nearest centre within this jump
         # (normalised frame units, per missed frame it may travel further).
@@ -73,10 +98,12 @@ class SimpleTracker:
             else float(max_jump)
         )
         self._next_id = 1
+        # Track ids key OCR results in Redis; a restarted tracker must not reuse them.
+        self._run = format(int(time.time() * 10) % (36 ** 4), "x")
         self.tracks: Dict[str, Track] = {}
 
     def _new_id(self) -> str:
-        tid = f"{self.camera_key}-{self._next_id}"
+        tid = f"{self.camera_key}-{self._run}-{self._next_id}"
         self._next_id += 1
         return tid
 
@@ -94,6 +121,9 @@ class SimpleTracker:
             tr.crossed = True
             tr.cross_dir = side  # new side after cross
         tr.nx, tr.ny = nx, ny
+        if tr.start_nx < 0:
+            tr.start_nx, tr.start_ny = nx, ny
+        tr.max_shift = max(tr.max_shift, ((nx - tr.start_nx) ** 2 + (ny - tr.start_ny) ** 2) ** 0.5)
         tr.box_norm = box_n
         tr.conf = conf
         if veh_label:
@@ -133,7 +163,7 @@ class SimpleTracker:
         for tid, tr in self.tracks.items():
             if tid in matched:
                 continue
-            limit = self.max_jump * (1.0 + 0.5 * tr.misses)
+            limit = self.max_jump * min(3.5, 1.0 + 0.5 * tr.misses / self.fps)
             area_t = _box_area(tr.box_norm)
             for j, det in enumerate(detections):
                 if j in used_det:
@@ -142,7 +172,15 @@ class SimpleTracker:
                 if dist > limit:
                     continue
                 area_d = _box_area(det[3])
-                if area_t > 0 and area_d > 0 and not (0.33 <= area_d / area_t <= 3.0):
+                # A bike's plate box and its lower-vehicle box (vehicle assist, when the
+                # plate model misses) differ a lot in size but are the same vehicle.
+                nested = _centre_inside(det[3], tr.box_norm) or _centre_inside(tr.box_norm, det[3])
+                if (
+                    not nested
+                    and area_t > 0
+                    and area_d > 0
+                    and not (0.33 <= area_d / area_t <= 3.0)
+                ):
                     continue
                 pairs.append((dist, tid, j))
         for dist, tid, j in sorted(pairs):
@@ -171,6 +209,8 @@ class SimpleTracker:
                 vehicle_label=veh_label or "",
                 line_side=side,
                 prev_line_side=side,
+                start_nx=nx,
+                start_ny=ny,
             )
 
         # Drop lost

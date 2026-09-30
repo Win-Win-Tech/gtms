@@ -671,7 +671,12 @@ def _normalize_plate_token(text: str) -> str:
 def _format_indian_plate(state: str, dist: str, series: str, number: str) -> str:
     dist = _ocr_fix_digits(dist)
     number = _ocr_fix_digits(number)
-    series = re.sub(r"[^A-Z]", "", series.upper())
+    # A digit in the series is a misread letter (TN58 8F → B); never drop it.
+    series = "".join(
+        _SERIES_LETTER_FROM_DIGIT.get(c, c) for c in re.sub(r"[^A-Z0-9]", "", series.upper())
+    )
+    if not series.isalpha() and series:
+        return ""
     state = _fix_state_code(state) or ""
     if not state:
         return ""
@@ -685,6 +690,34 @@ def _format_indian_plate(state: str, dist: str, series: str, number: str) -> str
     return ""
 
 
+def _joined_rows_plate(rows: Sequence[str]) -> Optional[str]:
+    """
+    Two-row plates split the series letters anywhere: "TN59C" + "T6759",
+    "TN59CT" + "6759", "TN 59" + "CT 6759". Join the rows and accept only a
+    complete Indian plate that uses (almost) every character of the join.
+    """
+    tokens = [_normalize_plate_token(r) for r in rows]
+    if len(tokens) < 2 or any(not t for t in tokens):
+        return None
+    top = tokens[0]
+    if not (3 <= len(top) <= 7) or not top[:2].isalpha() or not any(c.isdigit() for c in top):
+        return None
+    # After state + 2-digit district the top row can only hold series letters:
+    # "TN588" is TN 58 B (B read as 8).
+    if len(top) > 4 and top[2:4].isdigit():
+        tail = "".join(_SERIES_LETTER_FROM_DIGIT.get(c, c) for c in top[4:])
+        if tail.isalpha():
+            tokens[0] = top[:4] + tail
+    joined = "".join(tokens)
+    if not (8 <= len(joined) <= 11):
+        return None
+    best: Optional[str] = None
+    for plate, _ in _indian_compact_candidates(joined, 1.0):
+        if len(plate) >= len(joined) - 1 and (best is None or len(plate) > len(best)):
+            best = plate
+    return best
+
+
 def _indian_two_line_candidates(lines: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
     """Merge consecutive OCR lines that look like Indian state + series rows."""
     out: List[Tuple[str, float]] = []
@@ -692,6 +725,31 @@ def _indian_two_line_candidates(lines: List[Tuple[str, float]]) -> List[Tuple[st
         return out
     for i, (t1, s1) in enumerate(lines):
         if _is_ocr_noise_line(t1 or ""):
+            continue
+        # Next real rows below (skip OSD noise and emblem tokens like "IND")
+        below: List[Tuple[str, float]] = []
+        for t2, s2 in lines[i + 1 : i + 4]:
+            if _is_ocr_noise_line(t2 or ""):
+                continue
+            below.append((t2, float(s2)))
+            if len(below) == 2:
+                break
+        joined_plate = None
+        if below:
+            t2, s2 = below[0]
+            combos = [([t1, t2], s2)]
+            if len(below) > 1 and len(_normalize_plate_token(t2)) <= 3:
+                combos.append(([t1, t2, below[1][0]], min(s2, below[1][1])))
+                combos.append(([t1, below[1][0]], below[1][1]))
+            for rows, s_low in combos:
+                joined_plate = _joined_rows_plate(rows)
+                if joined_plate:
+                    conf = float(min(0.99, (float(s1) + s_low) / 2.0 + 0.06))
+                    out.append((joined_plate, conf))
+                    break
+        # A top row with series letters ("TN58B") must not also be read as bare
+        # state + district: that would drop its letters (TN58F4827).
+        if joined_plate and len(_normalize_plate_token(t1)) > 4:
             continue
         parsed_state = _parse_indian_state_line(t1 or "")
         if not parsed_state:
@@ -832,7 +890,13 @@ def extract_vehicle_number(lines: List[Tuple[str, float]]) -> Optional[Tuple[str
     # Joining every line only makes sense for a single small plate. On larger OCR
     # results it glues text from different vehicles / body paint into one "plate".
     useful_lines = [t for t, _ in lines if t and not _is_ocr_noise_line(t)]
-    if not candidates and len(useful_lines) <= 3:
+    # Row fragments ("TN59C" of TN59C / T6759) are not real candidates and must
+    # not block the join.
+    has_real = any(
+        len(_normalize_plate_token(p)) >= 7 and not is_rejected_anpr_plate(p, lines)
+        for p, _ in candidates
+    )
+    if not has_real and len(useful_lines) <= 3:
         blob = _normalize_plate_token(" ".join(useful_lines))
         for plate, conf in _indian_compact_candidates(blob, 0.55):
             candidates.append((plate, conf))

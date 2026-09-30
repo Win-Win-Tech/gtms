@@ -151,6 +151,7 @@ def apply_gate_event(
     evidence_path: Optional[str] = None,
     yolo_label: Optional[str] = None,
     gate_mode: str = "parked_toggle",
+    stationary: bool = False,
 ) -> Dict[str, Any]:
     """
     Create check-in or check-out for a CCTV plate event.
@@ -166,6 +167,9 @@ def apply_gate_event(
       check_out → exit_photo
 
     vehicle_type comes from YOLO class (car/truck/bus/motorcycle), mapped to org lookup codes.
+
+    stationary: the vehicle never moved while tracked (found parked). It may be
+    checked in, but never checked out — a parked vehicle leaves by moving.
     """
     plate = normalize_plate(plate)
     if len(plate) < 7:
@@ -311,6 +315,9 @@ def apply_gate_event(
             return {"ok": False, "reason": "no_open_entry", "plate": plate}
         action = "check_out"
     else:
+        if stationary and open_entry:
+            logger.info("[ANPR_GATE] still parked (not moving, already in) plate=%s site=%s", plate, site.id)
+            return {"ok": False, "reason": "still_parked", "plate": plate}
         action = "check_out" if open_entry else "check_in"
 
     if action == "check_out" and open_entry and not vehicle_type:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timezone as dt_timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +21,7 @@ from . import settings_helpers as anpr_settings
 from .gate import apply_gate_event, normalize_plate
 from .ocr_gate import anpr_ocr_gate_eligible
 from .plate_stabilize import stabilize_plate
+from .queue import report_result
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +88,13 @@ def _vote_plates(reads: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str,
     summary = {p: (e["count"], round(e["score"], 3)) for p, e in tally.items()}
     if not tally:
         return reads[0], summary
-    winner = max(tally.values(), key=lambda e: (e["score"], e["count"]))
+    # A read missing only the last digit (TN58BF482 of TN58BF4827) backs the full plate.
+    support = {
+        p: e["score"]
+        + sum(o["score"] for q, o in tally.items() if len(q) == len(p) - 1 and p.startswith(q))
+        for p, e in tally.items()
+    }
+    winner = max(tally.items(), key=lambda pe: (support[pe[0]], pe[1]["score"], pe[1]["count"]))[1]
     return winner["best"], summary
 
 
@@ -95,10 +104,40 @@ def _vote_plates(reads: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str,
     max_retries=0,
     soft_time_limit=90,
     time_limit=120,
-    expires=90,
 )
-def process_anpr_frame(
-    self,
+def process_anpr_frame(self, **kwargs) -> Dict[str, Any]:
+    """Run one event and tell the reader whether the vehicle needs another try."""
+    track_id = kwargs.get("track_id")
+    result: Dict[str, Any] = {"ok": False, "reason": "error"}
+    try:
+        result = _process_anpr_frame(**kwargs)
+        return result
+    finally:
+        outcome = _outcome(result)
+        report_result(track_id, outcome, str(result.get("plate") or "") if outcome == "ok" else "")
+
+
+# Gate decided on a real plate without an event — retrying would not change it.
+_DECIDED_REASONS = frozenset({
+    "cooldown", "already_in", "no_open_entry", "no_cross_dir", "lane_entry_only",
+    "lane_exit_only", "still_parked",
+})
+
+
+def _same_plate(a: str, b: str) -> bool:
+    """Equal, or one OCR character apart (glare on a parked plate)."""
+    if not a or not b or len(a) != len(b):
+        return False
+    return sum(1 for x, y in zip(a, b) if x != y) <= 1
+
+
+def _outcome(result: Dict[str, Any]) -> str:
+    if result.get("ok") or str(result.get("reason") or "") in _DECIDED_REASONS:
+        return "ok"
+    return "miss"
+
+
+def _process_anpr_frame(
     *,
     camera_id: str,
     site_id: str,
@@ -113,6 +152,9 @@ def process_anpr_frame(
     cross_dir: int = 0,
     detect_meta: Optional[Dict[str, Any]] = None,
     ocr_extra: Optional[List[Dict[str, Any]]] = None,
+    attempt: int = 1,
+    known_plates: Optional[List[str]] = None,
+    stationary: bool = False,
 ) -> Dict[str, Any]:
     """
     OCR one event JPEG then apply gate. Stale frames are rejected.
@@ -122,6 +164,9 @@ def process_anpr_frame(
     ocr_extra: runner-up plate crops of the same vehicle ([{path, meta}]); OCR'd
         and voted on when the primary read is weak or not gate-eligible.
     gate_mode: parked_toggle | line_direction (from SiteCamera).
+    known_plates: plates already read at this track's parked spot; reading one of
+        them again means the same vehicle is still parked (no IN/OUT toggle).
+    stationary: the vehicle never moved while tracked — may check in, never out.
     """
     from scheduler.models import LocationSite, SiteCamera
 
@@ -170,13 +215,22 @@ def process_anpr_frame(
 
     # Long CPU/GPU work — release DB sockets so they are not idle-killed mid-OCR.
     close_old_connections()
+    t_start = time.monotonic()
     ocr = extract_vehicle_from_bgr(bgr, hint_meta=detect_meta)
 
     primary_ok = anpr_ocr_gate_eligible(ocr)[0]
     primary_conf = float(ocr.get("confidence") or 0.0)
     if ocr_extra and (not primary_ok or primary_conf < _vote_below_conf()):
         reads = [ocr]
+        budget = anpr_settings.vote_budget_sec()
         for extra in ocr_extra:
+            if budget and time.monotonic() - t_start >= budget:
+                logger.info(
+                    "[ANPR_TASK] vote budget %.0fs used — skip remaining frames track=%s",
+                    budget,
+                    track_id,
+                )
+                break
             extra_bgr = _load_bgr(extra["path"], None)
             if extra_bgr is None:
                 continue
@@ -200,10 +254,11 @@ def process_anpr_frame(
 
     if not ocr.get("found"):
         logger.info(
-            "[ANPR_TASK] ocr miss track=%s reason=%s meta=%s",
+            "[ANPR_TASK] ocr miss track=%s attempt=%s reason=%s raw=%s",
             track_id,
+            attempt,
             ocr.get("reason"),
-            detect_meta,
+            (ocr.get("raw_text") or [])[:6],
         )
         _cleanup_jpeg(*temp_paths)
         return {"ok": False, "reason": "ocr_miss", "ocr": ocr}
@@ -242,6 +297,16 @@ def process_anpr_frame(
         )
     plate = resolved
 
+    for known in known_plates or []:
+        if _same_plate(plate, normalize_plate(str(known or ""))):
+            logger.info(
+                "[ANPR_TASK] still parked plate=%s (read before at this spot) track=%s",
+                plate,
+                track_id,
+            )
+            _cleanup_jpeg(*temp_paths)
+            return {"ok": False, "reason": "still_parked", "plate": plate}
+
     result = apply_gate_event(
         plate=plate,
         site=site,
@@ -249,6 +314,7 @@ def process_anpr_frame(
         direction_mode=direction,
         gate_mode=resolved_gate_mode,
         cross_dir=int(cross_dir or 0),
+        stationary=bool(stationary),
         confidence=ocr.get("confidence"),
         evidence_path=jpeg_path,
         yolo_label=(
@@ -265,6 +331,58 @@ def process_anpr_frame(
     result["track_id"] = track_id
     result["camera_id"] = camera_id
     return result
+
+
+def _worker_serves_anpr_queue() -> bool:
+    import re
+    import sys
+
+    argv = " ".join(sys.argv)
+    m = re.search(r"(?:-Q|--queues)[=\s]*([\w,.\-]+)", argv)
+    if not m:
+        return False
+    return anpr_settings.queue_name() in m.group(1).split(",")
+
+
+def _warm_models() -> None:
+    t0 = time.monotonic()
+    try:
+        from visitor.ai.detect import detect_plates
+        from visitor.ai.plate_enhance import upscale_plate
+        from visitor.ai.rapid_ocr_engine import run_rapid_ocr_detailed
+
+        detect_plates(np.zeros((320, 320, 3), dtype=np.uint8), conf=0.25)
+        blank = np.full((60, 200, 3), 255, dtype=np.uint8)
+        cv2.putText(blank, "TN01AB1234", (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+        upscale_plate(blank[:, :100], 480)
+        run_rapid_ocr_detailed(blank)
+        logger.info("[ANPR_TASK] models warm (keep loaded) ms=%.0f", (time.monotonic() - t0) * 1000)
+    except Exception as exc:
+        logger.warning("[ANPR_TASK] model warm-up failed: %s", exc)
+
+
+try:
+    from celery.signals import worker_process_init
+
+    @worker_process_init.connect
+    def _anpr_worker_process_init(**_kwargs) -> None:
+        """
+        The ANPR worker must answer in seconds: never idle-unload plate YOLO, and
+        load models at start instead of on the first vehicle (~15 s cold).
+        ANPR_WARM_MODELS=0 disables; =1 forces on any worker.
+        """
+        flag = (os.environ.get("ANPR_WARM_MODELS") or "auto").strip().lower()
+        if flag in ("0", "false", "no", "off"):
+            return
+        if flag not in ("1", "true", "yes", "on") and not _worker_serves_anpr_queue():
+            return
+        from visitor.ai import memory
+
+        memory.IDLE_UNLOAD_SEC = 0
+        # Background: worker_process_init must return within a few seconds.
+        threading.Thread(target=_warm_models, name="anpr-warmup", daemon=True).start()
+except ImportError:
+    pass
 
 
 def _cleanup_jpeg(*paths: Optional[str]) -> None:

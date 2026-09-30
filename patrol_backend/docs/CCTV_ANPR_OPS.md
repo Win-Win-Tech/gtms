@@ -73,7 +73,7 @@ python manage.py migrate scheduler
 ```bash
 ANPR_ENABLED=true
 ANPR_MAX_CAMERAS=2
-ANPR_DETECT_FPS=1
+ANPR_DETECT_FPS=3             # 1 is too slow for moving bikes (seen once, never tracked)
 ANPR_COOLDOWN_SEC=60
 ANPR_QUEUE=anpr
 ANPR_CAMERA_REFRESH_SEC=300   # reload SiteCamera from DB every 5 min (diff-only)
@@ -171,7 +171,7 @@ WorkingDirectory=/root/htdocs/ravi/gms/patrol_backend
 Environment=DJANGO_SETTINGS_MODULE=patrol_backend.settings
 Environment=ANPR_ENABLED=true
 Environment=ANPR_MAX_CAMERAS=2
-Environment=ANPR_DETECT_FPS=1
+Environment=ANPR_DETECT_FPS=3
 Environment=ANPR_COOLDOWN_SEC=60
 Environment=ANPR_CAMERA_REFRESH_SEC=300
 Environment=ANPR_QUEUE=anpr
@@ -238,7 +238,7 @@ Healthy Celery: `celery@… ready` and registered task `visitor.anpr.tasks.proce
 | Reader runs as **gunicorn** | Wrong ExecStart | Must be `python manage.py run_anpr_reader` |
 | `MySQL server has gone away` | Stale DB pool after idle | Deploy latest reader; keep `DB_POOL_RECYCLE≤280`; restart reader |
 | Celery inactive, reader OK | No OCR → no check-in/out | Fix/start `patrol-anpr-celery` |
-| `Received unregistered task ... process_anpr_frame` | Nested `visitor.anpr.tasks` not auto-discovered; or wrong worker ate the message | Ensure `ANPR_ENABLED=true` on ANPR Celery; `visitor.apps` + `CELERY_IMPORTS` register the task after Django ready; restart `patrol-anpr-celery`; default worker must use `-Q celery` and a unique `-n` |
+| `Received unregistered task ... process_anpr_frame` | Worker running old code (before 30 Sep 2026 it only registered the task with `ANPR_ENABLED=true`); or wrong worker ate the message | Pull latest code and restart the worker — every Celery worker now registers the task; check `visitor.anpr.tasks.process_anpr_frame` appears under `[tasks]` at startup |
 | `AppRegistryNotReady` on anpr reader/celery after celery.py change | Eager `import visitor.anpr.tasks` inside `celery.py` (loaded from `patrol_backend/__init__` before `django.setup`) | Do **not** import ANPR tasks in `celery.py`; use `VisitorConfig.ready()` / `CELERY_IMPORTS` instead |
 
 After deploying reader code:

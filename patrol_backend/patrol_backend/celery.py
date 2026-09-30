@@ -13,7 +13,7 @@ app.config_from_object('django.conf:settings', namespace='CELERY')
 
 # Auto-discover tasks in all installed apps (loads visitor.tasks, etc.)
 # Nested visitor.anpr.tasks is registered from visitor.apps.VisitorConfig.ready()
-# when ANPR_ENABLED=true (do NOT import it here — patrol_backend/__init__ loads
+# in every Celery worker (do NOT import it here — patrol_backend/__init__ loads
 # this module before django.setup() and would raise AppRegistryNotReady).
 app.autodiscover_tasks()
 

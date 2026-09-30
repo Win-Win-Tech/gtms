@@ -461,6 +461,28 @@ def _expected_plate_rect(hint_meta, w: int, h: int, reader_zoom: bool):
     return (bx1 * w, by1 * h, bx2 * w, by2 * h)
 
 
+def _plates_near_tracked(plates, hint_meta, w: int, h: int):
+    """
+    The reader zoom around one vehicle often shows a neighbour's plate too (a
+    parked car next to a bike). Keep only plates whose centre is in or next to
+    the tracked box; unknown geometry keeps everything.
+    """
+    hm = hint_meta or {}
+    if not hm.get("box_norm") or not hm.get("zoom_rect"):
+        return plates
+    rect = _expected_plate_rect(hint_meta, w, h, True)
+    if rect is None:
+        return plates
+    x1, y1, x2, y2 = rect
+    mx = max(24.0, 0.25 * (x2 - x1))
+    my = max(24.0, 0.25 * (y2 - y1))
+    return [
+        p
+        for p in plates
+        if x1 - mx <= (p.x1 + p.x2) / 2.0 <= x2 + mx and y1 - my <= (p.y1 + p.y2) / 2.0 <= y2 + my
+    ]
+
+
 def _choose_plate(plates, expected_rect):
     """Plate box of the tracked vehicle: nearest to where the reader saw it."""
     if not plates:
@@ -1019,6 +1041,16 @@ def _pipeline_vehicle_plate_v2(
                 )
         except Exception as exc:
             logger.debug("vehicle-plate-v2 rotate detect skipped: %s", exc)
+
+    if plates and anpr_mode and reader_zoom and not detect_meta.get("rotated"):
+        near = _plates_near_tracked(plates, hint_meta, w, h)
+        if len(near) < len(plates):
+            detect_meta["dropped_far_plates"] = len(plates) - len(near)
+            logger.info(
+                "vehicle-plate-v2 dropped %s plate(s) away from the tracked vehicle",
+                len(plates) - len(near),
+            )
+        plates = near
 
     hit = False
     if plates:

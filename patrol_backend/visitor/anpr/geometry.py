@@ -113,6 +113,18 @@ def geometry_to_dict(roi: Optional[NormBox], line: Optional[NormLine]) -> Dict[s
     return out
 
 
+def expand_roi(roi: Optional[NormBox], margin: float) -> Optional[NormBox]:
+    """
+    Grow the drawn zone by ``margin`` (fraction of frame) on every side. Plates hang
+    below the vehicle body (bikes, scooters): the vehicle is inside the zone while
+    its plate is just outside the drawn edge.
+    """
+    if roi is None or margin <= 0:
+        return roi
+    r = roi.clamp()
+    return NormBox(r.x1 - margin, r.y1 - margin, r.x2 + margin, r.y2 + margin).clamp()
+
+
 def point_in_roi(nx: float, ny: float, roi: Optional[NormBox]) -> bool:
     """True if point is inside ROI, or always True when no ROI is configured."""
     if roi is None:
