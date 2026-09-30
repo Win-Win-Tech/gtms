@@ -64,6 +64,7 @@ htmlcov/
 # YOLO / Ultralytics model weights (auto-downloaded)
 *.pt
 yolov8*.pt
+*_openvino_model/
 runs/
 
 patrol_backend/certificate/*.json
