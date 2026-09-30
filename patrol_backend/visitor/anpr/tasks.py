@@ -68,16 +68,19 @@ def _ocr_plate(ocr: Dict[str, Any]) -> str:
     return normalize_plate(ocr.get("number") or ocr.get("vehicle_number") or "")
 
 
-def _vote_plates(reads: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _vote_plates(
+    reads: List[Dict[str, Any]], exclude: Optional[List[str]] = None
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Pick the plate that most frames agree on (sum of OCR confidence, gate-eligible
     reads only). One blurred/glared frame that misreads a character is outvoted by
-    two clean frames. Returns (winning OCR dict, vote summary).
+    two clean frames. Plates in ``exclude`` (neighbours' plates) never win.
+    Returns (winning OCR dict, vote summary).
     """
     tally: Dict[str, Dict[str, Any]] = {}
     for ocr in reads:
         plate = _ocr_plate(ocr)
-        if not plate or not anpr_ocr_gate_eligible(ocr)[0]:
+        if not plate or not anpr_ocr_gate_eligible(ocr)[0] or _is_one_of(plate, exclude):
             continue
         conf = float(ocr.get("confidence") or 0.0)
         entry = tally.setdefault(plate, {"score": 0.0, "count": 0, "best": ocr})
@@ -131,6 +134,10 @@ def _same_plate(a: str, b: str) -> bool:
     return sum(1 for x, y in zip(a, b) if x != y) <= 1
 
 
+def _is_one_of(plate: str, plates: Optional[List[str]]) -> bool:
+    return any(_same_plate(plate, normalize_plate(str(p or ""))) for p in plates or [])
+
+
 def _outcome(result: Dict[str, Any]) -> str:
     if result.get("ok") or str(result.get("reason") or "") in _DECIDED_REASONS:
         return "ok"
@@ -155,6 +162,7 @@ def _process_anpr_frame(
     attempt: int = 1,
     known_plates: Optional[List[str]] = None,
     stationary: bool = False,
+    neighbour_plates: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     OCR one event JPEG then apply gate. Stale frames are rejected.
@@ -167,6 +175,8 @@ def _process_anpr_frame(
     known_plates: plates already read at this track's parked spot; reading one of
         them again means the same vehicle is still parked (no IN/OUT toggle).
     stationary: the vehicle never moved while tracked — may check in, never out.
+    neighbour_plates: plates of other vehicles parked in view right now; a read of
+        one of them is the neighbour's plate in this vehicle's photo (miss).
     """
     from scheduler.models import LocationSite, SiteCamera
 
@@ -218,7 +228,7 @@ def _process_anpr_frame(
     t_start = time.monotonic()
     ocr = extract_vehicle_from_bgr(bgr, hint_meta=detect_meta)
 
-    primary_ok = anpr_ocr_gate_eligible(ocr)[0]
+    primary_ok = anpr_ocr_gate_eligible(ocr)[0] and not _is_one_of(_ocr_plate(ocr), neighbour_plates)
     primary_conf = float(ocr.get("confidence") or 0.0)
     if ocr_extra and (not primary_ok or primary_conf < _vote_below_conf()):
         reads = [ocr]
@@ -242,7 +252,7 @@ def _process_anpr_frame(
                 )
             except Exception as exc:
                 logger.warning("[ANPR_TASK] extra frame OCR failed track=%s: %s", track_id, exc)
-        ocr, votes = _vote_plates(reads)
+        ocr, votes = _vote_plates(reads, neighbour_plates)
         logger.info(
             "[ANPR_TASK] vote track=%s frames=%d votes=%s chosen=%s",
             track_id,
@@ -297,15 +307,22 @@ def _process_anpr_frame(
         )
     plate = resolved
 
-    for known in known_plates or []:
-        if _same_plate(plate, normalize_plate(str(known or ""))):
-            logger.info(
-                "[ANPR_TASK] still parked plate=%s (read before at this spot) track=%s",
-                plate,
-                track_id,
-            )
-            _cleanup_jpeg(*temp_paths)
-            return {"ok": False, "reason": "still_parked", "plate": plate}
+    if _is_one_of(plate, known_plates):
+        logger.info(
+            "[ANPR_TASK] still parked plate=%s (read before at this spot) track=%s",
+            plate,
+            track_id,
+        )
+        _cleanup_jpeg(*temp_paths)
+        return {"ok": False, "reason": "still_parked", "plate": plate}
+    if _is_one_of(plate, neighbour_plates):
+        logger.info(
+            "[ANPR_TASK] neighbour plate=%s (belongs to a vehicle parked in view) track=%s",
+            plate,
+            track_id,
+        )
+        _cleanup_jpeg(*temp_paths)
+        return {"ok": False, "reason": "neighbour_plate", "plate": plate}
 
     result = apply_gate_event(
         plate=plate,

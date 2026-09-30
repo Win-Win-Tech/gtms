@@ -188,6 +188,12 @@ Runs a loop per camera, `ANPR_DETECT_FPS` times per second.
       vehicle may be checked **in** (found parked, not in yet) but never
       checked **out** — a parked vehicle leaves by moving.
     - Overlapping assist boxes on one vehicle are merged into one.
+    - Every job also carries `neighbour_plates`: plates of the other read
+      vehicles parked in view. A moving vehicle's zoom often shows a parked
+      neighbour's plate; the worker never gives it that plate (it is left out
+      of the vote, and a final read of it is a miss → retry / follow-up).
+    - A read (committed) track follows its vehicle by box overlap only, so a
+      vehicle passing close by cannot pull the parked track along with it.
 11. **Which vehicle owns a plate** — a plate belongs to the smallest vehicle box
     that contains its centre **below the top 30 %** of the box. A car's plate
     seen behind a parked scooter's handlebar sits at the top of the scooter's
@@ -210,6 +216,7 @@ ocr_extra: [{path, meta}, …]      ← runner-up plate photos for voting
 attempt                           ← 1 = first try, 2–3 = retries
 known_plates                      ← optional: plates already read at this parked spot
 stationary                        ← never moved: may check in, never check out
+neighbour_plates                  ← optional: plates of other vehicles parked in view (never this vehicle's)
 ```
 
 ### 4.3 Celery task (`visitor/anpr/tasks.py` → `process_anpr_frame`)
@@ -233,6 +240,9 @@ stationary                        ← never moved: may check in, never check out
    junk plates (e.g. `TN58TN58`).
    If the plate is in `known_plates` (±1 character) the vehicle is still parked:
    result `still_parked`, no gate event.
+   If it is in `neighbour_plates` it belongs to another parked vehicle:
+   result `neighbour_plate` (a miss, so the reader tries again). A first read of
+   a neighbour's plate always goes to voting, where neighbour plates cannot win.
 7. **Gate** (`gate.py` → `apply_gate_event`):
    - cooldown per plate (`ANPR_COOLDOWN_SEC`, 60 s) to avoid double events,
    - `Visitor` with IC `CCTV-<plate>` (created once per plate),
@@ -376,6 +386,7 @@ moving vehicles not recorded (only parked ones).
 | After restart only one of two parked vehicles read; car saved as motorcycle with the scooter's photo (30 Sep 10:44) | The car's plate lies inside the scooter's box (handlebar height): the scooter counted as "has a plate" (no assist zone) and the car's evidence picked the smaller scooter box | Plate must sit below the top 30 % of its vehicle; smallest fitting vehicle owns it | `reader.py` |
 | Standing vehicles re-read when something moves | Every new track at a parked spot was OCR'd | Never-moved tracks at a read spot adopt the plate without OCR (memory kept in Redis across restarts); leaving vehicles re-armed; `stationary` reads never check out | `reader.py`, `tracker.py`, `queue.py`, `gate.py`, `tasks.py` |
 | Parked scooter checked out when someone moved near it (30 Sep 10:05) | Extra vehicle-assist box / hidden track made a second track that re-read the same plate | Worker reports the plate; new tracks at a read vehicle's spot carry `known_plates` → `still_parked`; duplicate assist boxes merged | `reader.py`, `queue.py`, `tasks.py` |
+| Moving auto's photo saved as the parked car's CHECK_OUT (30 Sep 18:07, TN59BP9717) | The zoom around the moving auto also showed the parked car's plate and OCR read it | Jobs carry `neighbour_plates` (plates of read vehicles parked in view); they are left out of the vote and a final read of one is a miss; read tracks follow by overlap only | `reader.py`, `tasks.py`, `tracker.py` |
 
 ### What code cannot fix
 
@@ -470,6 +481,7 @@ sudo journalctl -u patrol-anpr-celery -f | grep -E "vote|CHECK_|gate skip|ocr mi
 | `[ANPR_READER] send track=… after it left` | Fast vehicle sent once it left the zone |
 | `[ANPR_READER] follow-up held / sent track=…` | Vehicle left while queued; later photos sent only if the first read missed |
 | `[ANPR_TASK] still parked plate=…` | Same plate re-read at a parked vehicle's spot — no IN/OUT |
+| `[ANPR_TASK] neighbour plate=… (belongs to a vehicle parked in view)` | A moving vehicle's photo showed a parked vehicle's plate — ignored, retried |
 | `[ANPR_READER] still parked track=… — not read again` | Standing vehicle seen again; no OCR |
 | `[ANPR_READER] parked track=… is leaving — reading again` | Read parked vehicle drove off; its exit is read |
 | `[ANPR_GATE] still parked (not moving, already in)` | Stationary read of a vehicle already in — no check-out |

@@ -1128,16 +1128,27 @@ class CameraWorker:
             "attempt": tr.attempts + 1,
             "stationary": not int(tr.cross_dir or 0) and not self._has_moved(tr),
         }
-        if not int(tr.cross_dir or 0):
-            # A moving track over a read vehicle that is still visible there: the
-            # same plate means a duplicate track on it, not a new visit.
-            known = sorted({
-                plate
-                for tid, plate in self._parked_at(tr, tuple(meta.get("box_norm") or tr.box_norm))
-                if tid in self.tracker.tracks and self.tracker.tracks[tid].misses == 0
-            })
-            if known:
-                payload["known_plates"] = known
+        # Read vehicles still standing in view right now. Over one of them (no line
+        # cross) the same plate is a duplicate track on it → still parked. Anywhere
+        # else their plate is a neighbour's (a parked car's plate next to a passing
+        # auto) and must not be booked to this vehicle.
+        box_norm = tuple(meta.get("box_norm") or tr.box_norm)
+        known, neighbours = set(), set()
+        for other in self.tracker.tracks.values():
+            if other is tr or other.state != "COMMITTED" or not other.plate or other.misses:
+                continue
+            if (
+                not int(tr.cross_dir or 0)
+                and _same_spot(other.box_norm, box_norm)
+                and _same_kind(other.vehicle_label, tr.vehicle_label)
+            ):
+                known.add(other.plate)
+            else:
+                neighbours.add(other.plate)
+        if known:
+            payload["known_plates"] = sorted(known)
+        if neighbours - known:
+            payload["neighbour_plates"] = sorted(neighbours - known)
         return payload
 
     @staticmethod

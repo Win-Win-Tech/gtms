@@ -159,9 +159,11 @@ class SimpleTracker:
                 self._apply(tr, detections[best_j])
 
         # 2) Nearest centre for the rest (moving vehicles), closest pairs first
+        # Read (committed) vehicles follow by overlap only: a vehicle passing a
+        # parked one must not pull the parked track along with it.
         pairs = []
         for tid, tr in self.tracks.items():
-            if tid in matched:
+            if tid in matched or tr.state == "COMMITTED":
                 continue
             limit = self.max_jump * min(3.5, 1.0 + 0.5 * tr.misses / self.fps)
             area_t = _box_area(tr.box_norm)
