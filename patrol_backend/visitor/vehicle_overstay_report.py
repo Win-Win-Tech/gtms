@@ -17,6 +17,7 @@ from patrol_backend.utils.timezone_utils import (
 )
 
 from .anpr.gate import normalize_plate
+from .contact_details import contact_search_q, entry_phone_number, entry_visitor_name
 from .lookup_options import resolve_label
 from .models import VehicleOverstayWhitelist, VisitorEntry
 from .overstay import get_overstay_hours
@@ -91,9 +92,9 @@ def _vehicle_type_label(code, location_id):
     return text or "—"
 
 
-def _display_visitor_name(visitor, plate):
+def _display_visitor_name(name, plate):
     """Omit plate-as-name placeholders (ANPR/CCTV stores plate in visitor_name)."""
-    name = (getattr(visitor, "visitor_name", None) or "").strip() if visitor else ""
+    name = (name or "").strip()
     if not name:
         return ""
     name_norm = "".join(name.upper().split())
@@ -105,10 +106,25 @@ def _display_visitor_name(visitor, plate):
     return name
 
 
-def _row_from_entry(entry, *, location_id, user_tz, wl_plates, status, status_label, end_point=None):
+def _row_from_entry(
+    entry,
+    *,
+    location_id,
+    user_tz,
+    wl_plates,
+    status,
+    status_label,
+    end_point=None,
+    entry_contact=False,
+):
     plate = normalize_plate(entry.vehicle_number) or (entry.vehicle_number or "").strip().upper()
     is_wl = plate in wl_plates
     visitor = entry.visitor
+    if entry_contact:
+        name, phone = entry_visitor_name(entry), entry_phone_number(entry)
+    else:
+        name = getattr(visitor, "visitor_name", None) if visitor else ""
+        phone = getattr(visitor, "phone_number", "") if visitor else ""
     check_out = entry.check_out_time
     duration_end = end_point if end_point is not None else check_out
     return {
@@ -116,8 +132,8 @@ def _row_from_entry(entry, *, location_id, user_tz, wl_plates, status, status_la
         "vehicle_number": plate,
         "vehicle_type": entry.vehicle_type or "",
         "vehicle_type_label": _vehicle_type_label(entry.vehicle_type, location_id),
-        "visitor_name": _display_visitor_name(visitor, plate),
-        "phone_number": getattr(visitor, "phone_number", "") or "",
+        "visitor_name": _display_visitor_name(name, plate),
+        "phone_number": phone or "",
         "site_id": str(entry.site_id) if entry.site_id else None,
         "site_name": getattr(entry.site, "name", None) or "—",
         "visit_date": entry.visit_date.isoformat() if entry.visit_date else None,
@@ -147,11 +163,15 @@ def build_vehicle_overstay_report(
     search=None,
     status_filter=None,
     vehicle_type=None,
+    entry_contact=False,
 ):
     """
     Rows where stay duration >= vehicle_overstay_hours:
     - still checked_in (no checkout), duration until now
     - checked_out, duration check_out - check_in
+
+    entry_contact: name / phone (and their search) use the entry's own values
+    when set (v5, scheduled reports).
     """
     from scheduler.models import Location
 
@@ -204,11 +224,13 @@ def build_vehicle_overstay_report(
     if vehicle_type_key:
         base = base.filter(vehicle_type=vehicle_type_key)
     if search_q:
-        base = base.filter(
-            Q(vehicle_number__icontains=search_q)
-            | Q(visitor__visitor_name__icontains=search_q)
-            | Q(visitor__phone_number__icontains=search_q)
-        )
+        if entry_contact:
+            contact_q = contact_search_q(search_q)
+        else:
+            contact_q = Q(visitor__visitor_name__icontains=search_q) | Q(
+                visitor__phone_number__icontains=search_q
+            )
+        base = base.filter(Q(vehicle_number__icontains=search_q) | contact_q)
 
     still_rows = []
     if status_key in ("all", "still_inside"):
@@ -239,6 +261,7 @@ def build_vehicle_overstay_report(
                     status="still_inside",
                     status_label="Still inside",
                     end_point=end_point,
+                    entry_contact=entry_contact,
                 )
             )
 
@@ -276,6 +299,7 @@ def build_vehicle_overstay_report(
                     wl_plates=wl_plates,
                     status="checked_out",
                     status_label="Checked out",
+                    entry_contact=entry_contact,
                 )
             )
 

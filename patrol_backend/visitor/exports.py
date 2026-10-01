@@ -13,6 +13,7 @@ from patrol_backend.utils.timezone_utils import (
     to_user_timezone,
 )
 
+from .contact_details import entry_phone_number, entry_visitor_name
 from .utils import resolve_location_for_request
 
 HEADERS = [
@@ -78,16 +79,24 @@ def _status_label(status):
     return (status or "").replace("_", " ").title()
 
 
-def _entry_export_row(entry, request, include_site=False):
-    """Shared row values for Excel and PDF (same columns / order)."""
+def _entry_export_row(entry, request, include_site=False, entry_contact=False):
+    """
+    Shared row values for Excel and PDF (same columns / order).
+    entry_contact: use the entry's own name / phone when set (v5, scheduled reports).
+    """
     location_id = str(entry.location_id) if entry.location_id else None
     user_tz = get_user_timezone_from_request(request, location_id=location_id)
     visitor = entry.visitor
+    if entry_contact:
+        name, phone = entry_visitor_name(entry), entry_phone_number(entry)
+    else:
+        name = visitor.visitor_name if visitor else ""
+        phone = visitor.phone_number if visitor else ""
     row = [
         _fmt_date(entry.visit_date),
         visitor.ic_passport_number if visitor else "",
-        visitor.visitor_name if visitor else "",
-        visitor.phone_number if visitor else "",
+        name,
+        phone,
         entry.company_name or "",
         entry.visitor_type or "",
         entry.vehicle_type or "",
@@ -108,12 +117,16 @@ def _entry_export_row(entry, request, include_site=False):
     return row
 
 
-def _entry_excel_row(entry, request, include_site=False):
-    return _entry_export_row(entry, request, include_site=include_site)
+def _entry_excel_row(entry, request, include_site=False, entry_contact=False):
+    return _entry_export_row(
+        entry, request, include_site=include_site, entry_contact=entry_contact
+    )
 
 
-def _entry_pdf_row(entry, request, include_site=False):
-    return _entry_export_row(entry, request, include_site=include_site)
+def _entry_pdf_row(entry, request, include_site=False, entry_contact=False):
+    return _entry_export_row(
+        entry, request, include_site=include_site, entry_contact=entry_contact
+    )
 
 
 def _resolve_export_meta(request):
@@ -193,7 +206,7 @@ def _resolve_export_meta(request):
     }
 
 
-def generate_visitor_excel(queryset, request, include_site=False):
+def generate_visitor_excel(queryset, request, include_site=False, entry_contact=False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Visitor Entries"
@@ -203,7 +216,11 @@ def generate_visitor_excel(queryset, request, include_site=False):
         cell.font = Font(bold=True)
 
     for entry in queryset:
-        ws.append(_entry_excel_row(entry, request, include_site=include_site))
+        ws.append(
+            _entry_excel_row(
+                entry, request, include_site=include_site, entry_contact=entry_contact
+            )
+        )
 
     buf = BytesIO()
     wb.save(buf)
@@ -337,7 +354,7 @@ def _draw_visitor_pdf_header_and_footer(canvas, doc):
     canvas.restoreState()
 
 
-def generate_visitor_pdf(queryset, request, include_site=False):
+def generate_visitor_pdf(queryset, request, include_site=False, entry_contact=False):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4, landscape
@@ -431,7 +448,9 @@ def generate_visitor_pdf(queryset, request, include_site=False):
     header_row = [Paragraph(h, header_cell_style) for h in headers]
     data = [header_row]
     for entry in entries:
-        row = _entry_pdf_row(entry, request, include_site=include_site)
+        row = _entry_pdf_row(
+            entry, request, include_site=include_site, entry_contact=entry_contact
+        )
         data.append([Paragraph(str(v) if v else "—", cell_style) for v in row])
 
     if len(data) == 1:

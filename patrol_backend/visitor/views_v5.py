@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 
 from authapp.site_access import assert_caller_can_access_site, get_site_or_error
 
+from .contact_details import master_is_placeholder
 from .exports import generate_visitor_excel, generate_visitor_pdf
 from .serializers_v5 import VisitorEntrySerializerV5
 from .site_filter import apply_visitor_site_filter
@@ -234,7 +235,7 @@ class VisitorEntryListViewV5(APIView):
 
     def get(self, request):
         try:
-            qs, err = _filtered_entries(request)
+            qs, err = _filtered_entries(request, entry_contact=True)
             if err:
                 return err
             qs = apply_visitor_site_filter(qs, request)
@@ -262,10 +263,31 @@ class VisitorEntryDetailViewV5(APIView):
 
 
 class VisitorEntryContactDetailsViewV5(VisitorEntryContactDetailsView):
-    """PATCH/POST /visitors/v5/entries/<id>/contact-details/ — CCTV name + phone."""
+    """
+    PATCH/POST /visitors/v5/entries/<id>/contact-details/ — CCTV name + phone.
+
+    First details for a CCTV visitor go on the Visitor (every visit shows them);
+    later edits are kept on this entry only.
+    """
 
     permission_classes = [IsAuthenticated]
     parser_classes = [FormParser, JSONParser, MultiPartParser]
+
+    def _apply_contact(self, entry, visitor, visitor_name, phone_number):
+        if master_is_placeholder(visitor, entry.vehicle_number):
+            super()._apply_contact(entry, visitor, visitor_name, phone_number)
+            own_name = own_phone = ""
+        elif (
+            visitor_name == (visitor.visitor_name or "").strip()
+            and phone_number == (visitor.phone_number or "").strip()
+        ):
+            own_name = own_phone = ""
+        else:
+            own_name, own_phone = visitor_name, phone_number
+        if (entry.visitor_name, entry.phone_number) != (own_name, own_phone):
+            entry.visitor_name = own_name
+            entry.phone_number = own_phone
+            entry.save(update_fields=["visitor_name", "phone_number", "modified_on"])
 
     def _run(self, request, entry_id, *, method):
         try:
@@ -311,11 +333,11 @@ class VisitorEntryExportViewV5(APIView):
 
     def get(self, request):
         try:
-            qs, err = _filtered_entries(request)
+            qs, err = _filtered_entries(request, entry_contact=True)
             if err:
                 return err
             qs = apply_visitor_site_filter(qs, request)
-            return generate_visitor_excel(qs, request, include_site=True)
+            return generate_visitor_excel(qs, request, include_site=True, entry_contact=True)
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
 
@@ -325,11 +347,11 @@ class VisitorEntryExportPdfViewV5(APIView):
 
     def get(self, request):
         try:
-            qs, err = _filtered_entries(request)
+            qs, err = _filtered_entries(request, entry_contact=True)
             if err:
                 return err
             qs = apply_visitor_site_filter(qs, request)
-            return generate_visitor_pdf(qs, request, include_site=True)
+            return generate_visitor_pdf(qs, request, include_site=True, entry_contact=True)
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
 
@@ -526,7 +548,7 @@ def _vehicle_overstay_report_from_request_v5(request):
             return None, Response({"error": detail}, status=status.HTTP_400_BAD_REQUEST)
 
     data, error_response = _vehicle_overstay_report_from_request(
-        request, site_id=str(site.id) if site else None
+        request, site_id=str(site.id) if site else None, entry_contact=True
     )
     if error_response:
         return None, error_response

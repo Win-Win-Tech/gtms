@@ -19,6 +19,7 @@ from notifications.models import NotificationLog
 from notifications.services import notify_visitor_host_action, notify_visitor_pending
 from scheduler.models import Location
 
+from .contact_details import contact_search_q
 from .exports import generate_visitor_excel, generate_visitor_pdf
 from .lookup_options import (
     get_valid_codes,
@@ -333,7 +334,11 @@ def _resolve_host(request, host_id, location_id):
     return host, None
 
 
-def _filtered_entries(request):
+def _filtered_entries(request, entry_contact=False):
+    """
+    entry_contact: search also matches the entry's own visitor_name / phone_number
+    (CCTV per-visit details; v5 and background reports).
+    """
     location_id, err = resolve_location_for_request(
         request, request.query_params.get("location_id")
     )
@@ -373,10 +378,15 @@ def _filtered_entries(request):
 
     search = (request.query_params.get("search") or "").strip()
     if search:
+        if entry_contact:
+            contact_q = contact_search_q(search)
+        else:
+            contact_q = Q(visitor__visitor_name__icontains=search) | Q(
+                visitor__phone_number__icontains=search
+            )
         qs = qs.filter(
-            Q(visitor__visitor_name__icontains=search)
+            contact_q
             | Q(visitor__ic_passport_number__icontains=search)
-            | Q(visitor__phone_number__icontains=search)
             | Q(vehicle_number__icontains=search)
             | Q(purpose_of_visit__icontains=search)
             | Q(host__name__icontains=search)
@@ -1285,14 +1295,17 @@ class VisitorEntryContactDetailsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        visitor.visitor_name = visitor_name[:255]
-        visitor.phone_number = phone_number[:32]
-        visitor.save(update_fields=["visitor_name", "phone_number", "modified_on"])
+        self._apply_contact(entry, visitor, visitor_name[:255], phone_number[:32])
 
         entry = _base_entry_qs().get(id=entry.id)
         return Response(
             VisitorEntrySerializer(entry, context={"request": request}).data
         )
+
+    def _apply_contact(self, entry, visitor, visitor_name, phone_number):
+        visitor.visitor_name = visitor_name
+        visitor.phone_number = phone_number
+        visitor.save(update_fields=["visitor_name", "phone_number", "modified_on"])
 
 
 class VisitorEntryExportView(APIView):
@@ -1712,7 +1725,7 @@ class VehicleMovementReportExportPdfView(APIView):
         return response
 
 
-def _vehicle_overstay_report_from_request(request, *, site_id=None):
+def _vehicle_overstay_report_from_request(request, *, site_id=None, entry_contact=False):
     location_id_param = request.query_params.get("location_id") or request.query_params.get(
         "location"
     )
@@ -1747,6 +1760,7 @@ def _vehicle_overstay_report_from_request(request, *, site_id=None):
             search=search,
             status_filter=status_filter,
             vehicle_type=vehicle_type,
+            entry_contact=entry_contact,
         )
     except ValueError as exc:
         return None, Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)

@@ -154,6 +154,10 @@ class VisitorEntry(models.Model):
     remarks = models.TextField(blank=True, default="")
     revert_reason = models.TextField(blank=True, default="")
 
+    # CCTV: name / phone for this visit only. Blank = use the linked Visitor's.
+    visitor_name = models.CharField(max_length=255, blank=True, default="")
+    phone_number = models.CharField(max_length=32, blank=True, default="")
+
     # Manual entry: expected times (same-day). Invitation: visit_date for future.
     expected_arrival_time = models.DateTimeField(null=True, blank=True)
     expected_out_time = models.DateTimeField(null=True, blank=True)

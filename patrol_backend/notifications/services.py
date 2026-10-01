@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional
 from django.conf import settings
 from django.utils import timezone
 
+from visitor.contact_details import entry_visitor_name
+
 from .models import DeviceToken, NotificationLog
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ def _entry_payload(entry, notif_type: str, extra: Optional[Dict[str, Any]] = Non
     data = {
         "type": notif_type,
         "entry_id": str(entry.id),
-        "visitor_name": getattr(visitor, "visitor_name", "") or "",
+        "visitor_name": entry_visitor_name(entry),
         "ic_passport_number": getattr(visitor, "ic_passport_number", "") or "",
         "status": entry.status or "",
         "host_id": str(entry.host_id) if entry.host_id else "",
@@ -253,8 +255,7 @@ def notify_vehicle_overstay(entry, recipients) -> int:
     )
     site = getattr(entry, "site", None)
     site_name = getattr(site, "name", None) or "site"
-    visitor = getattr(entry, "visitor", None)
-    visitor_name = (getattr(visitor, "visitor_name", None) or "").strip()
+    visitor_name = entry_visitor_name(entry).strip()
     if visitor_name and normalize_plate(visitor_name) == plate:
         visitor_name = ""
 

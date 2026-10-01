@@ -2,21 +2,27 @@ from rest_framework import serializers
 
 from patrol_backend.utils.timezone_utils import get_user_timezone_from_request, to_user_timezone
 
+from .contact_details import entry_phone_number, entry_visitor_name
 from .models import Visitor, VisitorAsset, VisitorEntry
 
 
-def entry_needs_details(entry) -> bool:
+def entry_needs_details(entry, entry_contact=False) -> bool:
     """
     True when a CCTV entry still needs real visitor name + phone.
 
     ANPR stores the plate as visitor_name and leaves phone empty — treat plate
     (or blank) as "name not filled". Default False for non-CCTV.
+    entry_contact: use the entry's own name / phone when set (v5).
     """
     if getattr(entry, "entry_source", None) != VisitorEntry.ENTRY_CCTV:
         return False
-    visitor = getattr(entry, "visitor", None)
-    name = (getattr(visitor, "visitor_name", None) or "").strip() if visitor else ""
-    phone = (getattr(visitor, "phone_number", None) or "").strip() if visitor else ""
+    if entry_contact:
+        name = entry_visitor_name(entry).strip()
+        phone = entry_phone_number(entry).strip()
+    else:
+        visitor = getattr(entry, "visitor", None)
+        name = (getattr(visitor, "visitor_name", None) or "").strip() if visitor else ""
+        phone = (getattr(visitor, "phone_number", None) or "").strip() if visitor else ""
     plate = (getattr(entry, "vehicle_number", None) or "").strip()
     name_norm = "".join(name.upper().split())
     plate_norm = "".join(plate.upper().split())

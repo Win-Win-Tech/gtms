@@ -389,7 +389,7 @@ def _incident_generate(location_id, period, site_id, request, send_pdf, send_exc
 def _visitor_queryset(location_id, period, site_id, request):
     from visitor.views import _filtered_entries
 
-    qs, err = _filtered_entries(request)
+    qs, err = _filtered_entries(request, entry_contact=True)
     if err is not None or qs is None:
         return None
     if site_id:
@@ -415,7 +415,9 @@ def _visitor_generate(location_id, period, site_id, request, send_pdf, send_exce
     include_site = bool(site_id)
 
     if send_excel:
-        content, _fname = _http_to_bytes(generate_visitor_excel(qs, request, include_site=include_site))
+        content, _fname = _http_to_bytes(
+            generate_visitor_excel(qs, request, include_site=include_site, entry_contact=True)
+        )
         attachments.append(
             {
                 "filename": f"{base}.xlsx",
@@ -427,7 +429,9 @@ def _visitor_generate(location_id, period, site_id, request, send_pdf, send_exce
             }
         )
     if send_pdf:
-        content, fname = generate_visitor_pdf(qs, request, include_site=include_site)
+        content, fname = generate_visitor_pdf(
+            qs, request, include_site=include_site, entry_contact=True
+        )
         attachments.append(
             {
                 "filename": fname or f"{base}.pdf",
@@ -552,6 +556,7 @@ def _vehicle_overstay_data(location_id, period, site_id, request, include_whitel
         end_date_str=end,
         site_id=str(site_id) if site_id else None,
         include_whitelist=include_whitelist,
+        entry_contact=True,
     )
 
 
