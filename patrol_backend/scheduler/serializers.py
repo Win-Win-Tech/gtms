@@ -41,6 +41,8 @@ class SiteCameraSerializer(serializers.ModelSerializer):
             "site",
             "name",
             "rtsp_url",
+            "camera_type",
+            "features",
             "direction",
             "gate_mode",
             "is_enabled",
@@ -57,6 +59,16 @@ class SiteCameraWriteSerializer(serializers.Serializer):
     id = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(max_length=255)
     rtsp_url = serializers.CharField(max_length=1024)
+    camera_type = serializers.ChoiceField(
+        choices=SiteCamera.CameraType.choices,
+        default=SiteCamera.CameraType.VEHICLE,
+        required=False,
+    )
+    features = serializers.ListField(
+        child=serializers.CharField(max_length=64),
+        required=False,
+        default=list,
+    )
     direction = serializers.ChoiceField(
         choices=SiteCamera.Direction.choices,
         default=SiteCamera.Direction.TOGGLE,
@@ -71,6 +83,38 @@ class SiteCameraWriteSerializer(serializers.Serializer):
     sort_order = serializers.IntegerField(min_value=0, default=0, required=False)
     stream_path = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
     anpr_geometry = serializers.JSONField(required=False, default=dict)
+
+    def validate(self, attrs):
+        camera_type = str(attrs.get("camera_type") or SiteCamera.CameraType.VEHICLE)
+        name = (attrs.get("name") or "").strip()
+        allowed = SiteCamera.FEATURES_BY_TYPE.get(camera_type, ())
+        labels = dict(SiteCamera.Feature.choices)
+        type_label = dict(SiteCamera.CameraType.choices).get(camera_type, camera_type)
+
+        features = []
+        for raw in attrs.get("features") or []:
+            feature = (raw or "").strip()
+            if feature and feature not in features:
+                features.append(feature)
+
+        for feature in features:
+            if feature not in allowed:
+                raise serializers.ValidationError(
+                    {"features": f"{labels.get(feature, feature)} is not available for {type_label} cameras (camera: {name})."}
+                )
+            if feature in SiteCamera.UNAVAILABLE_FEATURES:
+                raise serializers.ValidationError(
+                    {"features": f"{labels[feature]} is coming soon and cannot be enabled yet (camera: {name})."}
+                )
+        if allowed and not features:
+            raise serializers.ValidationError(
+                {"features": f"Select at least one feature for {type_label} cameras (camera: {name})."}
+            )
+
+        attrs["camera_type"] = camera_type
+        attrs["features"] = features
+        return attrs
+
 
 class SiteCameraBulkSerializer(serializers.Serializer):
     cameras = SiteCameraWriteSerializer(many=True)

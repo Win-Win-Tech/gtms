@@ -1340,7 +1340,10 @@ def load_cameras():
 
     def _fetch():
         qs = (
-            SiteCamera.objects.filter(is_enabled=True)
+            SiteCamera.objects.filter(
+                is_enabled=True,
+                camera_type=SiteCamera.CameraType.VEHICLE,
+            )
             .select_related("site")
             .order_by("sort_order", "name")
         )

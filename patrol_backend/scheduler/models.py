@@ -155,6 +155,25 @@ class SiteCamera(models.Model):
         # Fire only when vehicle crosses the virtual line; cross side = in/out
         LINE_DIRECTION = "line_direction", "Only when vehicle crosses the line"
 
+    class CameraType(models.TextChoices):
+        VEHICLE = "vehicle", "Vehicle (number plate)"
+        FACE = "face", "Face"
+
+    class Feature(models.TextChoices):
+        FACE_ATTENDANCE = "face_attendance", "Face attendance"
+        ID_CARD_EXTRACT = "id_card_extract", "ID card extract"
+
+    # Vehicle cameras always run ANPR, so they take no extra features.
+    FEATURES_BY_TYPE = {
+        CameraType.VEHICLE.value: (),
+        CameraType.FACE.value: (
+            Feature.FACE_ATTENDANCE.value,
+            Feature.ID_CARD_EXTRACT.value,
+        ),
+    }
+    # Listed in the UI but not built yet; the API rejects them.
+    UNAVAILABLE_FEATURES = (Feature.ID_CARD_EXTRACT.value,)
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     site = models.ForeignKey(
         LocationSite,
@@ -163,6 +182,17 @@ class SiteCamera(models.Model):
     )
     name = models.CharField(max_length=255)
     rtsp_url = models.CharField(max_length=1024)
+    camera_type = models.CharField(
+        max_length=16,
+        choices=CameraType.choices,
+        default=CameraType.VEHICLE,
+        help_text="vehicle = number plate gate (ANPR); face = face features",
+    )
+    features = models.JSONField(
+        blank=True,
+        default=list,
+        help_text='Features for this camera type, e.g. ["face_attendance"]',
+    )
     direction = models.CharField(
         max_length=16,
         choices=Direction.choices,
@@ -203,6 +233,9 @@ class SiteCamera(models.Model):
 
     def __str__(self):
         return f"{self.site.name} — {self.name}"
+
+    def has_feature(self, feature) -> bool:
+        return feature in (self.features or [])
 
 
 #class Shift(models.Model):

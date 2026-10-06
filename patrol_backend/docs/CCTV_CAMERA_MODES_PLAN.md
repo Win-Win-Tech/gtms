@@ -1,29 +1,32 @@
-# CCTV Camera Modes — Visitor / Attendance / People Count
+# CCTV Camera Types — Vehicle / Face (Face Attendance, ID Card Extract)
 
-**Status:** Planning (no implementation yet)  
-**Last updated:** 2026-09-26  
+**Status:** Phase 0 done locally (not deployed) · Phase A next  
+**Last updated:** 2026-10-05 (replaces the 2026-09-26 "Visitor / Attendance / People count" draft)  
 **Related docs:**
 - [`CCTV_VEHICLE_GATE_PLAN.md`](CCTV_VEHICLE_GATE_PLAN.md) — existing vehicle ANPR gate
 - [`CCTV_ANPR_OPS.md`](CCTV_ANPR_OPS.md) — ANPR reader / Celery ops
 - [`CCTV_ANPR_GEOMETRY_API.md`](CCTV_ANPR_GEOMETRY_API.md) — ROI + tripwire line
 - [`CCTV_LIVE_VIEW.md`](CCTV_LIVE_VIEW.md) — MediaMTX / HLS
+- [`FACE_ATTENDANCE_INSTALL.md`](FACE_ATTENDANCE_INSTALL.md) — kiosk face attendance (dlib + FAISS)
 
 ---
 
 ## 1. In one sentence
 
-Extend each site CCTV camera so admin can choose **Visitor (vehicle ANPR)** or **Attendance (walk-by face punch)** as the primary mode, with an optional **People count** add-on that counts Entry / Exit on tripwire — delivered **one capability at a time**.
+When adding a site camera, admin chooses **Vehicle** (current ANPR flow, unchanged) or **Face**; a Face camera has feature checkboxes — **Face attendance** (walk-by, one person or a group in one frame) now, **ID card extract** later.
 
 ---
 
-## 2. Client need (high level)
+## 2. Client need
 
 | Need | Description |
 |------|-------------|
-| Today | Cameras are vehicle-only: detect plate → create visitor entry / exit |
-| Wanted | Camera settings: choose **Attendance** or **Visitor**; optional **People count** |
-| Attendance | Not kiosk stand-still — people walk past camera; detect face; mark attendance using open session |
-| People count | Separate Entry count and Exit count when crossing tripwire (anonymous) |
+| Today | Every camera is a vehicle camera: plate → visitor check-in / check-out |
+| Wanted | Camera type choice: **Vehicle** or **Face** |
+| Vehicle | Exactly the current flow |
+| Face → Face attendance | Registered employees walking past the camera get check-in / check-out. Single person or a group of people in the same frame |
+| Face → ID card extract | Wanted, but the use case is **not decided yet** → Phase B, designed later |
+| Main focus | Face attendance + ID card extract. The other 11 AI ideas (people count, PPE, fire/smoke, …) are ignored for now, but the data model must allow them later |
 
 ---
 
@@ -31,362 +34,370 @@ Extend each site CCTV camera so admin can choose **Visitor (vehicle ANPR)** or *
 
 | Capability | Exists? | Notes |
 |------------|---------|--------|
-| Site camera CRUD (name, RTSP, direction, gate_mode, geometry) | Yes | `scheduler.SiteCamera` |
+| Site camera CRUD (name, RTSP, direction, gate_mode, geometry) | Yes | `scheduler.SiteCamera`, `PUT /scheduler/sites/<site_id>/cameras/` |
 | Live HLS view | Yes | MediaMTX |
 | ANPR → visitor check-in / check-out | Yes | Reader + Celery `anpr` queue + `apply_gate_event` |
-| Per-camera tripwire (ROI + line) | Yes | Vehicle only |
-| Camera purpose / mode field | **No** | No `visitor` / `attendance` / people-count flags |
-| Walk-by CCTV face → attendance | **No** | Face attendance is **kiosk-only** today |
-| People Entry / Exit counters | **No** | — |
+| Camera type / feature field | **No** | ANPR reader loads **every** enabled camera (`visitor/anpr/reader.py`, camera refresh) |
+| Face attendance | Kiosk only | Phone uploads a still → `identify_user_in_location` (FAISS) → punch |
+| ID card OCR | Upload only | Visitor AI v2 `type=id` (RapidOCR + document detection) |
 
-### Current vehicle pipeline
-
-```
-RTSP camera
-  → run_anpr_reader (detect / track in ROI, optional line cross)
-  → Redis queue `anpr`
-  → Celery process_anpr_frame (OCR)
-  → apply_gate_event
-       → Visitor (synthetic IC CCTV-{plate})
-       → VisitorEntry check-in / check-out
-       → VisitorAsset evidence photo
-```
-
-### Current face attendance (kiosk only)
+### Current face attendance (kiosk)
 
 ```
-Mobile/tablet upload still face
+Mobile/tablet uploads one still face
   → POST /dashboard/attendance/face_attendance/
-  → geofence + identify_user_in_location (FAISS)
+  → geofence + identify_user_in_location (FAISS, strict 0.38 / relaxed 0.45 + margin)
   → open session? → checkout : checkin
   → CheckInLog + AttendanceCheckin
 ```
 
-**Open session** (no separate Session model): for that user on today’s shift window, latest check-in is newer than latest check-out.
+Face encoding: dlib `face_recognition` (128-d). The slow part on CPU is dlib's HOG **face detection** (~1 s per full frame); encoding a face whose box is already known is much cheaper.
+
+### Important camera API behaviour
+
+`PUT /scheduler/sites/<site_id>/cameras/` **deletes and recreates** all cameras of the site, so camera ids change on every save. Anything that references a camera (event logs) must use `on_delete=SET_NULL` and also store the camera name.
 
 ---
 
-## 4. Decisions (locked from product discussion)
+## 4. Decisions
 
 | # | Topic | Decision |
 |---|--------|----------|
-| 1 | Primary mode | Mutually exclusive: **Visitor** **or** **Attendance** (main control) |
-| 2 | People count | **Add-on checkbox** (optional), not a third primary mode |
-| 3 | Direction / in-out | Same as vehicle: **same camera + tripwire**, or **separate Entry / Exit cameras** |
-| 4 | Separate tripwires | **Yes** — each camera has its own `anpr_geometry.line` |
-| 5 | Attendance capture style | Walk-by (not kiosk stand-still) |
-| 6 | People count identity | Anonymous only (no face match required) |
-| 7 | Attendance identity | Registered users only (face match) |
-| 8 | Cooldown | Same pattern as vehicle (`ANPR_COOLDOWN_SEC`, default **60s**); key by plate (visitor) or user (attendance) |
-| 9 | Display UI for counts / CCTV attendance events | **Decide later** |
-| 10 | Delivery | **One by one** (not all features in one release) |
-| 11 | Shift required for CCTV attendance | **Pending client confirmation** |
-| 12 | Dual Entry+Exit race | Handled by shared site cooldown + lane rules (see §6); stronger “gate pair” optional later |
+| 1 | Main choice | Camera type: **Vehicle** or **Face** (one per camera) |
+| 2 | Face features | Checkboxes: **Face attendance**, **ID card extract** — at least one required |
+| 3 | Existing cameras | Become `vehicle` automatically; no behaviour change |
+| 4 | ANPR reader | Only reads `vehicle` cameras |
+| 5 | Build order | Phase 0 (settings) → Phase A (face attendance) → Phase B (ID card, design later) |
+| 6 | Scale for v1 | **Single face camera per site**; single person or a small group in one frame |
+| 7 | Attendance identity | Registered users only (existing face index). Unknown faces never punch |
+| 8 | Shift rule | **Decide later** → one setting, default = same as kiosk (no shift today = no punch) |
+| 9 | ID card extract | **Use case not decided** → checkbox hidden / disabled ("coming soon") until Phase B |
+| 10 | Other AI features | Out of scope; model must allow adding them without new columns |
 
 ---
 
-## 5. Target camera settings model
+## 5. Camera settings model (Phase 0)
 
-### UI (Organisation → Site → CCTV cameras)
-
-For each camera:
-
-1. **Primary mode** (required) — radio / select:
-   - `Visitor` (vehicle ANPR → visitor entry) — default for existing cameras
-   - `Attendance` (walk-by face → punch)
-2. **People count** (optional checkbox) — add-on:
-   - When enabled: tripwire crosses increment Entry / Exit counters
-3. Existing fields remain: name, RTSP, enabled, `direction` (`toggle` / `in` / `out`), `gate_mode`, ROI + line geometry
-
-### Proposed DB fields on `SiteCamera` (additive)
+### New fields on `SiteCamera` (additive)
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `primary_mode` | CharField | `visitor` | `visitor` \| `attendance` |
-| `people_count_enabled` | Boolean | `false` | Add-on people Entry/Exit counting |
+| `camera_type` | CharField(16), choices | `vehicle` | `vehicle` \| `face` |
+| `features` | JSONField (list of strings) | `[]` | Face: `face_attendance`, `id_card_extract`. Vehicle: empty (ANPR is implied) |
 
-> Exact allow-list for “People count on Visitor cams vs Attendance cams only” — still open (see §12).
+Why a list instead of one boolean per feature: the future ideas fit the same two fields without migrations.
 
-### Logical flow
+| `camera_type` | `features` now | Possible later |
+|---------------|----------------|----------------|
+| `vehicle` | — (ANPR) | — |
+| `face` | `face_attendance`, `id_card_extract` | `gender_age` |
+| `people` (later) | — | `people_count`, `crowd_threshold`, `idle_sitting`, `restricted_area`, `fall_detect` |
+| `safety` (later) | — | `fire_smoke`, `weapon`, `ppe`, `missing_object` |
+| `production` (later) | — | `conveyor_count` |
+
+Only `vehicle` and `face` are accepted in Phase 0.
+
+### Validation (API)
+
+| Rule | Error |
+|------|-------|
+| `camera_type` not in allowed list | "Unknown camera type" |
+| `face` with empty `features` | "Select at least one face feature" |
+| Unknown feature, or feature not allowed for the type | "Feature X is not available for Y cameras" |
+| `id_card_extract` before Phase B ships | Rejected: "ID card extract is coming soon and cannot be enabled yet" |
+| `vehicle` | `features` saved as `[]` |
+
+`direction` stays on every camera (used by face attendance too). `gate_mode` and the ROI/line in `anpr_geometry` are only used for vehicle cameras in v1.
+
+### API payload
+
+`GET` / `PUT /scheduler/sites/<site_id>/cameras/` and `GET /scheduler/cctv/live-cameras/` gain two keys:
+
+```json
+{
+  "name": "Main door",
+  "rtsp_url": "…",
+  "camera_type": "face",
+  "features": ["face_attendance"],
+  "direction": "toggle",
+  "gate_mode": "parked_toggle",
+  "is_enabled": true,
+  "anpr_geometry": {}
+}
+```
+
+Old clients that don't send the keys → `vehicle` / `[]`, so they keep working.
+
+### Web UI (Organisation → Site → CCTV cameras, `SiteCctvCamerasPanel.jsx`)
 
 ```
-SiteCamera
-  ├─ primary_mode = visitor     → ANPR plate gate → VisitorEntry
-  ├─ primary_mode = attendance  → Face detect + match → CheckInLog / Attendance
-  └─ people_count_enabled=true  → Tripwire Entry/Exit anonymous counts (add-on)
+Name  [__________]      RTSP URL [______________]
+Camera type   (•) Vehicle   ( ) Face
+
+-- Vehicle selected --
+Direction [Both / Entry only / Exit only]
+Gate mode [Whenever plate is seen / Only when crossing line]
+ROI + line editor                                   (all as today)
+
+-- Face selected --
+Features   [x] Face attendance
+           [ ] ID card extract  (coming soon — disabled)
+Direction [Both / Entry only / Exit only]
+Hint: mount at head height, 2–4 m from the door, faces ≥ 80 px wide
 ```
+
+- Camera list shows a small badge: **Vehicle** / **Face**.
+- Live view shows all camera types (unchanged).
 
 ---
 
-## 6. Separate Entry + Exit cameras and dual-sight race
+## 6. Face attendance (Phase A)
 
-### Can each have its own tripwire?
+### Kiosk vs CCTV
 
-**Yes.** Geometry is per `SiteCamera`. Entry camera draws its line; Exit camera draws its own. Independent.
+| Kiosk today | CCTV face attendance |
+|-------------|----------------------|
+| One person stands still | People walk past; one or several faces in a frame |
+| Phone uploads a photo + GPS | RTSP stream from site camera |
+| Geofence check | Site/location comes from the camera (no GPS) |
+| One encode per request | Each person is encoded **once per walk-past**, not every frame |
 
-### Scenario (client doubt)
-
-Vehicle at gate:
-
-- **Entry camera** (outside-focused) captures vehicle **front**
-- **Exit camera** (inside-focused) captures vehicle **back / side** at almost the same time  
-  (or reverse: Exit marks, then Entry immediately sees same vehicle)
-
-### What happens with **current** vehicle gate code
-
-Key file: `visitor/anpr/gate.py`
-
-| Rule | Behavior |
-|------|----------|
-| Shared cooldown | Key = `site_id + plate` (**not** camera). First success sets ~60s cooldown; second event for same plate → `cooldown` skip |
-| Lane filter | `direction=in` → only check-in; `direction=out` → only check-out |
-| Open entry | Exit with no open visit → `no_open_entry`; Entry while already in → `already_in` |
-| Fuzzy plate | Front OCR ≠ rear OCR may still link to an open CCTV entry (not 100%) |
+### Pipeline
 
 ```
-EntryCam ──► Gate: check_in plate X ──► DB open VisitorEntry
-                                    ──► cooldown(site, X) = 60s
-ExitCam  ──► Gate: check_out plate X (same moment)
-         ◄── skip: cooldown  OR  no_open_entry (if Entry not committed yet)
+Face camera (feature face_attendance)
+  → RTSP frames, sampled (~5 fps)
+  → fast face detector on the whole frame (all faces)
+  → track each face across frames (same idea as visitor/anpr/tracker.py)
+  → per track: keep best crop (size, sharpness, frontal)
+  → track done (left view / enough frames)
+       → dlib encoding of the best crop (box already known → no HOG)
+       → identify_user_in_location(camera.site.location, encoding)  (existing FAISS)
+       → no match / weak match → log only, no punch
+       → match → cooldown check (site + user)
+               → shift rule (setting)
+               → direction: camera.direction in / out / toggle
+               → punch via existing kiosk punch helpers
+               → save event + snapshot
 ```
 
-### Remaining failure modes
+Group in one frame = several tracks at once; each track goes through the same steps independently.
 
-| Risk | Why | Mitigation |
-|------|-----|------------|
-| Front OCR ≠ rear OCR | Different plate strings → two “vehicles” | Fuzzy open-entry match; ops: prefer readable plate side; later harden |
-| Exit fires before Entry commits | Exit rejected; then Entry check-in | Usually OK for true entry; Exit line must not fire on approach |
-| Exit cam sees approach lane | False exit attempts | Camera aim + `line_direction` + `direction=out` |
-| Reverse: Exit then Entry | After checkout, Entry within cooldown skipped; after cooldown can check-in again | Correct for re-entry; tune cooldown if false double-sighting |
+### Speed / server load
 
-### Recommended ops config (document in hardening phase)
+| Step | Choice | Why |
+|------|--------|-----|
+| Face detection | **OpenCV YuNet** (`cv2.FaceDetectorYN`, ONNX, ~300 KB model) | Fast on CPU, finds many faces per frame. No new Python package (OpenCV already installed) |
+| Encoding | Existing dlib `face_recognition.face_encodings(img, known_face_locations=…)` | Same 128-d vectors as stored `User.face_encoding` → no re-enrolment |
+| Matching | Existing FAISS `identify_user_in_location` | Same thresholds as kiosk |
 
-1. Prefer `gate_mode=line_direction` on both cams (**not** `parked_toggle`).
-2. Entry: `direction=in` + inbound line only. Exit: `direction=out` + outbound line only.
-3. Aim Entry at outside approach; Exit at inside leave lane — minimize overlap.
-4. Keep **one shared cooldown per site + plate** (never per-camera-only for the same plate).
+Server is 4 vCPU / 8 GB and ANPR already uses ~2 cores. v1 = one face camera per site. Measure CPU / RAM on live with the real camera before adding more.
 
-### Applies later to Attendance / People count
+### Accuracy guards
 
-| Mode | Cooldown / debounce key |
-|------|-------------------------|
-| Visitor | `site + plate` (today) |
-| Attendance | `site + user_id` (planned) |
-| People count | Site/camera + track id or short debounce on line cross (planned) |
+- Minimum face size (default 80 px wide); smaller faces are tracked but not encoded.
+- Use kiosk **strict** tolerance (0.38) + margin check; no relaxed second pass on CCTV.
+- Optional vote: same user matched on 2 crops of the track before punching (setting).
+- Unknown faces never create attendance.
 
-**v1 stance:** Shared cooldown + lane filter is enough. Optional later: explicit “gate pair” linking Entry/Exit cameras.
+### Direction
 
----
+| Camera `direction` | Behaviour |
+|--------------------|-----------|
+| `in` | Only check-in (no punch if already checked in) |
+| `out` | Only check-out (no punch if no open session) |
+| `toggle` | Open session → check-out, else check-in (cooldown prevents flip-flop) |
 
-## 7. Attendance mode (walk-by) — detailed intent
-
-### Not kiosk
-
-| Kiosk today | CCTV Attendance (planned) |
-|-------------|---------------------------|
-| User stands still in front of tablet | User **walks** past fixed camera |
-| Phone uploads one photo + GPS | RTSP frames from site camera |
-| Admin auth on device | Camera agent / reader pipeline |
-| Geofence mandatory | Site bound via camera’s `LocationSite` (no phone GPS) |
-
-### Planned flow
-
-```
-Attendance-mode RTSP camera
-  → detect person / face in ROI (optional tripwire for direction)
-  → crop face → identify_user_in_location (existing FAISS)
-  → if matched registered user:
-       → cooldown check (site + user)
-       → resolve direction (line cross OR camera direction=in/out)
-       → open session? → checkout : checkin
-       → apply punch (reuse kiosk_apply_punch / attendance helpers)
-  → else: ignore or log (no anonymous attendance)
-```
-
-### Direction semantics (same as vehicle)
-
-| Setup | Behavior |
-|-------|----------|
-| Single cam + `line_direction` | Cross side → in or out |
-| Separate cams | Entry cam `direction=in` only check-in; Exit cam `direction=out` only check-out |
-| `toggle` (if allowed) | Open session → out, else in — riskier for walk-by; prefer line or dedicated cams |
+Line-cross direction for faces (like vehicle `line_direction`) → later, only if needed.
 
 ### Cooldown
 
-- Reuse vehicle pattern: default **60 seconds** (configurable).
-- Key: `cctv-attendance:cooldown:{site_id}:{user_id}` (name TBD).
-- Prevents double punch when both Entry and Exit glimpse the same person.
+- Key `cctv-face:cooldown:{site_id}:{user_id}`, default **300 s** (`FACE_CCTV_COOLDOWN_SEC`).
+- Longer than vehicle (60 s) because a person may stand near the door for minutes.
 
-### Open product question (blocking punch rules)
+### Rules reused from kiosk
 
-**Must the user have today’s assigned shift** (same as kiosk `no_shift_today`), or may any registered face at that location punch?
+| Rule | Source |
+|------|--------|
+| Location must have `is_face_attendance_enabled` | `Location` |
+| User must have a face enrolled | `User.face_encoding` / face index |
+| Shift today required | Setting `FACE_CCTV_REQUIRE_SHIFT` (default **true**, same as kiosk; client decides later) |
+| Check-in / check-out rows | `kiosk_attendance_fast.py`, `attendance_resolve.py` |
 
-→ Confirm with client before implementing Phase A punch gate.
+### Event log (new model, for review / debugging)
 
-### Reuse (do not reinvent)
+`CctvFaceEvent`
 
-| Piece | Path |
-|-------|------|
-| Face 1:N | `patrol_backend/utils/face_index.py` → `identify_user_in_location` |
-| Session + punch | `patrol_backend/utils/kiosk_attendance_fast.py` |
-| Attendance row rules | `patrol_backend/utils/attendance_resolve.py` |
-| Tripwire tracking ideas | `visitor/anpr/tracker.py`, `geometry.py` |
+| Field | Notes |
+|-------|-------|
+| `site` | FK LocationSite |
+| `camera` | FK SiteCamera, `SET_NULL` (ids change on camera save) |
+| `camera_name` | Copy of name |
+| `user` | FK User, null when unknown |
+| `distance` | Match distance |
+| `result` | `checkin` / `checkout` / `cooldown` / `no_shift` / `already_in` / `no_open_session` / `unknown` |
+| `snapshot` | Face crop (optional; `FACE_CCTV_SAVE_UNKNOWN` decides for unknown faces) |
+| `created_on` | — |
 
-### Risks / gaps vs kiosk
+Screens for this log → decide later (admin / Django admin is enough for v1 testing).
 
-- Distant / angled / multi-person frames → miss or wrong match
-- Quality retry / second-pass can be slow on CPU (see Indus kiosk timing lessons)
-- Must debounce walk-by (cooldown + direction) or punches flip repeatedly
-- Lighting at gate often worse than kiosk booth
+### Runtime
+
+- New management command `run_face_reader` (separate from `run_anpr_reader`).
+- New systemd service `patrol-face-reader` with the same limits style as ANPR (`OMP_NUM_THREADS=2`, `MemoryHigh` / `MemoryMax`, `CPUWeight=50`).
+- Reads only cameras with `camera_type=face` and `face_attendance` in `features`; refreshes the camera list periodically like the ANPR reader.
+- Detection, tracking, encoding and punching all in this one process (single camera → no Redis image hand-off needed).
+
+### Settings (planned)
+
+| Setting | Default |
+|---------|---------|
+| `FACE_CCTV_FPS` | 5 |
+| `FACE_CCTV_MIN_FACE_PX` | 80 |
+| `FACE_CCTV_TOLERANCE` | 0.38 |
+| `FACE_CCTV_VOTES` | 1 (2 = stricter) |
+| `FACE_CCTV_COOLDOWN_SEC` | 300 |
+| `FACE_CCTV_REQUIRE_SHIFT` | true |
+| `FACE_CCTV_SAVE_UNKNOWN` | false |
+| `FACE_CCTV_MAX_CAMERAS` | 1 |
+
+### Camera placement (ops — matters more than code)
+
+- Head height (≈ 1.8–2.2 m), facing the walking direction, 2–4 m from the door.
+- Faces ≥ 80 px wide in the image (1080p at a door: OK; wide-angle ceiling CCTV: will mostly fail).
+- Avoid strong backlight (glass door with sun behind people).
 
 ---
 
-## 8. People count add-on — detailed intent
+## 7. ID card extract (Phase B — design later)
 
-### What it is
+Not designed yet; the use case must be confirmed first.
 
-- Optional checkbox on camera.
-- On **tripwire cross**: increment **Entry** or **Exit** separately.
-- **Anonymous** — no face identify, no attendance, no visitor record.
+Known constraint: card text is far too small to read from a walk-by CCTV frame. It is only realistic at a **desk / reception camera** where the person holds the card close.
 
-### What it is not
-
-- Not a substitute for Attendance.
-- Not plate / vehicle count (that stays Visitor/ANPR).
-- Not the first place we build dashboard/mobile UI (deferred).
-
-### Planned flow
+Candidate (to discuss):
 
 ```
-Camera with people_count_enabled
-  → person / blob track in ROI
-  → line cross → Entry (+1) or Exit (+1)
-  → persist counter (store TBD: per site / camera / day)
-  → optional internal read API later; UI later
+Reception face camera (feature id_card_extract)
+  → visitor holds ID card to camera
+  → detect card → RapidOCR (reuse visitor AI v2 type=id pipeline)
+  → name + IC number (+ face snapshot from same camera)
+  → create / pre-fill visitor entry for guard to confirm
 ```
 
-### Open product question
-
-Can People count be enabled on **both** Visitor and Attendance cameras, or only one primary mode?
+Until then: checkbox shown as disabled "coming soon" (or hidden) and rejected by the API.
 
 ---
 
-## 9. Delivery phases (one by one)
-
-Do **not** ship Visitor + Attendance + People count together. Suggested order (confirm #2 in §12):
+## 8. Delivery phases
 
 | Phase | Goal | Depends on |
 |-------|------|------------|
-| **0** | Camera settings foundation (`primary_mode`, `people_count_enabled`) + UI + API | — |
-| **A** | Attendance walk-by pipeline + cooldown + punch | Phase 0 + client shift answer |
-| **B** | People count Entry/Exit counters + storage + stub API | Phase 0 |
-| **C** | Hardening: debounce, placement docs, dual-cam ops notes, logging | A and/or B |
+| **0** | Camera type + features: model, API, web UI; ANPR reader skips face cameras | — |
+| **A** | Face attendance walk-by (single camera, single + group faces) | Phase 0 |
+| **B** | ID card extract | Use case decision |
+| **C** | Hardening: placement guide, thresholds from live data, event log screen, more cameras if CPU allows | A |
 
-### Phase 0 — Camera settings foundation
+### Phase 0 — Camera settings ✅ DONE (local, 2026-10-05)
 
-**Goal:** Admin can select mode without changing runtime pipelines yet (Visitor path unchanged).
+- [x] Migration `scheduler/0031_sitecamera_camera_type_features`: `camera_type` (default `vehicle`), `features` (default `[]`)
+- [x] Model: `SiteCamera.CameraType`, `SiteCamera.Feature`, `FEATURES_BY_TYPE`, `UNAVAILABLE_FEATURES`, `has_feature()`
+- [x] Serializer + validation (§5); `PUT` view saves both fields; `_camera_live_payload` returns both
+- [x] ANPR reader `load_cameras`: `filter(is_enabled=True, camera_type="vehicle")`
+- [x] Web `SiteCctvCamerasPanel.jsx`: camera type radio (Vehicle / Face) on each camera card; Face shows feature checkboxes instead of "When to record"; ID card extract shown disabled "coming soon"
+- [x] Web `SiteFormPage.jsx`: blocks save when a Face camera has no feature
+- [x] Web `CctvLiveView.jsx`: "ANPR zone" editor only for vehicle cameras
+- [x] Web `AnprGeometryEditor.jsx`: saving a zone now keeps `camera_type`, `features` **and `gate_mode`** of every camera (it used to reset `gate_mode` to `parked_toggle` for all cameras of the site — pre-existing bug fixed)
+- [x] Tests `scheduler/tests.py` (9, `SimpleTestCase`): default vehicle, face needs feature, vehicle rejects face feature, ID card rejected, unknown type/feature, old client payload, live payload, reader filter
 
-- [ ] Migration: `SiteCamera.primary_mode`, `SiteCamera.people_count_enabled`
-- [ ] Serializers + `PUT /scheduler/sites/<site_id>/cameras/` payload
-- [ ] Web: `SiteCctvCamerasPanel` — primary mode control + People count checkbox
-- [ ] Default: existing cameras → `primary_mode=visitor`, people count off
-- [ ] Reader still only runs ANPR for `visitor` until Phase A
+**Done when:** admin can save a Face camera with Face attendance; existing vehicle cameras keep working; ANPR reader does not open Face cameras.
 
-### Phase A — Attendance walk-by
+**Deploy (live):**
 
-**Goal:** Attendance-mode cameras mark check-in/out for matched registered users.
+```bash
+cd /path/to/patrol_backend && git pull
+../gtms_venv/bin/python manage.py migrate scheduler
+sudo systemctl restart patrol_backend dapne_patrol_backend patrol-anpr-reader
+# web: build + release GTMS_NEw (Node 20)
+```
 
-- [ ] Reader / worker branch for `primary_mode=attendance`
-- [ ] Person/face detect + crop from RTSP
-- [ ] `identify_user_in_location` + site-bound punch (no GPS)
-- [ ] Direction from line or `direction=in|out`
-- [ ] Cooldown `site + user`
-- [ ] Shift rule per client decision
-- [ ] Structured logs (timing) for slow-path debug
-- [ ] Evidence photo optional (decide later)
+Until Phase A ships, a Face camera only gives live view (no attendance yet).
 
-### Phase B — People count
+Note: `makemigrations scheduler --dry-run` also shows an old unrelated diff on `SiteCamera.direction` (choices/help text); intentionally not included.
 
-**Goal:** Anonymous Entry/Exit counts on tripwire.
+### Phase A — Face attendance
 
-- [ ] Enable path when `people_count_enabled=true`
-- [ ] Persist Entry / Exit counts (schema TBD)
-- [ ] Minimal internal GET for counts
-- [ ] UI / reports / mobile — **out of scope until decided**
+- [ ] YuNet model file + loader (`utils/face_cctv/detector.py` or similar)
+- [ ] Face tracker + best-crop selection
+- [ ] Encode + `identify_user_in_location` + guards (§6)
+- [ ] Cooldown, direction, shift setting, punch via kiosk helpers
+- [ ] `CctvFaceEvent` model + migration
+- [ ] `run_face_reader` command + systemd unit with limits
+- [ ] Structured timing logs (`[FACE_CCTV]`)
+- [ ] Tests with mocks (no DB): direction, cooldown, unknown face, shift rule
+- [ ] Live test: one person, then 2–3 people together, then repeat within cooldown
+
+**Done when:**
+- Registered person walking past → one check-in (or check-out).
+- 2–3 registered people together → each gets their own punch.
+- Same person again within cooldown → no extra punch.
+- Unknown face → no attendance, event logged as `unknown`.
+- ANPR timing on the same server is not noticeably worse.
+
+### Phase B — ID card extract
+
+- [ ] Confirm use case (§7)
+- [ ] Then write its own section / plan
 
 ### Phase C — Hardening
 
-- [ ] Dual-camera ops guide (aim, line, cooldown)
-- [ ] Debounce / track ID hygiene
-- [ ] OCR front/rear mismatch notes (Visitor)
-- [ ] Face quality / multi-face policy (Attendance)
-- [ ] Update ops docs alongside `CCTV_ANPR_OPS.md`
+- [ ] Tune thresholds from `CctvFaceEvent` data
+- [ ] Placement guide in ops doc
+- [ ] Event list screen (if wanted)
+- [ ] Raise `FACE_CCTV_MAX_CAMERAS` only after CPU check
 
 ---
 
-## 10. Explicitly out of scope (for now)
+## 9. Out of scope (for now)
 
-- Dashboard / mobile screens for people counts or CCTV attendance event lists
-- Changing behaviour of cameras that remain `primary_mode=visitor` (except shared cooldown docs)
-- Kiosk UI / kiosk API redesign
-- Strong “gate pair” object linking Entry+Exit cameras (optional later)
-- Auto-checkout timeout for visitors who never exit (existing product rule)
+- The other AI features (people count, crowd, PPE, fire/smoke, weapon, missing object, idle, fall, shouting, conveyor count, restricted area, gender/age)
+- Changing vehicle camera behaviour
+- Kiosk UI / API changes
+- Visitor face recognition (only employees are in the face index)
+- GPU / bigger server (revisit after Phase A live measurements)
 
 ---
 
-## 11. Codebase anchors
+## 10. Codebase anchors
 
 | Area | Path |
 |------|------|
 | Camera model | `scheduler/models.py` → `SiteCamera` |
-| Camera API | `scheduler/views_cameras.py` |
+| Camera API | `scheduler/views_cameras.py`, `scheduler/serializers.py` |
 | Camera UI | `GTMS_NEw/src/pages/organisation/components/SiteCctvCamerasPanel.jsx` |
-| ANPR reader | `visitor/anpr/reader.py` |
-| ANPR gate + cooldown | `visitor/anpr/gate.py` |
-| ANPR settings | `ANPR_COOLDOWN_SEC` in `patrol_backend/settings.py` |
-| Face identify | `patrol_backend/utils/face_index.py` |
+| ANPR reader (camera refresh) | `visitor/anpr/reader.py` |
+| Tracker ideas | `visitor/anpr/tracker.py` |
+| Face identify | `patrol_backend/utils/face_index.py` → `identify_user_in_location` |
+| Face encode helpers | `patrol_backend/utils/face_utils.py` |
 | Kiosk punch | `patrol_backend/utils/kiosk_attendance_fast.py` |
-| Kiosk API | `dashboard/views.py` → `face_attendance` |
+| Attendance rows | `patrol_backend/utils/attendance_resolve.py` |
+| ID OCR (Phase B) | Visitor AI v2 `type=id` |
 
 ---
 
-## 12. Open items (must answer before coding Attendance)
+## 11. Open items
 
-1. **Shift rule:** CCTV attendance — require today’s assigned shift like kiosk, or any registered user at location?
-2. **Build order:** Phase A (Attendance) first, then B (People count) — or reverse?
-3. **People count add-on:** Allowed on **both** Visitor and Attendance cameras, or only one?
-4. **Dual-camera race:** Confirm v1 = shared site cooldown + lane filter is enough (no gate-pair object yet)?
-
----
-
-## 13. Acceptance sketch (when a phase is “done”)
-
-### Phase 0 done when
-
-- Admin can save Visitor vs Attendance + People count flag on a site camera.
-- Existing Visitor ANPR sites keep working with default `visitor`.
-
-### Phase A done when
-
-- Walking past an Attendance Entry camera (registered face, cooldown clear) creates check-in.
-- Walking past Exit (or opposite line) creates check-out when session open.
-- Double-sight within cooldown does not double-punch.
-- Unmatched faces do not create attendance.
-
-### Phase B done when
-
-- Tripwire Entry and Exit increments are stored and readable via API stub.
-- Counts remain anonymous (no user/visitor linkage required).
+1. **Shift rule** for CCTV attendance — decide later (default = same as kiosk).
+2. **ID card extract** use case — decide before Phase B.
+3. `id_card_extract` before Phase B: reject in API (recommended) or store and ignore.
+4. Snapshot of unknown faces: save or not (privacy) — default off.
 
 ---
 
-## 14. Summary for stakeholders
+## 12. Summary
 
-| Mode | Detects | Identifies | Writes |
-|------|---------|------------|--------|
-| Visitor (existing) | Vehicle / plate | Plate string | VisitorEntry in/out |
-| Attendance (new) | Face walk-by | Registered user | Attendance check-in/out |
-| People count (add-on) | Person line cross | Nobody | Entry count / Exit count |
-
-**Build order:** settings first → one runtime mode at a time → UI for counts later.  
-**Dual Entry/Exit cams:** each has own tripwire; shared site cooldown + lane rules prevent most double events.
+| Camera type | Feature | Detects | Identifies | Writes | Phase |
+|-------------|---------|---------|------------|--------|-------|
+| Vehicle | (ANPR) | Plate | Plate string | VisitorEntry in/out | exists |
+| Face | Face attendance | Faces (one or group) | Registered employee | Attendance check-in/out + event log | 0 → A |
+| Face | ID card extract | ID card at desk | Name / IC from OCR | Visitor entry (TBD) | B |
