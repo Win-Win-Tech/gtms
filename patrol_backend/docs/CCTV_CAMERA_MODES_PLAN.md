@@ -327,13 +327,15 @@ Note: `makemigrations scheduler --dry-run` also shows an old unrelated diff on `
 
 ### Phase A — Face attendance
 
-- [ ] YuNet model file + loader (`utils/face_cctv/detector.py` or similar)
-- [ ] Face tracker + best-crop selection
+Detailed phase plan, settings and deploy steps: [`CCTV_FACE_ATTENDANCE.md`](CCTV_FACE_ATTENDANCE.md).
+
+- [x] YuNet model file + loader (`dashboard/cctv_face/detector.py`) — A1
+- [x] Face tracker + best-crop selection — A1
 - [ ] Encode + `identify_user_in_location` + guards (§6)
 - [ ] Cooldown, direction, shift setting, punch via kiosk helpers
 - [ ] `CctvFaceEvent` model + migration
-- [ ] `run_face_reader` command + systemd unit with limits
-- [ ] Structured timing logs (`[FACE_CCTV]`)
+- [x] `run_face_reader` command + systemd unit with limits — A1
+- [x] Structured timing logs (`[FACE_CCTV]`) — A1
 - [ ] Tests with mocks (no DB): direction, cooldown, unknown face, shift rule
 - [ ] Live test: one person, then 2–3 people together, then repeat within cooldown
 

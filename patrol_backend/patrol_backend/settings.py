@@ -540,6 +540,28 @@ ANPR_DETECT_MAX_SIDE = int(os.environ.get("ANPR_DETECT_MAX_SIDE", "960"))
 # How often the reader reloads SiteCamera rows (diff-only; default 5 min)
 ANPR_CAMERA_REFRESH_SEC = int(os.environ.get("ANPR_CAMERA_REFRESH_SEC", "300"))
 
+# CCTV face attendance reader (docs/CCTV_FACE_ATTENDANCE.md) — Face cameras only
+FACE_CCTV_ENABLED = os.environ.get("FACE_CCTV_ENABLED", "false").lower() in ("1", "true", "yes")
+FACE_CCTV_MAX_CAMERAS = int(os.environ.get("FACE_CCTV_MAX_CAMERAS", "1"))
+FACE_CCTV_FPS = float(os.environ.get("FACE_CCTV_FPS", "2"))
+# Longest side of the frame given to the face detector (smaller = faster, misses far faces)
+FACE_CCTV_DETECT_MAX_SIDE = int(os.environ.get("FACE_CCTV_DETECT_MAX_SIDE", "640"))
+FACE_CCTV_DETECT_SCORE = float(os.environ.get("FACE_CCTV_DETECT_SCORE", "0.8"))
+# Faces narrower than this (full-frame pixels) are tracked but too small to recognise
+FACE_CCTV_MIN_FACE_PX = int(os.environ.get("FACE_CCTV_MIN_FACE_PX", "60"))
+FACE_CCTV_MIN_TRACK_HITS = int(os.environ.get("FACE_CCTV_MIN_TRACK_HITS", "2"))
+# A face unseen this long has left the view (its pass is finished)
+FACE_CCTV_TRACK_LOST_SEC = float(os.environ.get("FACE_CCTV_TRACK_LOST_SEC", "1.5"))
+FACE_CCTV_MOTION_GATE = os.environ.get("FACE_CCTV_MOTION_GATE", "true").lower() in ("1", "true", "yes")
+FACE_CCTV_IDLE_DETECT_SEC = float(os.environ.get("FACE_CCTV_IDLE_DETECT_SEC", "2"))
+FACE_CCTV_MOTION_HOLD_SEC = float(os.environ.get("FACE_CCTV_MOTION_HOLD_SEC", "2"))
+FACE_CCTV_MOTION_MIN_AREA = float(os.environ.get("FACE_CCTV_MOTION_MIN_AREA", "0.003"))
+FACE_CCTV_CAMERA_REFRESH_SEC = int(os.environ.get("FACE_CCTV_CAMERA_REFRESH_SEC", "300"))
+FACE_CCTV_CV_THREADS = int(os.environ.get("FACE_CCTV_CV_THREADS", "1"))
+# Save each person's best face crop to media/face_cctv_debug/ (camera quality check)
+FACE_CCTV_SAVE_DEBUG_CROPS = os.environ.get("FACE_CCTV_SAVE_DEBUG_CROPS", "false").lower() in ("1", "true", "yes")
+FACE_CCTV_DEBUG_KEEP = int(os.environ.get("FACE_CCTV_DEBUG_KEEP", "200"))
+
 # Route ANPR OCR tasks to dedicated queue (separate worker: -Q anpr -c 1)
 CELERY_TASK_ROUTES = {
     "visitor.anpr.tasks.process_anpr_frame": {"queue": ANPR_QUEUE},

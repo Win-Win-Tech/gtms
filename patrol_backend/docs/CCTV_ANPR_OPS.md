@@ -154,6 +154,10 @@ celery -A patrol_backend worker -Q anpr -c 1 --prefetch-multiplier=1 --loglevel=
 
 This is the part that watches the camera. Celery cannot replace it.
 
+> **Running the face reader too?** Use the combined `patrol-cctv-readers` service instead of
+> this one (vehicle + face in one service) — see [`CCTV_FACE_ATTENDANCE.md`](CCTV_FACE_ATTENDANCE.md) §4.
+> Never run both services at the same time, or vehicle entries are created twice.
+
 ### Example: `/etc/systemd/system/gtms-anpr-reader.service`
 
 Adjust paths/user to match your server:

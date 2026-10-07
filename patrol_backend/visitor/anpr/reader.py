@@ -394,8 +394,12 @@ class _FrameGrabber:
         with self._lock:
             return self._frame, self._seq
 
-    def stop(self) -> None:
+    def stop(self, wait: float = 0.0) -> None:
+        """Ask the thread to stop; ``wait`` > 0 blocks until it has released the capture
+        (needed before interpreter exit, or the native read aborts the process)."""
         self._stop = True
+        if wait > 0 and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=wait)
 
 
 def _use_grab_thread() -> bool:
