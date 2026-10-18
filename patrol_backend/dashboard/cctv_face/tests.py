@@ -168,8 +168,9 @@ class FaceCameraWorkerTests(SimpleTestCase):
     def test_person_counted_once_after_leaving(self):
         w = self._worker([[_box(100, 100)], [_box(110, 100)], [], []])
         frame = _frame()
-        for i, t in enumerate([0.0, 0.5, 1.0, 2.0]):
-            w.process_tick(frame, now_m=t)
+        with mock.patch("dashboard.cctv_face.recogniser.record_face_event"):
+            for i, t in enumerate([0.0, 0.5, 1.0, 2.0]):
+                w.process_tick(frame, now_m=t)
         self.assertEqual(w.stats["people"], 1)
         self.assertEqual(w.stats["good_faces"], 1)
         self.assertEqual(w.stats["max_faces"], 1)
@@ -185,3 +186,42 @@ class FaceCameraWorkerTests(SimpleTestCase):
         self.assertEqual(w.stats["idle_skips"], 2)
         w.process_tick(frame, now_m=2.5)
         self.assertEqual(w.detector.detect.call_count, 2)
+
+
+class RecogniserTests(SimpleTestCase):
+    def test_match_user_strict_tolerance(self):
+        from . import recogniser
+
+        vec = np.zeros(128, dtype=np.float32)
+        entry = mock.MagicMock()
+        entry.vectors32 = np.zeros((1, 128), dtype=np.float32)
+
+        with mock.patch("patrol_backend.utils.face_index.get_or_rebuild_location_index", return_value=entry), \
+             mock.patch("patrol_backend.utils.face_index._match_encoding_tiered", return_value=("ok", "user-uuid", 0.32, "strict")):
+            res, uid, dist = recogniser.match_user_in_location("00000000-0000-0000-0000-000000000001", vec)
+            self.assertEqual(res, "recognised")
+            self.assertEqual(uid, "user-uuid")
+            self.assertAlmostEqual(dist, 0.32, places=2)
+
+    def test_match_user_over_tolerance_gives_unknown(self):
+        from . import recogniser
+
+        vec = np.zeros(128, dtype=np.float32)
+        entry = mock.MagicMock()
+        entry.vectors32 = np.zeros((1, 128), dtype=np.float32)
+
+        with mock.patch("patrol_backend.utils.face_index.get_or_rebuild_location_index", return_value=entry), \
+             mock.patch("patrol_backend.utils.face_index._match_encoding_tiered", return_value=("over_tolerance", "user-uuid", 0.55, "none")):
+            res, uid, dist = recogniser.match_user_in_location("00000000-0000-0000-0000-000000000001", vec)
+            self.assertEqual(res, "unknown")
+            self.assertEqual(uid, "user-uuid")
+            self.assertAlmostEqual(dist, 0.55, places=2)
+
+    def test_match_user_invalid_location_gives_unknown(self):
+        from . import recogniser
+
+        vec = np.zeros(128, dtype=np.float32)
+        res, uid, dist = recogniser.match_user_in_location("not-a-uuid", vec)
+        self.assertEqual(res, "unknown")
+        self.assertIsNone(uid)
+        self.assertIsNone(dist)

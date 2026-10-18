@@ -79,16 +79,21 @@ def _get_site_setting_int(key, location_id=None, default_value=None):
     """
     Read integer values from SiteSetting (stored as strings).
     Returns default_value when missing/invalid.
+    Cached for 5 minutes to avoid repeated WAN database round-trips.
     """
+    cache_key = f"site_setting_int:{key}:{location_id}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         raw = SiteSetting.get_setting(
             key=key,
             location_id=location_id,
             default_value=default_value,
         )
-        if raw is None:
-            return default_value
-        return int(raw)
+        val = int(raw) if raw is not None else default_value
+        cache.set(cache_key, val, timeout=300)
+        return val
     except Exception:
         return default_value
 
@@ -2012,6 +2017,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
         raw_bytes = image_file.read() if image_file else None
 
+        import time as _time
+        _t_req = _time.perf_counter()
+        timing = {}
+
         if getattr(org_location, "is_face_attendance_enabled", False):
             if not is_face_attendance_available():
                 return Response(
@@ -2023,7 +2032,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 )
             if not raw_bytes:
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-            ok, msg, dist_face = verify_user_face(user, raw_bytes)
+            ok, msg, dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
             if not ok:
                 return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2031,6 +2040,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if image_file:
             img_name = getattr(image_file, "name", img_name) or img_name
 
+        _t_db = _time.perf_counter()
         log = CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -2065,13 +2075,32 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             user_tz=user_tz,
             refresh_fn=_attendance_v3_refresh_saved_fields,
             skip_sibling_reconcile=False,
+            timing_dict=timing,
+        )
+        timing["db_save_ms"] = int((_time.perf_counter() - _t_db) * 1000)
+        timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
+
+        logger.info(
+            "[ATTENDANCE_TIMING] action=checkin_v4 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+            getattr(user, "id", "?"),
+            timing.get("engine", "dlib"),
+            timing.get("decode_ms"),
+            timing.get("detect_ms"),
+            timing.get("encode_ms"),
+            timing.get("match_ms"),
+            timing.get("db_save_ms"),
+            timing.get("total_ms"),
         )
 
         data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
         if isinstance(data, dict):
             data["face_attendance"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
             data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
-        return Response(data, status=status.HTTP_201_CREATED)
+        resp = Response(data, status=status.HTTP_201_CREATED)
+        parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+        if parts:
+            resp["Server-Timing"] = ", ".join(parts)
+        return resp
 
     @action(detail=False, methods=["post"], url_path="checkout_v4")
     @parser_classes([MultiPartParser, FormParser])
@@ -2129,6 +2158,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
         raw_bytes = image_file.read() if image_file else None
 
+        import time as _time
+        _t_req = _time.perf_counter()
+        timing = {}
+
         if getattr(org_location, "is_face_attendance_enabled", False):
             if not is_face_attendance_available():
                 return Response(
@@ -2140,7 +2173,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 )
             if not raw_bytes:
                 return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-            ok, msg, dist_face = verify_user_face(user, raw_bytes)
+            ok, msg, dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
             if not ok:
                 return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2148,6 +2181,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if image_file:
             img_name = getattr(image_file, "name", img_name) or img_name
 
+        _t_db = _time.perf_counter()
         log = CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -2178,13 +2212,32 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             user_tz=user_tz,
             refresh_fn=_attendance_v3_refresh_saved_fields,
             skip_sibling_reconcile=False,
+            timing_dict=timing,
+        )
+        timing["db_save_ms"] = int((_time.perf_counter() - _t_db) * 1000)
+        timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
+
+        logger.info(
+            "[ATTENDANCE_TIMING] action=checkout_v4 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+            getattr(user, "id", "?"),
+            timing.get("engine", "dlib"),
+            timing.get("decode_ms"),
+            timing.get("detect_ms"),
+            timing.get("encode_ms"),
+            timing.get("match_ms"),
+            timing.get("db_save_ms"),
+            timing.get("total_ms"),
         )
 
         data = AttendanceCheckinSerializer(attendance, context={'request': request}).data
         if isinstance(data, dict):
             data["face_attendance"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
             data["face_verified"] = bool(getattr(org_location, "is_face_attendance_enabled", False))
-        return Response(data, status=status.HTTP_200_OK)
+        resp = Response(data, status=status.HTTP_200_OK)
+        parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+        if parts:
+            resp["Server-Timing"] = ", ".join(parts)
+        return resp
 
     @action(detail=False, methods=["post"], url_path="face_attendance")
     @parser_classes([MultiPartParser, FormParser])
@@ -2200,6 +2253,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         from patrol_backend.utils.timezone_utils import get_user_timezone
 
         _t_start = _time.perf_counter()
+        timing = {}
 
         actor = request.user
         actor_id = str(getattr(actor, "id", "unknown"))
@@ -2217,14 +2271,20 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             body = {"success": False, "code": code, "message": message}
             if extra:
                 body.update(extra)
+            timing["total_ms"] = _elapsed_ms()
             kiosk_logger.warning(
-                "[KIOSK] error actor=%s code=%s http_status=%s elapsed_ms=%d",
+                "[KIOSK] error actor=%s code=%s http_status=%s elapsed_ms=%d timing=%s",
                 actor_id,
                 code,
                 http_status,
                 _elapsed_ms(),
+                timing,
             )
-            return Response(body, status=http_status)
+            resp = Response(body, status=http_status)
+            parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+            if parts:
+                resp["Server-Timing"] = ", ".join(parts)
+            return resp
 
         actor_role = (getattr(actor, "role", "") or "").strip().lower()
         if not (getattr(actor, "is_superuser", False) or actor_role == "admin"):
@@ -2272,7 +2332,9 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             return _kiosk_error("geofence_required", "latitude and longitude are required")
 
         # Multi-site proximity validation
+        _t_geo = _time.perf_counter()
         matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
+        timing["geofence_ms"] = int((_time.perf_counter() - _t_geo) * 1000)
         if not matched_site:
             return _kiosk_error(
                 "outside_geofence",
@@ -2292,6 +2354,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         matched_user_id, face_code, _face_distance = identify_user_in_location(
             str(org_location.id),
             raw_bytes,
+            timing_dict=timing,
         )
         kiosk_logger.info(
             "[KIOSK] face match actor=%s location=%s elapsed_ms=%d face_ms=%d matched_user=%s code=%s dist=%s",
@@ -2359,9 +2422,11 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         user_tz = get_user_timezone(user)
         kiosk_loc_id = getattr(org_location, "id", None)
+        _t_assign = _time.perf_counter()
         assignment, shift_start_date = self.get_today_assignment_v2(
             user, request=None, location_id=kiosk_loc_id
         )
+        timing["assignment_lookup_ms"] = int((_time.perf_counter() - _t_assign) * 1000)
         if not assignment:
             gate_response = _kiosk_shift_gate_response(
                 user, org_location, greeting_name, user_tz
@@ -2419,6 +2484,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     user_tz=user_tz,
                     refresh_fn=None if defer_refresh else _attendance_v3_refresh_saved_fields,
                 )
+                timing["db_save_ms"] = int((_time.perf_counter() - _t_punch) * 1000)
+                timing["total_ms"] = _elapsed_ms()
             except CheckoutTooEarly as exc:
                 return _kiosk_error(
                     "checkout_too_early",
@@ -2448,6 +2515,19 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 str(user.id),
                 action_mode,
                 int((_time.perf_counter() - _t_punch) * 1000),
+                _elapsed_ms(),
+            )
+            kiosk_logger.info(
+                "[KIOSK_TIMING] actor=%s user=%s action=%s decode_ms=%s detect_ms=%s encode_ms=%s faiss_ms=%s match_ms=%s db_save_ms=%s total_ms=%d",
+                actor_id,
+                str(user.id),
+                action_mode,
+                timing.get("decode_ms"),
+                timing.get("detect_ms"),
+                timing.get("encode_ms"),
+                timing.get("faiss_ms"),
+                timing.get("match_ms"),
+                timing.get("db_save_ms"),
                 _elapsed_ms(),
             )
 
@@ -2521,7 +2601,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 status_code,
                 _elapsed_ms(),
             )
-            return Response(
+            resp = Response(
                 {
                     "success": True,
                     "code": f"{action_mode}_success",
@@ -2532,6 +2612,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 },
                 status=status_code,
             )
+            parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+            if parts:
+                resp["Server-Timing"] = ", ".join(parts)
+            return resp
 
         # Legacy slow path (kept for rollback via FACE_KIOSK_FAST_PATH=False)
         latest_checkin = CheckInLog.objects.filter(
@@ -2610,6 +2694,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     },
                 )
 
+        _t_slow_db = _time.perf_counter()
         log = CheckInLog.objects.create(
             guard=user,
             assignment=assignment,
@@ -2661,6 +2746,22 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         _attendance_v3_refresh_saved_fields(
             attendance, user, assignment, shift, org_location, search_start_utc, search_end_utc
+        )
+        timing["db_save_ms"] = int((_time.perf_counter() - _t_slow_db) * 1000)
+        timing["total_ms"] = _elapsed_ms()
+
+        kiosk_logger.info(
+            "[KIOSK_TIMING] actor=%s user=%s action=%s (slow-path) decode_ms=%s detect_ms=%s encode_ms=%s faiss_ms=%s match_ms=%s db_save_ms=%s total_ms=%d",
+            actor_id,
+            str(user.id),
+            action_mode,
+            timing.get("decode_ms"),
+            timing.get("detect_ms"),
+            timing.get("encode_ms"),
+            timing.get("faiss_ms"),
+            timing.get("match_ms"),
+            timing.get("db_save_ms"),
+            _elapsed_ms(),
         )
 
         payload = AttendanceCheckinSerializer(attendance, context={"request": request}).data
@@ -2744,7 +2845,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             status_code,
             _elapsed_ms(),
         )
-        return Response(
+        resp = Response(
             {
                 "success": True,
                 "code": f"{action_mode}_success",
@@ -2755,6 +2856,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             },
             status=status_code,
         )
+        parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+        if parts:
+            resp["Server-Timing"] = ", ".join(parts)
+        return resp
 
     @action(detail=False, methods=["post"], url_path="force-checkout_v3")
     @parser_classes([MultiPartParser, FormParser])

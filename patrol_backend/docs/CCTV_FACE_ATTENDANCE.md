@@ -1,7 +1,7 @@
 # CCTV Face Attendance (walk-by, kiosk rules)
 
-**Status:** Phase A1 done locally (detection + tracking, **no attendance yet**) · A2 next  
-**Last updated:** 2026-10-07  
+**Status:** Phase A1 & A2 done locally (detection, tracking + FAISS recognition dry run, **no attendance yet**) · A3 next  
+**Last updated:** 2026-10-14  
 **Related docs:**
 - [`CCTV_CAMERA_MODES_PLAN.md`](CCTV_CAMERA_MODES_PLAN.md) — Vehicle / Face camera types (Phase 0)
 - [`CCTV_ANPR_OPS.md`](CCTV_ANPR_OPS.md) — the vehicle reader this one is modelled on
@@ -32,9 +32,9 @@ with the **same rules as the kiosk tablet**.
 
 | Phase | Goal | Writes attendance? | Status |
 |-------|------|--------------------|--------|
-| **A1** | Find every face, follow each person, pick their best photo, log it | No | ✅ Done (local) |
-| **A2** | Recognise who it is (face index), save every pass as an event | No (dry run) | Next |
-| **A3** | Mark attendance with kiosk rules (shift, 5 min, lane) | **Yes** | Later |
+| **A1** | Find every face, follow each person, pick their best photo, log it | No | ✅ Done |
+| **A2** | Recognise who it is (face index), save every pass as an event | No (dry run) | ✅ Done |
+| **A3** | Mark attendance with kiosk rules (shift, 5 min, lane) | **Yes** | Next |
 | **A4** | Hardening: load limits, review screen for events, tuning | Yes | Later |
 
 Each phase can be deployed alone and checked on live before the next.

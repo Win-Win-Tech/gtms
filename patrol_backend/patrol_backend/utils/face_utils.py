@@ -6,6 +6,7 @@ checkin_v4/checkout_v4 return 503 when a location has face attendance enabled.
 """
 import io
 import logging
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -75,11 +76,16 @@ def _apply_exif_orientation(img):
         return img
 
 
-def load_image_rgb_array(image_bytes: bytes, max_dimension: Optional[int] = None) -> Optional[np.ndarray]:
+def load_image_rgb_array(
+    image_bytes: bytes,
+    max_dimension: Optional[int] = None,
+    timing_dict: Optional[dict] = None,
+) -> Optional[np.ndarray]:
     """
     Decode upload to RGB numpy array with EXIF orientation applied.
     Optionally downscale so longest side <= max_dimension (keeps kiosk fast).
     """
+    t_start = time.perf_counter()
     fr = _load_face_recognition()
     if not fr or not image_bytes:
         return None
@@ -87,6 +93,7 @@ def load_image_rgb_array(image_bytes: bytes, max_dimension: Optional[int] = None
         from PIL import Image
 
         with Image.open(io.BytesIO(image_bytes)) as img:
+            orig_w, orig_h = img.size
             img = _apply_exif_orientation(img)
             img = img.convert("RGB")
             w, h = img.size
@@ -95,11 +102,23 @@ def load_image_rgb_array(image_bytes: bytes, max_dimension: Optional[int] = None
                 new_w = max(1, int(w * scale))
                 new_h = max(1, int(h * scale))
                 img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-            return np.asarray(img)
+            arr = np.asarray(img)
+            if timing_dict is not None:
+                timing_dict["decode_ms"] = round(
+                    timing_dict.get("decode_ms", 0.0) + (time.perf_counter() - t_start) * 1000.0, 2
+                )
+                timing_dict["image_orig_size"] = f"{orig_w}x{orig_h}"
+                timing_dict["image_proc_size"] = f"{arr.shape[1]}x{arr.shape[0]}"
+            return arr
     except Exception as exc:
         logger.warning("load_image_rgb_array failed, fallback to face_recognition loader: %s", exc)
         try:
-            return fr.load_image_file(io.BytesIO(image_bytes))
+            arr = fr.load_image_file(io.BytesIO(image_bytes))
+            if timing_dict is not None and arr is not None:
+                timing_dict["decode_ms"] = round(
+                    timing_dict.get("decode_ms", 0.0) + (time.perf_counter() - t_start) * 1000.0, 2
+                )
+            return arr
         except Exception:
             return None
 
@@ -109,14 +128,24 @@ def _encoding_from_image(
     *,
     upsample: int,
     num_jitters: int,
+    timing_dict: Optional[dict] = None,
 ) -> Optional[np.ndarray]:
     fr = _load_face_recognition()
     if fr is None or image is None:
         return None
+    t0 = time.perf_counter()
     locations = fr.face_locations(image, number_of_times_to_upsample=max(0, int(upsample)))
+    t_det = (time.perf_counter() - t0) * 1000.0
+    if timing_dict is not None:
+        timing_dict["detect_ms"] = round(timing_dict.get("detect_ms", 0.0) + t_det, 2)
+        timing_dict["face_count"] = len(locations)
     if not locations:
         return None
+    t1 = time.perf_counter()
     encodings = fr.face_encodings(image, locations, num_jitters=max(0, int(num_jitters)))
+    t_enc = (time.perf_counter() - t1) * 1000.0
+    if timing_dict is not None:
+        timing_dict["encode_ms"] = round(timing_dict.get("encode_ms", 0.0) + t_enc, 2)
     if not encodings:
         return None
     return encodings[0]
@@ -160,7 +189,12 @@ def _kiosk_detect_attempts() -> List[Tuple[Optional[int], int, int]]:
     return unique
 
 
-def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.ndarray]:
+def get_face_encoding(
+    image_bytes: bytes,
+    *,
+    fast: bool = False,
+    timing_dict: Optional[dict] = None,
+) -> Optional[np.ndarray]:
     """Return 128-d encoding or None if no face / error."""
     fr = _load_face_recognition()
     if not fr or not image_bytes:
@@ -168,19 +202,19 @@ def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.
     try:
         if fast:
             for max_dim, upsample, num_jitters in _kiosk_detect_attempts():
-                image = load_image_rgb_array(image_bytes, max_dimension=max_dim)
+                image = load_image_rgb_array(image_bytes, max_dimension=max_dim, timing_dict=timing_dict)
                 if image is None:
                     continue
-                enc = _encoding_from_image(image, upsample=upsample, num_jitters=num_jitters)
+                enc = _encoding_from_image(image, upsample=upsample, num_jitters=num_jitters, timing_dict=timing_dict)
                 if enc is not None:
                     return enc
             logger.info("No face found in kiosk image after all detect attempts.")
             return None
 
-        image = load_image_rgb_array(image_bytes, max_dimension=None)
+        image = load_image_rgb_array(image_bytes, max_dimension=None, timing_dict=timing_dict)
         if image is None:
             return None
-        enc = _encoding_from_image(image, upsample=1, num_jitters=2)
+        enc = _encoding_from_image(image, upsample=1, num_jitters=2, timing_dict=timing_dict)
         if enc is None:
             logger.info("No face found in image.")
         return enc
@@ -189,8 +223,8 @@ def get_face_encoding(image_bytes: bytes, *, fast: bool = False) -> Optional[np.
         return None
 
 
-def get_face_encoding_kiosk(image_bytes: bytes) -> Optional[np.ndarray]:
-    return get_face_encoding(image_bytes, fast=True)
+def get_face_encoding_kiosk(image_bytes: bytes, timing_dict: Optional[dict] = None) -> Optional[np.ndarray]:
+    return get_face_encoding(image_bytes, fast=True, timing_dict=timing_dict)
 
 
 @dataclass
@@ -209,7 +243,12 @@ def _identify_quality_attempt() -> Tuple[Optional[int], int, int]:
     return max_w, upsample, num_jitters
 
 
-def extract_identify_frame(image_bytes: bytes, *, use_quality: bool = False) -> IdentifyFrameResult:
+def extract_identify_frame(
+    image_bytes: bytes,
+    *,
+    use_quality: bool = False,
+    timing_dict: Optional[dict] = None,
+) -> IdentifyFrameResult:
     """
     Single decode + detect pass. Fast tier (~640px) for speed; quality tier for borderline cases.
     """
@@ -226,13 +265,22 @@ def extract_identify_frame(image_bytes: bytes, *, use_quality: bool = False) -> 
         attempts = [kiosk_attempts[0]] if kiosk_attempts else [(640, 0, 0)]
 
     for max_dim, upsample, num_jitters in attempts:
-        image = load_image_rgb_array(image_bytes, max_dimension=max_dim)
+        image = load_image_rgb_array(image_bytes, max_dimension=max_dim, timing_dict=timing_dict)
         if image is None:
             continue
+        t0 = time.perf_counter()
         locations = fr.face_locations(image, number_of_times_to_upsample=max(0, int(upsample)))
+        t_det = (time.perf_counter() - t0) * 1000.0
+        if timing_dict is not None:
+            timing_dict["detect_ms"] = round(timing_dict.get("detect_ms", 0.0) + t_det, 2)
+            timing_dict["face_count"] = len(locations)
         if not locations:
             continue
+        t1 = time.perf_counter()
         encodings = fr.face_encodings(image, locations, num_jitters=max(0, int(num_jitters)))
+        t_enc = (time.perf_counter() - t1) * 1000.0
+        if timing_dict is not None:
+            timing_dict["encode_ms"] = round(timing_dict.get("encode_ms", 0.0) + t_enc, 2)
         if not encodings:
             continue
         return IdentifyFrameResult(encodings[0], len(locations), tier)
@@ -258,6 +306,7 @@ def compare_encodings(
     enrolled: np.ndarray,
     live: np.ndarray,
     tolerance: float = DEFAULT_FACE_TOLERANCE,
+    timing_dict: Optional[dict] = None,
 ) -> Tuple[bool, float]:
     """
     Returns (match_ok, distance). Lower distance is better.
@@ -267,7 +316,12 @@ def compare_encodings(
     if not fr:
         return False, float("inf")
     try:
+        t0 = time.perf_counter()
         dist = fr.face_distance([enrolled], live)[0]
+        if timing_dict is not None:
+            timing_dict["match_ms"] = round(
+                timing_dict.get("match_ms", 0.0) + (time.perf_counter() - t0) * 1000.0, 2
+            )
         # compare_faces uses tolerance as max distance for a match
         ok = bool(dist <= tolerance)
         return ok, float(dist)
@@ -280,13 +334,43 @@ def verify_user_face(
     user,
     live_image_bytes: bytes,
     tolerance: float = DEFAULT_FACE_TOLERANCE,
+    timing_dict: Optional[dict] = None,
+    fast: bool = True,
 ) -> Tuple[bool, str, Optional[float]]:
     """
     1:1 verify live image against user's stored encoding.
     Returns (ok, error_message, distance_or_none).
     """
+    t_v0 = time.perf_counter()
     if not is_face_attendance_available():
         return False, "Face recognition is not installed on the server", None
+
+    from django.conf import settings
+
+    backend = getattr(settings, "FACE_RECOGNITION_BACKEND", "dlib")
+    if backend == "insightface":
+        try:
+            from patrol_backend.utils.face_insight import (
+                compare_insight_embeddings,
+                extract_insightface_embedding,
+                get_user_enrolled_insight_embedding,
+                is_insightface_available,
+            )
+            if is_insightface_available():
+                live_emb, face_count = extract_insightface_embedding(live_image_bytes, timing_dict=timing_dict)
+                if live_emb is not None:
+                    ref_emb = get_user_enrolled_insight_embedding(user)
+                    if ref_emb is not None:
+                        thresh = float(getattr(settings, "FACE_INSIGHT_SIMILARITY_THRESHOLD", 0.40))
+                        ok, sim = compare_insight_embeddings(ref_emb, live_emb, threshold=thresh, timing_dict=timing_dict)
+                        if timing_dict is not None:
+                            timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
+                            timing_dict["engine"] = "insightface"
+                        if not ok:
+                            return False, "Face does not match enrolled user", sim
+                        return True, "", sim
+        except Exception as exc:
+            logger.warning("InsightFace verification failed, falling back to dlib: %s", exc)
 
     ref = None
     if user.face_encoding:
@@ -295,7 +379,7 @@ def verify_user_face(
         try:
             user.face_photo.open("rb")
             try:
-                ref = get_face_encoding(user.face_photo.read())
+                ref = get_face_encoding(user.face_photo.read(), fast=fast)
             finally:
                 user.face_photo.close()
         except Exception as e:
@@ -304,11 +388,21 @@ def verify_user_face(
     if ref is None:
         return False, "User has no enrolled face (upload face_photo in admin or app)", None
 
-    live = get_face_encoding(live_image_bytes)
+    live = get_face_encoding(live_image_bytes, fast=fast, timing_dict=timing_dict)
+    if live is None and fast:
+        # Fallback to full-res scan if fast tier missed the face (e.g. far/tilted)
+        live = get_face_encoding(live_image_bytes, fast=False, timing_dict=timing_dict)
+
     if live is None:
+        if timing_dict is not None:
+            timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
+            timing_dict["engine"] = "dlib"
         return False, "No face detected in uploaded image", None
 
-    ok, dist = compare_encodings(ref, live, tolerance=tolerance)
+    ok, dist = compare_encodings(ref, live, tolerance=tolerance, timing_dict=timing_dict)
+    if timing_dict is not None:
+        timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
+        timing_dict["engine"] = "dlib"
     if not ok:
         return False, "Face does not match enrolled user", dist
     return True, "", dist

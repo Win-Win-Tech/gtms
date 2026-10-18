@@ -144,6 +144,8 @@ class FaceCameraWorker:
             "people": 0,
             "good_faces": 0,
             "small_faces": 0,
+            "recognised": 0,
+            "unknown": 0,
         }
 
     # ---- RTSP -------------------------------------------------------------
@@ -271,6 +273,18 @@ class FaceCameraWorker:
         if good and face_settings.save_debug_crops():
             self._save_debug_crop(tr)
 
+        # Phase A2: Recognition (FAISS match + CctvFaceEvent log)
+        try:
+            from .recogniser import process_finished_track
+
+            verdict, _uid, _dist = process_finished_track(self.camera, tr)
+            if verdict == "recognised":
+                self.stats["recognised"] += 1
+            elif verdict == "unknown":
+                self.stats["unknown"] += 1
+        except Exception:
+            logger.exception("[FACE_CCTV] recognition failed camera=%s track=%s", self.camera.id, tr.track_id)
+
     def _save_debug_crop(self, tr: FaceTrack) -> None:
         path = _debug_dir()
         name = f"{str(self.camera.id)[:8]}_{time.strftime('%Y%m%d-%H%M%S')}_{tr.track_id}.jpg"
@@ -285,7 +299,8 @@ class FaceCameraWorker:
         s = self.stats
         logger.info(
             "[FACE_CCTV] status camera=%s name=%s ticks=%d detects=%d idle_skips=%d "
-            "detect_ms=%d max_faces=%d people=%d recognisable=%d too_small=%d tracks_now=%d",
+            "detect_ms=%d max_faces=%d people=%d recognisable=%d too_small=%d "
+            "recognised=%d unknown=%d tracks_now=%d",
             self.camera.id,
             self.camera.name,
             s["ticks"],
@@ -296,6 +311,8 @@ class FaceCameraWorker:
             s["people"],
             s["good_faces"],
             s["small_faces"],
+            s.get("recognised", 0),
+            s.get("unknown", 0),
             len(self.tracker.tracks),
         )
         self._last_status_log = now_m
@@ -343,7 +360,8 @@ def run_face_reader_loop(*, once: bool = False) -> None:
             logger.info("[FACE_CCTV] no enabled Face cameras with face attendance")
 
     refresh_workers()
-    last_refresh = last_keepalive = time.monotonic()
+    refresh_index_every = float(face_settings.index_refresh_sec())
+    last_refresh = last_keepalive = last_index_refresh = time.monotonic()
     logger.info(
         "[FACE_CCTV] started fps=%s detect_max_side=%s min_face_px=%s cameras=%d",
         face_settings.fps(),
@@ -363,6 +381,14 @@ def run_face_reader_loop(*, once: bool = False) -> None:
             if loop_start - last_refresh >= refresh_every:
                 refresh_workers()
                 last_refresh = loop_start
+            if loop_start - last_index_refresh >= refresh_index_every:
+                try:
+                    from patrol_backend.utils.face_index import rebuild_all_indexes
+
+                    rebuild_all_indexes()
+                except Exception:
+                    logger.exception("[FACE_CCTV] face index refresh failed")
+                last_index_refresh = loop_start
 
             for key, w in workers.items():
                 frame = w.read_latest()

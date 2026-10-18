@@ -238,6 +238,81 @@ class SiteCamera(models.Model):
         return feature in (self.features or [])
 
 
+class CctvFaceEvent(models.Model):
+    """
+    Log of CCTV face recognition events (passes detected by CCTV face reader).
+    Phase A2: recognition dry run (result=recognised / unknown / too_small).
+    Phase A3: attendance punches (result=checkin / checkout / cooldown / no_shift).
+    """
+
+    class Result(models.TextChoices):
+        RECOGNISED = "recognised", "Recognised"
+        UNKNOWN = "unknown", "Unknown"
+        TOO_SMALL = "too_small", "Face too small"
+        NO_SHIFT = "no_shift", "No active shift today"
+        COOLDOWN = "cooldown", "Within cooldown period"
+        CHECKIN = "checkin", "Check-in marked"
+        CHECKOUT = "checkout", "Check-out marked"
+        ALREADY_IN = "already_in", "Already checked in"
+        NO_OPEN_SESSION = "no_open_session", "No open session to checkout"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    site = models.ForeignKey(
+        LocationSite,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cctv_face_events",
+    )
+    camera = models.ForeignKey(
+        SiteCamera,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="face_events",
+    )
+    camera_name = models.CharField(max_length=255, blank=True, default="")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cctv_face_events",
+    )
+    distance = models.FloatField(
+        null=True,
+        blank=True,
+        help_text="FAISS Euclidean match distance (lower is closer, <= 0.38 is strict match)",
+    )
+    result = models.CharField(
+        max_length=50,
+        choices=Result.choices,
+        default=Result.UNKNOWN,
+    )
+    snapshot = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Relative path to debug / snapshot crop",
+    )
+    track_id = models.CharField(max_length=64, blank=True, default="")
+    face_px = models.IntegerField(null=True, blank=True)
+    detect_score = models.FloatField(null=True, blank=True)
+    created_on = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_on"]
+        indexes = [
+            models.Index(fields=["site", "-created_on"]),
+            models.Index(fields=["user", "-created_on"]),
+            models.Index(fields=["camera", "-created_on"]),
+        ]
+
+    def __str__(self):
+        user_str = str(self.user) if self.user else "Unknown"
+        return f"{self.created_on} | {self.camera_name} | {self.result} | {user_str} ({self.distance})"
+
+
 #class Shift(models.Model):
 #    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 #    location = models.ForeignKey(Location, on_delete=models.CASCADE)

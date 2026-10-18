@@ -1,5 +1,9 @@
 # Face Attendance Installation Guide (Live Server)
 
+> [!TIP]
+> **New / Recommended (Ultra-Fast 30-100ms Backend)**: For sub-second face verification using InsightFace + ONNX Runtime, please refer to [docs/INSIGHTFACE_INSTALLATION.md](file:///d:/CloudGen/GTMS/gtms/patrol_backend/docs/INSIGHTFACE_INSTALLATION.md).
+> The instructions below document the baseline `dlib` / `face-recognition` setup and compatibility pins.
+
 This guide is for GTMS `checkin_v4` / `checkout_v4` face attendance.
 
 It includes the production issue you hit on Python 3.12:

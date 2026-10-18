@@ -331,9 +331,9 @@ Detailed phase plan, settings and deploy steps: [`CCTV_FACE_ATTENDANCE.md`](CCTV
 
 - [x] YuNet model file + loader (`dashboard/cctv_face/detector.py`) — A1
 - [x] Face tracker + best-crop selection — A1
-- [ ] Encode + `identify_user_in_location` + guards (§6)
-- [ ] Cooldown, direction, shift setting, punch via kiosk helpers
-- [ ] `CctvFaceEvent` model + migration
+- [x] Encode + `identify_user_in_location` + guards (§6) — A2
+- [ ] Cooldown, direction, shift setting, punch via kiosk helpers — A3
+- [x] `CctvFaceEvent` model + migration — A2
 - [x] `run_face_reader` command + systemd unit with limits — A1
 - [x] Structured timing logs (`[FACE_CCTV]`) — A1
 - [ ] Tests with mocks (no DB): direction, cooldown, unknown face, shift rule

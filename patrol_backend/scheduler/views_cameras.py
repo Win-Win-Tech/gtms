@@ -216,3 +216,68 @@ class CctvMediaMtxSyncView(APIView):
             )
 
         return Response({"synced": synced, "failed": failed, "results": details})
+
+
+class CctvFaceEventListView(APIView):
+    """
+    GET /scheduler/cctv/face-events/
+    Query CCTV face events (passes detected and recognised by the face reader).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.conf import settings
+        from .models import CctvFaceEvent
+
+        user = request.user
+        qs = CctvFaceEvent.objects.all().select_related("user", "site", "camera")
+        if not user.is_superuser:
+            if not user.location_id:
+                return Response([])
+            qs = qs.filter(site__location_id=user.location_id)
+
+        site_id = request.query_params.get("site_id")
+        if site_id:
+            qs = qs.filter(site_id=site_id)
+
+        camera_id = request.query_params.get("camera_id")
+        if camera_id:
+            qs = qs.filter(camera_id=camera_id)
+
+        result_filter = request.query_params.get("result")
+        if result_filter:
+            qs = qs.filter(result=result_filter)
+
+        try:
+            limit = min(200, max(1, int(request.query_params.get("limit", 50))))
+        except (ValueError, TypeError):
+            limit = 50
+
+        events = qs[:limit]
+        media_url = getattr(settings, "MEDIA_URL", "/media/")
+        data = []
+        for e in events:
+            snap_url = f"{media_url.rstrip('/')}/{e.snapshot.lstrip('/')}" if e.snapshot else ""
+            user_name = ""
+            if e.user:
+                user_name = f"{getattr(e.user, 'first_name', '')} {getattr(e.user, 'last_name', '')}".strip() or getattr(e.user, "username", "")
+            data.append(
+                {
+                    "id": str(e.id),
+                    "created_on": e.created_on.isoformat() if e.created_on else None,
+                    "site_id": str(e.site_id) if e.site_id else None,
+                    "site_name": e.site.name if e.site else "",
+                    "camera_id": str(e.camera_id) if e.camera_id else None,
+                    "camera_name": e.camera_name,
+                    "user_id": str(e.user_id) if e.user_id else None,
+                    "user_name": user_name,
+                    "result": e.result,
+                    "distance": e.distance,
+                    "face_px": e.face_px,
+                    "detect_score": e.detect_score,
+                    "track_id": e.track_id,
+                    "snapshot_url": snap_url,
+                }
+            )
+        return Response(data)

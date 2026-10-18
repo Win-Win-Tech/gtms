@@ -67,3 +67,19 @@ def save_debug_crops() -> bool:
 
 def debug_keep() -> int:
     return max(10, int(getattr(settings, "FACE_CCTV_DEBUG_KEEP", 200)))
+
+
+def strict_tolerance() -> float:
+    return min(1.0, max(0.1, float(getattr(settings, "FACE_CCTV_STRICT_TOLERANCE", 0.38))))
+
+
+def relaxed_tolerance() -> float:
+    return min(1.0, max(0.1, float(getattr(settings, "FACE_CCTV_RELAXED_TOLERANCE", 0.45))))
+
+
+def save_unknown_crops() -> bool:
+    return bool(getattr(settings, "FACE_CCTV_SAVE_UNKNOWN_CROPS", False))
+
+
+def index_refresh_sec() -> int:
+    return max(30, int(getattr(settings, "FACE_CCTV_INDEX_REFRESH_SEC", 300)))

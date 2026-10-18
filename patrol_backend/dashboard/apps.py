@@ -24,5 +24,12 @@ class DashboardConfig(AppConfig):
                 rebuild_all_indexes()
             except Exception as exc:
                 logger.warning("Face index warmup skipped during startup: %s", exc)
+            try:
+                from patrol_backend.utils.face_insight import get_face_analysis_app, is_insightface_available
+
+                if is_insightface_available():
+                    get_face_analysis_app()
+            except Exception as exc:
+                logger.warning("InsightFace warmup skipped during startup: %s", exc)
 
         threading.Thread(target=_warmup, daemon=True).start()

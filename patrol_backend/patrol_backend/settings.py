@@ -274,6 +274,13 @@ FACE_IDENTIFY_SECOND_PASS_RELAXED_ONLY = True
 FACE_IDENTIFY_SECOND_PASS_USE_QUALITY = True
 FACE_IDENTIFY_SECOND_PASS_TOLERANCE = 0.42
 
+# Face Recognition Backend Engine: 'dlib' (default, 128-d) or 'insightface' (ONNX, 512-d)
+# FACE_RECOGNITION_BACKEND = "dlib"
+FACE_RECOGNITION_BACKEND = "insightface"
+FACE_INSIGHT_MODEL_NAME = "buffalo_s"
+FACE_INSIGHT_SIMILARITY_THRESHOLD = 0.40
+FACE_INSIGHT_IDENTIFY_MIN_MARGIN = 0.05
+
 # Kiosk face_attendance performance
 FACE_KIOSK_FAST_PATH = True
 FACE_KIOSK_MAX_IMAGE_WIDTH = 640
@@ -282,7 +289,7 @@ FACE_KIOSK_UPSAMPLE = 0
 FACE_KIOSK_LIGHT_RESPONSE = True
 FACE_KIOSK_DEFER_METRICS_REFRESH = True
 # Skip per-punch sibling row reconcile on kiosk (heavy); full metrics refresh runs in background.
-FACE_KIOSK_SKIP_SIBLING_RECONCILE = True
+FACE_KIOSK_SKIP_SIBLING_RECONCILE = False
 # Ignore duplicate kiosk scans for the same guard within N seconds (one row / one log).
 FACE_KIOSK_DUPLICATE_PUNCH_SECONDS = 15
 # Minimum minutes from check-in before checkout is allowed (kiosk + mobile).
@@ -510,7 +517,7 @@ MEDIAMTX_HLS_BASE_URL = os.environ.get("MEDIAMTX_HLS_BASE_URL", "http://127.0.0.
 MEDIAMTX_WEBRTC_BASE_URL = os.environ.get("MEDIAMTX_WEBRTC_BASE_URL", "http://127.0.0.1:8889")
 
 # CCTV ANPR (Phases 3–5) — Reader + Celery queue `anpr` (Redis broker, not RabbitMQ)
-ANPR_ENABLED = os.environ.get("ANPR_ENABLED", "false").lower() in ("1", "true", "yes")
+ANPR_ENABLED = os.environ.get("ANPR_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 ANPR_MAX_CAMERAS = int(os.environ.get("ANPR_MAX_CAMERAS", "2"))
 ANPR_DETECT_FPS = float(os.environ.get("ANPR_DETECT_FPS", "3"))
 ANPR_COOLDOWN_SEC = int(os.environ.get("ANPR_COOLDOWN_SEC", "60"))
@@ -531,7 +538,7 @@ ANPR_LOST_FLUSH_SEC = float(os.environ.get("ANPR_LOST_FLUSH_SEC", "1"))
 # A new track at a read parked vehicle's spot with its plate is not re-toggled
 ANPR_PARKED_MEMORY_SEC = float(os.environ.get("ANPR_PARKED_MEMORY_SEC", "120"))
 # Idle gate: detect at full rate only while the zone changes (else every IDLE sec)
-ANPR_MOTION_GATE = os.environ.get("ANPR_MOTION_GATE", "true").lower() in ("1", "true", "yes")
+ANPR_MOTION_GATE = os.environ.get("ANPR_MOTION_GATE", "true").strip().lower() in ("1", "true", "yes")
 ANPR_IDLE_DETECT_SEC = float(os.environ.get("ANPR_IDLE_DETECT_SEC", "1"))
 ANPR_MOTION_HOLD_SEC = float(os.environ.get("ANPR_MOTION_HOLD_SEC", "3"))
 ANPR_MOTION_MIN_AREA = float(os.environ.get("ANPR_MOTION_MIN_AREA", "0.003"))
@@ -541,7 +548,7 @@ ANPR_DETECT_MAX_SIDE = int(os.environ.get("ANPR_DETECT_MAX_SIDE", "960"))
 ANPR_CAMERA_REFRESH_SEC = int(os.environ.get("ANPR_CAMERA_REFRESH_SEC", "300"))
 
 # CCTV face attendance reader (docs/CCTV_FACE_ATTENDANCE.md) — Face cameras only
-FACE_CCTV_ENABLED = os.environ.get("FACE_CCTV_ENABLED", "false").lower() in ("1", "true", "yes")
+FACE_CCTV_ENABLED = os.environ.get("FACE_CCTV_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 FACE_CCTV_MAX_CAMERAS = int(os.environ.get("FACE_CCTV_MAX_CAMERAS", "1"))
 FACE_CCTV_FPS = float(os.environ.get("FACE_CCTV_FPS", "2"))
 # Longest side of the frame given to the face detector (smaller = faster, misses far faces)
@@ -561,6 +568,11 @@ FACE_CCTV_CV_THREADS = int(os.environ.get("FACE_CCTV_CV_THREADS", "1"))
 # Save each person's best face crop to media/face_cctv_debug/ (camera quality check)
 FACE_CCTV_SAVE_DEBUG_CROPS = os.environ.get("FACE_CCTV_SAVE_DEBUG_CROPS", "false").lower() in ("1", "true", "yes")
 FACE_CCTV_DEBUG_KEEP = int(os.environ.get("FACE_CCTV_DEBUG_KEEP", "200"))
+# Phase A2: Recognition & FAISS match thresholds
+FACE_CCTV_STRICT_TOLERANCE = float(os.environ.get("FACE_CCTV_STRICT_TOLERANCE", "0.38"))
+FACE_CCTV_RELAXED_TOLERANCE = float(os.environ.get("FACE_CCTV_RELAXED_TOLERANCE", "0.45"))
+FACE_CCTV_SAVE_UNKNOWN_CROPS = os.environ.get("FACE_CCTV_SAVE_UNKNOWN_CROPS", "false").lower() in ("1", "true", "yes")
+FACE_CCTV_INDEX_REFRESH_SEC = int(os.environ.get("FACE_CCTV_INDEX_REFRESH_SEC", "300"))
 
 # Route ANPR OCR tasks to dedicated queue (separate worker: -Q anpr -c 1)
 CELERY_TASK_ROUTES = {

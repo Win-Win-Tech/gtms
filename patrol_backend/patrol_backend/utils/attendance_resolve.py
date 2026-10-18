@@ -319,15 +319,37 @@ def apply_v4_attendance_after_log(
     user_tz,
     refresh_fn: Optional[Callable] = None,
     skip_sibling_reconcile: bool = False,
+    timing_dict: Optional[dict] = None,
 ) -> None:
     """
     Update attendance row after CheckInLog was created — shared v4 field rules.
     action_mode: 'checkin' or 'checkout'
     """
+    import time as _time
+
+    _t_start = _time.perf_counter()
+
+    def _step(lbl: str, t_ref: float) -> float:
+        ms = int((_time.perf_counter() - t_ref) * 1000)
+        tot = int((_time.perf_counter() - _t_start) * 1000)
+        if timing_dict is not None:
+            timing_dict[f"resolve_{lbl}_ms"] = ms
+        logger.info(
+            "[ATTENDANCE_RESOLVE] step=%s ms=%d total_ms=%d user=%s action=%s",
+            lbl,
+            ms,
+            tot,
+            getattr(user, "id", "?"),
+            action_mode,
+        )
+        return _time.perf_counter()
+
+    _t = _time.perf_counter()
     attendance.shift_date = shift_start_date
     attendance.site = matched_site
     sync_attendance_times_from_logs(attendance, log_filter)
     ensure_punch_sites(attendance, matched_site, log_filter)
+    _t = _step("sync_times", _t)
 
     if action_mode == "checkin" and raw_bytes is not None:
         attendance.checkin_image.save(img_name, ContentFile(raw_bytes), save=False)
@@ -339,6 +361,7 @@ def apply_v4_attendance_after_log(
         attendance.checkout_image = None
 
     attendance.save()
+    _t = _step("save_attendance_row", _t)
 
     if refresh_fn:
         refresh_attendance_metrics(
@@ -352,6 +375,8 @@ def apply_v4_attendance_after_log(
             refresh_fn,
         )
         attendance.refresh_from_db()
+        _t = _step("refresh_metrics", _t)
+
         if not skip_sibling_reconcile:
             reconcile_sibling_attendance_rows(
                 user,
@@ -362,8 +387,12 @@ def apply_v4_attendance_after_log(
                 user_tz,
                 refresh_fn,
             )
+            _t = _step("reconcile_siblings", _t)
 
     if action_mode == "checkout":
         from livetracking.checkout_hooks import on_attendance_checkout
 
         on_attendance_checkout(user, attendance=attendance)
+        _t = _step("checkout_hooks", _t)
+
+    _step("done", _t_start)

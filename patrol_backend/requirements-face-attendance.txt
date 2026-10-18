@@ -1,6 +1,23 @@
 # Face attendance optional dependencies.
-# Follow exact server steps in docs/FACE_ATTENDANCE_INSTALL.md
-# Important compatibility pin for face_recognition_models pkg_resources import:
+# Documentation: docs/FACE_ATTENDANCE_INSTALL.md & docs/INSIGHTFACE_INSTALLATION.md
+
+# --- Common / compatibility ---
 setuptools<81
+numpy>=1.24.0,<2.0.0
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# --- Fast InsightFace + ONNX Runtime backend (Recommended: 30-50ms CPU inference) ---
+insightface>=0.7.3
+onnx>=1.16.0
+onnxruntime>=1.18.0
+faiss-cpu>=1.7.0
+scikit-image>=0.21.0
+scipy>=1.11.0
+tqdm>=4.66.0
+
+
+# --- Legacy dlib backend (Backward Compatibility / Fallback) ---
+# Note: On Windows or newer Python versions, dlib requires C++ build tools or pre-built wheel.
 face-recognition==1.3.0
 face-recognition-models==0.3.0

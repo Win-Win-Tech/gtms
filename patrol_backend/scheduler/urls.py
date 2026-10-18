@@ -12,7 +12,12 @@ from .views import (
     AppVersionCheckView,
 )
 from .views_v5 import AssignmentViewSetV5
-from .views_cameras import CctvLiveCamerasView, CctvMediaMtxSyncView, SiteCameraListReplaceView
+from .views_cameras import (
+    CctvFaceEventListView,
+    CctvLiveCamerasView,
+    CctvMediaMtxSyncView,
+    SiteCameraListReplaceView,
+)
 
 router = DefaultRouter()
 router.register('locations', LocationViewSet)
@@ -43,6 +48,11 @@ urlpatterns = router.urls + [
         'cctv/sync-mediamtx/',
         CctvMediaMtxSyncView.as_view(),
         name='cctv-sync-mediamtx',
+    ),
+    path(
+        'cctv/face-events/',
+        CctvFaceEventListView.as_view(),
+        name='cctv-face-events',
     ),
     path('v5/', include(v5_router.urls)),
 ]

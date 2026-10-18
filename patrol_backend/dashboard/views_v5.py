@@ -1,4 +1,5 @@
-"""v5 dashboard APIs — site-wise scope. Live dashboard URLs unchanged."""
+import logging
+import time as _time
 
 from django.http import HttpResponse
 from django.utils import timezone
@@ -8,6 +9,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+logger = logging.getLogger(__name__)
 
 from authapp.site_access import assert_caller_can_access_site, caller_can_access_site, get_site_or_error
 from patrol_backend.utils.timezone_utils import get_user_today, get_user_timezone_from_request
@@ -654,7 +657,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             raise ValidationError({"error": "latitude and longitude are required"})
         return lat, lon
 
-    def _v5_punch_response(self, request, attendance, matched_site, resolution, action_mode, status_code):
+    def _v5_punch_response(self, request, attendance, matched_site, resolution, action_mode, status_code, timing=None):
         data = AttendanceCheckinSerializer(attendance, context={"request": request}).data
         if isinstance(data, dict):
             org_location = attendance.org_location
@@ -664,7 +667,12 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             data["site_name"] = matched_site.name if matched_site else None
             data["site_resolution"] = resolution
             data["mode"] = action_mode
-        return Response(data, status=status_code)
+        resp = Response(data, status=status_code)
+        if timing:
+            parts = [f"{k}={v}ms" for k, v in timing.items() if isinstance(v, (int, float))]
+            if parts:
+                resp["Server-Timing"] = ", ".join(parts)
+        return resp
 
     @action(detail=False, methods=["post"], url_path="checkin_v5")
     @parser_classes([MultiPartParser, FormParser])
@@ -683,6 +691,8 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
         from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
 
         try:
+            _t_req = _time.perf_counter()
+            timing = {}
             user = request.user
             user_tz = get_user_timezone_from_request(request)
             live = self._live()
@@ -739,7 +749,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                     )
                 if not raw_bytes:
                     return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-                ok, msg, _dist_face = verify_user_face(user, raw_bytes)
+                ok, msg, _dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
                 if not ok:
                     return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -747,6 +757,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             if image_file:
                 img_name = getattr(image_file, "name", img_name) or img_name
 
+            _t_db = _time.perf_counter()
             log = CheckInLog.objects.create(
                 guard=user,
                 assignment=assignment,
@@ -780,10 +791,25 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                 user_tz=user_tz,
                 refresh_fn=_attendance_v3_refresh_saved_fields,
                 skip_sibling_reconcile=False,
+                timing_dict=timing,
+            )
+            timing["db_save_ms"] = int((_time.perf_counter() - _t_db) * 1000)
+            timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
+
+            logger.info(
+                "[ATTENDANCE_TIMING] action=checkin_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+                getattr(user, "id", "?"),
+                timing.get("engine", "dlib"),
+                timing.get("decode_ms"),
+                timing.get("detect_ms"),
+                timing.get("encode_ms"),
+                timing.get("match_ms"),
+                timing.get("db_save_ms"),
+                timing.get("total_ms"),
             )
 
             return self._v5_punch_response(
-                request, attendance, matched_site, resolution, "checkin", status.HTTP_201_CREATED
+                request, attendance, matched_site, resolution, "checkin", status.HTTP_201_CREATED, timing=timing
             )
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
@@ -881,6 +907,9 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                 user, assignment, shift, org_location, shift_start_date
             )
 
+            _t_req = _time.perf_counter()
+            timing = {}
+
             image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
             raw_bytes = image_file.read() if image_file else None
 
@@ -895,7 +924,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                     )
                 if not raw_bytes:
                     return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-                ok, msg, _dist_face = verify_user_face(user, raw_bytes)
+                ok, msg, _dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
                 if not ok:
                     return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -903,6 +932,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             if image_file:
                 img_name = getattr(image_file, "name", img_name) or img_name
 
+            _t_db = _time.perf_counter()
             log = CheckInLog.objects.create(
                 guard=user,
                 assignment=assignment,
@@ -933,10 +963,25 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                 user_tz=user_tz,
                 refresh_fn=_attendance_v3_refresh_saved_fields,
                 skip_sibling_reconcile=False,
+                timing_dict=timing,
+            )
+            timing["db_save_ms"] = int((_time.perf_counter() - _t_db) * 1000)
+            timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
+
+            logger.info(
+                "[ATTENDANCE_TIMING] action=checkout_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+                getattr(user, "id", "?"),
+                timing.get("engine", "dlib"),
+                timing.get("decode_ms"),
+                timing.get("detect_ms"),
+                timing.get("encode_ms"),
+                timing.get("match_ms"),
+                timing.get("db_save_ms"),
+                timing.get("total_ms"),
             )
 
             return self._v5_punch_response(
-                request, attendance, matched_site, resolution, "checkout", status.HTTP_200_OK
+                request, attendance, matched_site, resolution, "checkout", status.HTTP_200_OK, timing=timing
             )
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)

@@ -140,6 +140,12 @@ def sync_user_face_and_index(user, old_location_id=None, new_location_id=None):
         else:
             User.objects.filter(pk=user.pk).update(face_encoding=None)
             user.face_encoding = None
+
+        try:
+            from patrol_backend.utils.face_insight import invalidate_user_insight_embedding
+            invalidate_user_insight_embedding(str(user.pk))
+        except Exception:
+            pass
     except Exception as exc:
         logger.warning("refresh_user_face_encoding failed user=%s: %s", user.pk, exc)
 
