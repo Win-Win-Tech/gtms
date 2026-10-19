@@ -100,6 +100,8 @@ class LocationConsumer(AsyncWebsocketConsumer):
         server_now_utc = now()
         live_context = await self.save_user_location(lat, lng, server_now_utc, on_duty_ctx)
 
+        did_checkout = bool(live_context.get("did_auto_checkout"))
+
         payload = {
             "type": "location_update",
             "user_id": str(getattr(self.user, "id", "unknown")),
@@ -108,7 +110,8 @@ class LocationConsumer(AsyncWebsocketConsumer):
             "lat": lat,
             "lng": lng,
             "timestamp_utc": server_now_utc.isoformat(),
-            "on_duty": True,
+            "on_duty": not did_checkout,
+            "auto_checkout": did_checkout,
             "assigned_site_id": live_context.get("assigned_site_id"),
             "is_inside_boundary": live_context.get("is_inside_boundary"),
             "boundary_status": live_context.get("boundary_status"),
@@ -118,6 +121,17 @@ class LocationConsumer(AsyncWebsocketConsumer):
             payload,
             assigned_site_id=live_context.get("assigned_site_id"),
         )
+
+        if did_checkout:
+            await self.send(
+                text_data=json.dumps(
+                    {
+                        "type": "auto_checkout",
+                        "code": "boundary_breach_checkout",
+                        "message": "You have been automatically checked out due to moving outside the site boundary.",
+                    }
+                )
+            )
 
     async def handle_emergency_alert(self, data):
         """Handles high-priority Panic/SOS events."""

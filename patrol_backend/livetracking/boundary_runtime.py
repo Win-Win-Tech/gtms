@@ -186,9 +186,10 @@ def process_location_boundary_update(
     live_loc.save(update_fields=update_fields)
 
     # When breach alert is triggered for a checked-in user, automatically check them out
+    did_auto_checkout = False
     if alert:
         try:
-            auto_checkout_user_on_boundary_breach(
+            res = auto_checkout_user_on_boundary_breach(
                 user=user,
                 site=assigned_site,
                 lat=lat,
@@ -197,6 +198,8 @@ def process_location_boundary_update(
                 checkin=checkin,
                 now_utc=now,
             )
+            if res:
+                did_auto_checkout = True
         except Exception:
             logger.exception(
                 "[BOUNDARY_AUTO_CHECKOUT] Failed to auto-checkout user=%s on breach alert=%s",
@@ -205,9 +208,10 @@ def process_location_boundary_update(
             )
 
     return {
-        "assigned_site_id": str(assigned_site.id),
+        "assigned_site_id": str(assigned_site.id) if assigned_site else None,
         "is_inside_boundary": live_loc.is_inside_boundary,
         "boundary_status": live_loc.boundary_state,
+        "did_auto_checkout": did_auto_checkout,
     }
 
 
@@ -268,9 +272,15 @@ def auto_checkout_user_on_boundary_breach(
         checkin.checkin_time.astimezone(user_tz).date() if checkin.checkin_time else get_user_today(user_tz)
     )
 
+    curr_now = now_utc or timezone.now()
     search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
         shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
     )
+    if curr_now >= search_end_utc:
+        search_end_utc = curr_now + timedelta(minutes=15)
+    if checkin.checkin_time and checkin.checkin_time <= search_start_utc:
+        search_start_utc = checkin.checkin_time - timedelta(minutes=15)
+
     log_filter = build_log_window_filter(
         user, assignment, shift, org_location, search_start_utc, search_end_utc
     )
@@ -278,7 +288,7 @@ def auto_checkout_user_on_boundary_breach(
     matched_site = checkin.site or site
 
     # Create checkout CheckInLog
-    CheckInLog.objects.create(
+    checkout_log = CheckInLog.objects.create(
         guard=user,
         assignment=assignment,
         shift=shift,
@@ -288,6 +298,11 @@ def auto_checkout_user_on_boundary_breach(
         longitude=lng,
         site=matched_site,
     )
+
+    # Explicitly ensure checkout_time, last_checkout_time and status are set
+    checkin.checkout_time = checkout_log.timestamp
+    checkin.last_checkout_time = checkout_log.timestamp
+    checkin.status = "checked_out"
 
     breach_remark = "[Auto-checkout: Boundary breach alert triggered]"
     if checkin.remarks:
