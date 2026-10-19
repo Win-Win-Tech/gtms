@@ -25,9 +25,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-0f4$v*^k&wwuw0!dio!xgd&b(-d_fsre_=kcshan2gr@b9a^#!'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '147.93.27.224', 'unmentholated-konner-authorisable.ngrok-free.dev', 'gtmsapi.cloudgentechnologies.com']
+ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '147.93.27.224', 'unmentholated-konner-authorisable.ngrok-free.dev', 'gtmsapi.cloudgentechnologies.com', 'smartpatrol.cloudgentechnologies.com']
 
 # Application definition
 
@@ -249,7 +249,7 @@ SIMPLE_JWT = {
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-FACE_IDENTIFY_LOG_PHOTOS_ENABLED = True
+FACE_IDENTIFY_LOG_PHOTOS_ENABLED = False
 FACE_IDENTIFY_LOG_ASYNC = True  # write logphoto in background (faster API response)
 # 1:N kiosk identification — margin check stops wrong-user; tolerance allows haircut/appearance drift
 FACE_IDENTIFY_TOLERANCE = 0.45  # relaxed pass (quality retry / appearance change e.g. haircut)
