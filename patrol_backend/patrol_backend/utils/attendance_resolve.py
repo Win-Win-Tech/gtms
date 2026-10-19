@@ -320,6 +320,7 @@ def apply_v4_attendance_after_log(
     refresh_fn: Optional[Callable] = None,
     skip_sibling_reconcile: bool = False,
     timing_dict: Optional[dict] = None,
+    preserve_alert_id=None,
 ) -> None:
     """
     Update attendance row after CheckInLog was created — shared v4 field rules.
@@ -392,7 +393,7 @@ def apply_v4_attendance_after_log(
     if action_mode == "checkout":
         from livetracking.checkout_hooks import on_attendance_checkout
 
-        on_attendance_checkout(user, attendance=attendance)
+        on_attendance_checkout(user, attendance=attendance, preserve_alert_id=preserve_alert_id)
         _t = _step("checkout_hooks", _t)
 
     _step("done", _t_start)

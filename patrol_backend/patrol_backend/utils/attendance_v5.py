@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple
 
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -11,6 +12,8 @@ from patrol_backend.utils.proximity_utils import (
     get_nearest_site_within_proximity,
     is_within_site_attendance_radius,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_site_id(site_id) -> Optional[str]:
@@ -39,6 +42,15 @@ def resolve_v5_punch_site(
     """
     from authapp.site_access import allowed_site_ids
 
+    logger.info(
+        "[PUNCH_V5] geofence check user=%s location=%s site_id=%s input_coords=(%.6f, %.6f)",
+        getattr(user, "id", "?"),
+        org_location_id,
+        site_id,
+        latitude,
+        longitude,
+    )
+
     normalized = _normalize_site_id(site_id)
     if normalized:
         site = get_site_or_error(normalized)
@@ -46,18 +58,34 @@ def resolve_v5_punch_site(
             raise ValidationError({"site_id": "Site does not belong to this organisation."})
         assert_caller_can_access_site(user, site)
         if not is_within_site_attendance_radius(latitude, longitude, org_location_id, site):
+            logger.warning(
+                "[PUNCH_V5] outside geofence for specific site user=%s location=%s site=%s input_coords=(%.6f, %.6f)",
+                getattr(user, "id", "?"),
+                org_location_id,
+                site.id,
+                latitude,
+                longitude,
+            )
             raise ValidationError(
                 {"error": "You are not within the authorized boundary of this site."}
             )
         from patrol_backend.utils.proximity_utils import distance_to_site_meters
 
-        return site, distance_to_site_meters(latitude, longitude, site), "request"
+        dist = distance_to_site_meters(latitude, longitude, site)
+        return site, dist, "request"
 
     allowed = allowed_site_ids(user)
     site, dist = get_nearest_site_within_proximity(
         latitude, longitude, org_location_id, allowed_site_ids=allowed
     )
     if not site:
+        logger.warning(
+            "[PUNCH_V5] outside geofence user=%s location=%s input_coords=(%.6f, %.6f)",
+            getattr(user, "id", "?"),
+            org_location_id,
+            latitude,
+            longitude,
+        )
         raise ValidationError(
             {"error": "You are not within the authorized boundary of any site for this location."}
         )

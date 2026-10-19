@@ -87,7 +87,9 @@ def process_location_boundary_update(
     Returns broadcast fields: assigned_site_id, is_inside_boundary, boundary_status.
     """
     now = server_now_utc or timezone.now()
-    assigned_site = site
+    if checkin is None:
+        checkin = get_open_checkin_for_user(user)
+    assigned_site = site or (checkin.site if checkin and getattr(checkin, "site_id", None) else None)
 
     if not assigned_site:
         live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN
@@ -144,6 +146,7 @@ def process_location_boundary_update(
         and live_loc.active_breach_alert.is_active
     )
 
+    alert = None
     if new_state == UserLiveLocation.BoundaryState.OUTSIDE and not has_active_breach_alert:
         alert, _recipients = create_tracking_alert(
             alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
@@ -182,6 +185,25 @@ def process_location_boundary_update(
     live_loc.is_inside_boundary = is_inside
     live_loc.save(update_fields=update_fields)
 
+    # When breach alert is triggered for a checked-in user, automatically check them out
+    if alert:
+        try:
+            auto_checkout_user_on_boundary_breach(
+                user=user,
+                site=assigned_site,
+                lat=lat,
+                lng=lng,
+                alert=alert,
+                checkin=checkin,
+                now_utc=now,
+            )
+        except Exception:
+            logger.exception(
+                "[BOUNDARY_AUTO_CHECKOUT] Failed to auto-checkout user=%s on breach alert=%s",
+                getattr(user, "id", "?"),
+                getattr(alert, "id", "?"),
+            )
+
     return {
         "assigned_site_id": str(assigned_site.id),
         "is_inside_boundary": live_loc.is_inside_boundary,
@@ -189,8 +211,127 @@ def process_location_boundary_update(
     }
 
 
+def auto_checkout_user_on_boundary_breach(
+    *,
+    user,
+    site,
+    lat: float,
+    lng: float,
+    alert=None,
+    checkin=None,
+    now_utc=None,
+):
+    """
+    Automatically checks out a user when boundary breach / SOS alert is triggered.
+    Creates checkout CheckInLog, updates AttendanceCheckin to checked_out,
+    recalculates shift duration & PA status, and ensures the breach alert is preserved.
+    """
+    from dashboard.models import CheckInLog, AttendanceCheckin
+    from dashboard.views import (
+        _attendance_v3_shift_window_utc,
+        _attendance_v3_refresh_saved_fields,
+    )
+    from patrol_backend.utils.attendance_resolve import (
+        build_log_window_filter,
+        apply_v4_attendance_after_log,
+    )
+    from patrol_backend.utils.timezone_utils import get_user_timezone, get_user_today
+
+    if checkin is None:
+        checkin = get_open_checkin_for_user(user)
+
+    if not checkin:
+        logger.info(
+            "[BOUNDARY_AUTO_CHECKOUT] No open checkin found for user=%s; skipping auto-checkout",
+            getattr(user, "id", "?"),
+        )
+        return None
+
+    try:
+        checkin = AttendanceCheckin.objects.select_for_update().get(id=checkin.id)
+    except AttendanceCheckin.DoesNotExist:
+        return None
+
+    assignment = getattr(checkin, "assignment", None)
+    shift = getattr(checkin, "shift", None)
+    org_location = getattr(checkin, "org_location", None)
+    if not (assignment and shift and org_location):
+        logger.warning(
+            "[BOUNDARY_AUTO_CHECKOUT] Missing assignment/shift/location on checkin=%s user=%s",
+            checkin.id,
+            getattr(user, "id", "?"),
+        )
+        return None
+
+    user_tz = get_user_timezone(user)
+    shift_start_date = checkin.shift_date or (
+        checkin.checkin_time.astimezone(user_tz).date() if checkin.checkin_time else get_user_today(user_tz)
+    )
+
+    search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
+        shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+    )
+    log_filter = build_log_window_filter(
+        user, assignment, shift, org_location, search_start_utc, search_end_utc
+    )
+
+    matched_site = checkin.site or site
+
+    # Create checkout CheckInLog
+    CheckInLog.objects.create(
+        guard=user,
+        assignment=assignment,
+        shift=shift,
+        org_location=org_location,
+        type="checkout",
+        latitude=lat,
+        longitude=lng,
+        site=matched_site,
+    )
+
+    breach_remark = "[Auto-checkout: Boundary breach alert triggered]"
+    if checkin.remarks:
+        if breach_remark not in checkin.remarks:
+            checkin.remarks = f"{checkin.remarks} {breach_remark}"
+    else:
+        checkin.remarks = breach_remark
+
+    alert_id = getattr(alert, "id", None)
+
+    apply_v4_attendance_after_log(
+        attendance=checkin,
+        user=user,
+        assignment=assignment,
+        shift=shift,
+        org_location=org_location,
+        shift_start_date=shift_start_date,
+        matched_site=matched_site,
+        log_filter=log_filter,
+        search_start_utc=search_start_utc,
+        search_end_utc=search_end_utc,
+        action_mode="checkout",
+        raw_bytes=None,
+        img_name="auto_checkout.jpg",
+        user_tz=user_tz,
+        refresh_fn=_attendance_v3_refresh_saved_fields,
+        skip_sibling_reconcile=False,
+        preserve_alert_id=alert_id,
+    )
+
+    logger.info(
+        "[BOUNDARY_AUTO_CHECKOUT] Auto-checkout completed for user=%s attendance=%s alert=%s site=%s lat=%.6f lng=%.6f",
+        getattr(user, "id", "?"),
+        getattr(checkin, "id", "?"),
+        alert_id,
+        getattr(matched_site, "id", "?") if matched_site else None,
+        lat,
+        lng,
+    )
+    return checkin
+
+
 @transaction.atomic
-def clear_tracking_state_on_checkout(user, attendance=None) -> None:
+def clear_tracking_state_on_checkout(user, attendance=None, preserve_alert_id=None) -> None:
     """Resolve active alerts and reset boundary fields when a user checks out."""
     live_loc = (
         UserLiveLocation.objects.select_related("active_breach_alert", "assigned_site")
@@ -205,6 +346,8 @@ def clear_tracking_state_on_checkout(user, attendance=None) -> None:
         site = live_loc.assigned_site
 
     active_alerts = TrackingAlert.objects.filter(subject_user=user, is_active=True)
+    if preserve_alert_id:
+        active_alerts = active_alerts.exclude(id=preserve_alert_id)
     if site is not None:
         active_alerts = active_alerts.filter(site=site)
 
@@ -214,21 +357,31 @@ def clear_tracking_state_on_checkout(user, attendance=None) -> None:
     if not live_loc:
         return
 
-    live_loc.active_breach_alert = None
+    update_fields = [
+        "assigned_site",
+        "is_inside_boundary",
+        "boundary_state",
+    ]
+    if preserve_alert_id and str(live_loc.active_breach_alert_id) == str(preserve_alert_id):
+        # Keep active breach alert intact on UserLiveLocation so admins see it
+        pass
+    else:
+        live_loc.active_breach_alert = None
+        update_fields.append("active_breach_alert")
+
     live_loc.assigned_site = None
     live_loc.is_inside_boundary = None
     live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN
-    live_loc.last_location_at = None
-    live_loc.save(
-        update_fields=[
-            "active_breach_alert",
-            "assigned_site",
-            "is_inside_boundary",
-            "boundary_state",
-            "last_location_at",
-        ]
+    if not preserve_alert_id:
+        live_loc.last_location_at = None
+        update_fields.append("last_location_at")
+
+    live_loc.save(update_fields=update_fields)
+    logger.info(
+        "[BOUNDARY] Cleared tracking state on checkout for user=%s (preserved_alert=%s)",
+        user.id,
+        preserve_alert_id,
     )
-    logger.info("[BOUNDARY] Cleared tracking state on checkout for user=%s", user.id)
 
 
 def run_location_missing_checks(location_id=None) -> dict:

@@ -1984,9 +1984,24 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        logger.info(
+            "[CHECKIN_V4] geofence check user=%s location=%s input_coords=(%.6f, %.6f)",
+            getattr(user, "id", "?"),
+            getattr(org_location, "id", "?"),
+            lat,
+            lon,
+        )
+
         # Multi-site proximity validation
         matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
         if not matched_site:
+            logger.warning(
+                "[CHECKIN_V4] outside geofence user=%s location=%s input_coords=(%.6f, %.6f)",
+                getattr(user, "id", "?"),
+                getattr(org_location, "id", "?"),
+                lat,
+                lon,
+            )
             return Response(
                 {"error": "You are not within the authorized boundary of any site for this location."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2132,9 +2147,24 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         lat = float(request.data.get("latitude"))
         lon = float(request.data.get("longitude"))
 
+        logger.info(
+            "[CHECKOUT_V4] geofence check user=%s location=%s input_coords=(%.6f, %.6f)",
+            getattr(user, "id", "?"),
+            getattr(org_location, "id", "?"),
+            lat,
+            lon,
+        )
+
         # Multi-site proximity validation
         matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
         if not matched_site:
+            logger.warning(
+                "[CHECKOUT_V4] outside geofence user=%s location=%s input_coords=(%.6f, %.6f)",
+                getattr(user, "id", "?"),
+                getattr(org_location, "id", "?"),
+                lat,
+                lon,
+            )
             return Response(
                 {"error": "You are not within the authorized boundary of any site for this location."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2331,11 +2361,26 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             return _kiosk_error("geofence_required", "latitude and longitude are required")
 
+        kiosk_logger.info(
+            "[KIOSK] geofence check actor=%s location=%s input_coords=(%.6f, %.6f)",
+            getattr(request.user, "id", "?"),
+            getattr(org_location, "id", "?"),
+            lat,
+            lon,
+        )
+
         # Multi-site proximity validation
         _t_geo = _time.perf_counter()
         matched_site, dist = get_site_within_proximity(lat, lon, org_location.id)
         timing["geofence_ms"] = int((_time.perf_counter() - _t_geo) * 1000)
         if not matched_site:
+            kiosk_logger.warning(
+                "[KIOSK] outside geofence actor=%s location=%s input_coords=(%.6f, %.6f)",
+                getattr(request.user, "id", "?"),
+                getattr(org_location, "id", "?"),
+                lat,
+                lon,
+            )
             return _kiosk_error(
                 "outside_geofence",
                 "You are not within the authorized boundary of any site for this location.",
