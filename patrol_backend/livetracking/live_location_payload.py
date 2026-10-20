@@ -21,6 +21,13 @@ def build_location_update_payload(live_loc, requesting_user):
         timestamp_iso = None
         timestamp_utc = None
 
+    assigned_site_id = str(live_loc.assigned_site_id) if live_loc.assigned_site_id else None
+    if not assigned_site_id:
+        from livetracking.ws_groups import get_open_checkin_for_user
+        checkin = get_open_checkin_for_user(subject_user)
+        if checkin and checkin.site_id:
+            assigned_site_id = str(checkin.site_id)
+
     return {
         "type": "location_update",
         "user_id": str(subject_user.id),
@@ -32,7 +39,7 @@ def build_location_update_payload(live_loc, requesting_user):
         "timestamp_iso": timestamp_iso,
         "timestamp_utc": timestamp_utc,
         "on_duty": True,
-        "assigned_site_id": str(live_loc.assigned_site_id) if live_loc.assigned_site_id else None,
+        "assigned_site_id": assigned_site_id,
         "is_inside_boundary": live_loc.is_inside_boundary,
         "boundary_status": live_loc.boundary_state,
     }

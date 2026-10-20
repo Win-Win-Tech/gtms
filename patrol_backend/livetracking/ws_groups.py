@@ -84,12 +84,10 @@ def resolve_ws_groups_for_user(user):
 
 
 OPEN_CHECKIN_Q = (
-    ~Q(status="checked_out")
-    & (
-        Q(last_checkout_time__isnull=True)
-        | Q(last_checkin_time__gt=F("last_checkout_time"))
-        | (Q(last_checkin_time__isnull=True) & Q(checkout_time__isnull=True))
-    )
+    Q(last_checkin_time__isnull=False, last_checkout_time__isnull=True)
+    | Q(last_checkin_time__gt=F("last_checkout_time"))
+    | Q(last_checkin_time__isnull=True, checkin_time__isnull=False, checkout_time__isnull=True)
+    | Q(checkin_time__gt=F("checkout_time"))
 )
 
 
