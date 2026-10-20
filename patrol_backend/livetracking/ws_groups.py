@@ -1,6 +1,4 @@
-"""WebSocket channel group resolution for live tracking and tracking alerts."""
-
-from django.db.models import Q
+from django.db.models import F, Q
 
 from authapp.site_access import caller_can_access_site
 from authapp.views import resolve_role_for_user
@@ -85,10 +83,13 @@ def resolve_ws_groups_for_user(user):
     return sorted(groups)
 
 
-OPEN_CHECKIN_Q = Q(last_checkin_time__isnull=False, last_checkout_time__isnull=True) | Q(
-    last_checkin_time__isnull=True,
-    checkin_time__isnull=False,
-    checkout_time__isnull=True,
+OPEN_CHECKIN_Q = (
+    ~Q(status="checked_out")
+    & (
+        Q(last_checkout_time__isnull=True)
+        | Q(last_checkin_time__gt=F("last_checkout_time"))
+        | (Q(last_checkin_time__isnull=True) & Q(checkout_time__isnull=True))
+    )
 )
 
 
@@ -132,8 +133,24 @@ def get_on_duty_context(user):
     checkin = get_open_checkin_for_user(user)
     assigned_site = checkin.site if checkin and checkin.site_id else None
     org_location = checkin.org_location if checkin and checkin.org_location_id else None
+
+    has_active_breach = False
+    if not checkin and user and getattr(user, "is_authenticated", False):
+        from livetracking.models import TrackingAlert
+        active_breach = TrackingAlert.objects.filter(
+            subject_user=user,
+            alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
+            is_active=True,
+        ).select_related("site", "location").first()
+        if active_breach and active_breach.site:
+            has_active_breach = True
+            assigned_site = active_breach.site
+            org_location = active_breach.location
+
     return {
         "on_duty": bool(checkin),
+        "has_active_breach": has_active_breach,
+        "can_track": bool(checkin) or has_active_breach,
         "checkin": checkin,
         "assigned_site_id": str(assigned_site.id) if assigned_site else None,
         "assigned_site": assigned_site,

@@ -81,7 +81,7 @@ class LocationConsumer(AsyncWebsocketConsumer):
             return
 
         on_duty_ctx = await self.get_on_duty_context()
-        if not on_duty_ctx.get("on_duty"):
+        if not on_duty_ctx.get("can_track"):
             await self.send(
                 text_data=json.dumps(
                     {
