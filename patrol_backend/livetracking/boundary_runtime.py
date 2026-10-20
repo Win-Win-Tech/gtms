@@ -91,6 +91,29 @@ def process_location_boundary_update(
         checkin = get_open_checkin_for_user(user)
     assigned_site = site or (checkin.site if checkin and getattr(checkin, "site_id", None) else None)
 
+    # If user has any active boundary breach alerts, check if their current coordinates
+    # are back inside that alert's site. If so, automatically resolve the breach alert immediately!
+    active_breaches = TrackingAlert.objects.filter(
+        subject_user=user,
+        alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
+        is_active=True,
+    ).select_related("site")
+
+    for ab in active_breaches:
+        if ab.site:
+            ab_loc_id = getattr(ab.site, "location_id", None)
+            if evaluate_site_boundary(ab.site, float(lat), float(lng), location_id=ab_loc_id) is True:
+                resolve_tracking_alert(ab, dispatch_ws=True)
+                if live_loc.active_breach_alert_id == ab.id:
+                    live_loc.active_breach_alert = None
+                logger.info(
+                    "[BOUNDARY] Resolved active breach alert=%s for user=%s re-entering site=%s (%s)",
+                    ab.id,
+                    user.id,
+                    ab.site.id,
+                    ab.site.name,
+                )
+
     # If user has no active checkin (e.g. was auto-checked out due to boundary breach),
     # check if they have an active breach alert so we can track when they return inside
     # the site boundary and automatically resolve the active alert.
@@ -100,7 +123,7 @@ def process_location_boundary_update(
         elif live_loc.assigned_site_id:
             assigned_site = live_loc.assigned_site
         else:
-            active_breach = (
+            remaining_active = (
                 TrackingAlert.objects.filter(
                     subject_user=user,
                     alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
@@ -109,9 +132,9 @@ def process_location_boundary_update(
                 .select_related("site")
                 .first()
             )
-            if active_breach and active_breach.site:
-                assigned_site = active_breach.site
-                live_loc.active_breach_alert = active_breach
+            if remaining_active and remaining_active.site:
+                assigned_site = remaining_active.site
+                live_loc.active_breach_alert = remaining_active
 
     if not assigned_site:
         live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN

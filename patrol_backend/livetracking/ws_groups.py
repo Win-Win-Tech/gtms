@@ -97,11 +97,15 @@ def get_open_checkin_for_user(user):
     if not user or not getattr(user, "is_authenticated", False):
         return None
 
+    from datetime import timedelta
+    from django.utils import timezone
     from dashboard.models import AttendanceCheckin
 
+    recent_cutoff = timezone.now() - timedelta(hours=36)
     return (
         AttendanceCheckin.objects.filter(guard=user)
         .filter(OPEN_CHECKIN_Q)
+        .filter(Q(last_checkin_time__gte=recent_cutoff) | Q(checkin_time__gte=recent_cutoff))
         .select_related("site", "org_location")
         .order_by("-last_checkin_time", "-checkin_time")
         .first()
@@ -110,9 +114,14 @@ def get_open_checkin_for_user(user):
 
 def get_on_duty_user_ids(location_id=None):
     """User IDs with an open AttendanceCheckin, optionally scoped to one org."""
+    from datetime import timedelta
+    from django.utils import timezone
     from dashboard.models import AttendanceCheckin
 
-    qs = AttendanceCheckin.objects.filter(OPEN_CHECKIN_Q)
+    recent_cutoff = timezone.now() - timedelta(hours=36)
+    qs = AttendanceCheckin.objects.filter(OPEN_CHECKIN_Q).filter(
+        Q(last_checkin_time__gte=recent_cutoff) | Q(checkin_time__gte=recent_cutoff)
+    )
     if location_id:
         qs = qs.filter(org_location_id=location_id)
     return qs.values_list("guard_id", flat=True).distinct()
