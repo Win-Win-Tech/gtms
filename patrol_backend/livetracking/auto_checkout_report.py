@@ -128,7 +128,7 @@ def serialize_auto_checkout_log(log: CheckInLog, requesting_user) -> dict:
         "site_name": site.name if site else "—",
         "org_location_id": str(org_loc.id) if org_loc else None,
         "org_location_name": org_loc.name if org_loc else "—",
-        "shift_name": getattr(shift, "shift_name", "—") if shift else "—",
+        "shift_name": (getattr(shift, "name", None) or getattr(shift, "shift_name", None) or "—") if shift else "—",
         "latitude": float(log.latitude) if log.latitude is not None else None,
         "longitude": float(log.longitude) if log.longitude is not None else None,
         "is_auto_checkout": bool(log.is_auto_checkout),
@@ -190,13 +190,13 @@ def generate_auto_checkout_excel(queryset, requesting_user, context: Optional[di
     period_str = ctx.get("period_display", "All Time")
 
     # Title Banner (Rows 1-2)
-    ws.merge_cells("A1:K1")
+    ws.merge_cells("A1:J1")
     ws["A1"] = "SMART PATROL - BOUNDARY AUTO-CHECKOUT REPORT"
     ws["A1"].font = font_title
     ws["A1"].fill = brand_fill
     ws["A1"].alignment = align_center
 
-    ws.merge_cells("A2:K2")
+    ws.merge_cells("A2:J2")
     ws["A2"] = f"Location: {loc_name}  |  Period: {period_str}  |  Generated: {generated_at_str}"
     ws["A2"].font = font_sub
     ws["A2"].fill = brand_fill
@@ -227,7 +227,6 @@ def generate_auto_checkout_excel(queryset, requesting_user, context: Optional[di
         ("Shift", 16, align_left),
         ("Latitude", 14, align_right),
         ("Longitude", 14, align_right),
-        ("Auto-Checkout Reason / Breach Details", 45, align_left),
     ]
 
     header_row = 6
@@ -254,10 +253,9 @@ def generate_auto_checkout_excel(queryset, requesting_user, context: Optional[di
         role = getattr(guard, "role", "guard").upper()
         location_name = log.org_location.name if log.org_location else "—"
         site_name = log.site.name if log.site else "—"
-        shift_name = log.shift.shift_name if log.shift else "—"
+        shift_name = (getattr(log.shift, "name", None) or getattr(log.shift, "shift_name", None) or "—") if log.shift else "—"
         lat_val = f"{float(log.latitude):.6f}" if log.latitude is not None else "—"
         lng_val = f"{float(log.longitude):.6f}" if log.longitude is not None else "—"
-        reason_val = log.auto_checkout_reason or "Boundary breach: moved outside site boundary"
 
         row_values = [
             (s_no, align_center),
@@ -270,7 +268,6 @@ def generate_auto_checkout_excel(queryset, requesting_user, context: Optional[di
             (shift_name, align_left),
             (lat_val, align_right),
             (lng_val, align_right),
-            (reason_val, align_left),
         ]
 
         fill_color = zebra_fill if s_no % 2 == 0 else None
@@ -443,21 +440,21 @@ def generate_auto_checkout_pdf(queryset, requesting_user, context: Optional[dict
         Paragraph("<b>Date & Time</b>", th_style),
         Paragraph("<b>Guard</b>", th_style),
         Paragraph("<b>Role</b>", th_style),
+        Paragraph("<b>Location</b>", th_style),
         Paragraph("<b>Site Name</b>", th_style),
         Paragraph("<b>Shift</b>", th_style),
         Paragraph("<b>Coordinates</b>", th_style),
-        Paragraph("<b>Auto-Checkout Reason / Breach Details</b>", th_style),
     ]
 
     col_widths = [
-        0.35 * inch,  # #
-        1.25 * inch,  # Date & Time
-        1.70 * inch,  # Guard
-        0.80 * inch,  # Role
-        1.60 * inch,  # Site
-        1.10 * inch,  # Shift
-        1.30 * inch,  # Coordinates
-        2.50 * inch,  # Reason
+        0.40 * inch,  # #
+        1.40 * inch,  # Date & Time
+        2.00 * inch,  # Guard
+        0.90 * inch,  # Role
+        1.80 * inch,  # Location
+        1.99 * inch,  # Site
+        1.20 * inch,  # Shift
+        1.20 * inch,  # Coordinates
     ]
 
     table_data = [table_headers]
@@ -472,24 +469,23 @@ def generate_auto_checkout_pdf(queryset, requesting_user, context: Optional[dict
         emp_code = getattr(guard, "employee_code", "") or "—"
         guard_html = f"<b>{guard_name}</b><br/><font color='#64748b' size=6.5>{emp_code}</font>"
         role = getattr(guard, "role", "guard").upper()
+        location_name = log.org_location.name if log.org_location else "—"
         site_name = log.site.name if log.site else "—"
-        shift_name = log.shift.shift_name if log.shift else "—"
+        shift_name = (getattr(log.shift, "name", None) or getattr(log.shift, "shift_name", None) or "—") if log.shift else "—"
 
         coords = "—"
         if log.latitude is not None and log.longitude is not None:
             coords = f"{float(log.latitude):.4f}, {float(log.longitude):.4f}"
-
-        reason = log.auto_checkout_reason or "Boundary breach: moved outside site boundary"
 
         table_data.append([
             Paragraph(str(s_no), td_center),
             Paragraph(time_str, td_center),
             Paragraph(guard_html, td_style),
             Paragraph(role, td_center),
+            Paragraph(location_name, td_style),
             Paragraph(site_name, td_style),
             Paragraph(shift_name, td_style),
             Paragraph(coords, td_center),
-            Paragraph(reason, td_style),
         ])
         s_no += 1
 
