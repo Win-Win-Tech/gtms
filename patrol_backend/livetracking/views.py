@@ -287,22 +287,19 @@ class LiveTrackingViewSet(viewsets.ViewSet):
             )
 
             qs = filter_auto_checkout_queryset(request, user)
-
             start = request.query_params.get('start_date') or ''
             end = request.query_params.get('end_date') or ''
-            period_str = f"{start} to {end}" if (start and end) else (start or end or "All Time")
 
-            context = {
-                'location_name': getattr(user, 'location', None) and user.location.name or 'All Locations',
-                'period_display': period_str,
-            }
-
-            buf = generate_auto_checkout_excel(qs, user, context)
+            buf = generate_auto_checkout_excel(qs, user, request=request)
             response = HttpResponse(
                 buf.getvalue(),
                 content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             )
-            response['Content-Disposition'] = 'attachment; filename="boundary_auto_checkouts.xlsx"'
+            if start and end:
+                filename = f"auto_checkout_report_{start}_{end}.xlsx"
+            else:
+                filename = f"auto_checkout_report_{timezone.now().strftime('%Y%m%d')}.xlsx"
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
             return response
 
         except Exception as e:
@@ -324,19 +321,16 @@ class LiveTrackingViewSet(viewsets.ViewSet):
             )
 
             qs = filter_auto_checkout_queryset(request, user)
-
             start = request.query_params.get('start_date') or ''
             end = request.query_params.get('end_date') or ''
-            period_str = f"{start} to {end}" if (start and end) else (start or end or "All Time")
 
-            context = {
-                'location_name': getattr(user, 'location', None) and user.location.name or 'All Locations',
-                'period_display': period_str,
-            }
-
-            buf = generate_auto_checkout_pdf(qs, user, context)
+            buf = generate_auto_checkout_pdf(qs, user, request=request)
             response = HttpResponse(buf.getvalue(), content_type='application/pdf')
-            response['Content-Disposition'] = 'attachment; filename="boundary_auto_checkouts.pdf"'
+            if start and end:
+                filename = f"auto_checkout_report_{start}_{end}.pdf"
+            else:
+                filename = f"auto_checkout_report_{timezone.now().strftime('%Y%m%d')}.pdf"
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
             return response
 
         except Exception as e:

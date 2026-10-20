@@ -148,383 +148,317 @@ def build_auto_checkout_summary(qs) -> dict:
     }
 
 
+AUTO_CHECKOUT_EXPORT_HEADERS = [
+    "#",
+    "Date & Time",
+    "Guard",
+    "Emp Code",
+    "Role",
+    "Site",
+    "Location",
+    "Shift",
+    "Breach GPS",
+]
+
+
+def resolve_auto_checkout_export_meta(request, requesting_user):
+    from patrol_backend.utils.timezone_utils import (
+        get_user_now,
+        get_user_timezone_from_request,
+        to_user_timezone,
+    )
+
+    if not request:
+        user_tz = getattr(requesting_user, "timezone", None)
+        return {
+            "org_name": getattr(requesting_user, "location", None) and requesting_user.location.name or "—",
+            "site_name": None,
+            "range_start": None,
+            "range_end": None,
+            "printed_at": to_user_timezone(timezone.now(), requesting_user),
+            "user_tz": user_tz,
+        }
+
+    start_date_str = request.query_params.get("start_date")
+    end_date_str = request.query_params.get("end_date")
+    location_id = request.query_params.get("location_id")
+    site_id = request.query_params.get("site_id")
+
+    user_tz = get_user_timezone_from_request(request, location_id=location_id)
+    today = get_user_now(user_tz).date()
+
+    range_start, range_end = None, None
+    if start_date_str and end_date_str:
+        try:
+            range_start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            range_end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            range_start, range_end = today, today
+    elif start_date_str:
+        try:
+            range_start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+            range_end = range_start
+        except ValueError:
+            pass
+
+    org_name = "—"
+    if location_id and location_id not in ("All", "all", "null"):
+        from scheduler.models import Location
+
+        loc = Location.objects.filter(id=location_id, is_deleted=False).first()
+        if loc:
+            org_name = loc.name
+    elif getattr(requesting_user, "location", None):
+        org_name = requesting_user.location.name or "—"
+
+    site_name = None
+    if site_id and site_id not in ("All", "all", "null"):
+        from scheduler.models import LocationSite
+
+        site = LocationSite.objects.filter(id=site_id).select_related("location").first()
+        if site:
+            site_name = site.name
+            if org_name == "—" and site.location:
+                org_name = site.location.name
+
+    return {
+        "org_name": org_name,
+        "site_name": site_name,
+        "range_start": range_start,
+        "range_end": range_end,
+        "printed_at": to_user_timezone(timezone.now(), user_tz),
+        "user_tz": user_tz,
+    }
+
+
 # =============================================================================
-# EXCEL GENERATOR (openpyxl)
+# EXCEL GENERATOR (openpyxl) — GTMS Standard Report Layout
 # =============================================================================
 
-def generate_auto_checkout_excel(queryset, requesting_user, context: Optional[dict] = None) -> io.BytesIO:
-    """Produce formatted Excel workbook of auto-checkout events."""
+def generate_auto_checkout_excel(queryset, requesting_user, request=None, context: Optional[dict] = None) -> io.BytesIO:
+    """Produce formatted Excel workbook of auto-checkout events matching standard GTMS layout."""
     wb = Workbook()
     ws = wb.active
-    ws.title = "Auto-Checkouts"
+    ws.title = "Auto-Checkout Report"
     ws.views.sheetView[0].showGridLines = True
 
-    # Styling Palette
-    brand_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid") # Dark slate
-    header_fill = PatternFill(start_color="4338CA", end_color="4338CA", fill_type="solid") # Indigo
-    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-    total_fill = PatternFill(start_color="EEF2F6", end_color="EEF2F6", fill_type="solid")
+    meta = resolve_auto_checkout_export_meta(request, requesting_user)
+    user_tz = meta.get("user_tz") or requesting_user
 
-    font_title = Font(name="Calibri", size=15, bold=True, color="FFFFFF")
-    font_sub = Font(name="Calibri", size=10, italic=True, color="CBD5E1")
-    font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    font_data = Font(name="Calibri", size=10)
-    font_data_bold = Font(name="Calibri", size=10, bold=True)
+    # Row 1: Header Row
+    headers = AUTO_CHECKOUT_EXPORT_HEADERS
+    ws.append(headers)
 
+    header_font = Font(name="Calibri", size=10, bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     border_thin = Border(
         left=Side(style="thin", color="CBD5E1"),
         right=Side(style="thin", color="CBD5E1"),
         top=Side(style="thin", color="CBD5E1"),
         bottom=Side(style="thin", color="CBD5E1"),
     )
-
     align_center = Alignment(horizontal="center", vertical="center")
     align_left = Alignment(horizontal="left", vertical="center")
-    align_right = Alignment(horizontal="right", vertical="center")
 
-    now_local = to_user_timezone(timezone.now(), requesting_user)
-    generated_at_str = now_local.strftime("%d/%m/%Y %H:%M") if now_local else ""
-
-    ctx = context or {}
-    loc_name = ctx.get("location_name", "All Locations")
-    period_str = ctx.get("period_display", "All Time")
-
-    # Title Banner (Rows 1-2)
-    ws.merge_cells("A1:J1")
-    ws["A1"] = "SMART PATROL - BOUNDARY AUTO-CHECKOUT REPORT"
-    ws["A1"].font = font_title
-    ws["A1"].fill = brand_fill
-    ws["A1"].alignment = align_center
-
-    ws.merge_cells("A2:J2")
-    ws["A2"] = f"Location: {loc_name}  |  Period: {period_str}  |  Generated: {generated_at_str}"
-    ws["A2"].font = font_sub
-    ws["A2"].fill = brand_fill
-    ws["A2"].alignment = align_center
-
-    ws.row_dimensions[1].height = 28
-    ws.row_dimensions[2].height = 20
-
-    # Summary Row (Row 4)
-    summary = build_auto_checkout_summary(queryset)
-    ws["A4"] = "Summary KPIs:"
-    ws["A4"].font = font_data_bold
-    ws["B4"] = f"Total Auto-Checkouts: {summary['total_auto_checkouts']}"
-    ws["B4"].font = font_data_bold
-    ws["D4"] = f"Guards Affected: {summary['unique_guards']}"
-    ws["D4"].font = font_data_bold
-    ws["F4"] = f"Sites Affected: {summary['unique_sites']}"
-    ws["F4"].font = font_data_bold
-
-    headers = [
-        ("S.No", 8, align_center),
-        ("Date & Time", 20, align_center),
-        ("Guard Name", 24, align_left),
-        ("Emp Code", 16, align_center),
-        ("Role", 14, align_center),
-        ("Location", 22, align_left),
-        ("Site Name", 24, align_left),
-        ("Shift", 16, align_left),
-        ("Latitude", 14, align_right),
-        ("Longitude", 14, align_right),
-    ]
-
-    header_row = 6
-    ws.row_dimensions[header_row].height = 24
-
-    for col_idx, (title, width, alignment) in enumerate(headers, start=1):
-        cell = ws.cell(row=header_row, column=col_idx, value=title)
-        cell.font = font_header
+    ws.row_dimensions[1].height = 24
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = alignment
+        cell.alignment = align_center
         cell.border = border_thin
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    current_row = header_row + 1
-    s_no = 1
+    font_data = Font(name="Calibri", size=10)
 
-    for log in queryset:
-        local_time = to_user_timezone(log.timestamp, requesting_user)
-        time_str = local_time.strftime("%d/%m/%Y %H:%M:%S") if local_time else "—"
+    # Data Rows
+    for idx, log in enumerate(queryset, start=1):
+        local_time = to_user_timezone(log.timestamp, user_tz)
+        time_str = local_time.strftime("%Y-%m-%d %H:%M:%S") if local_time else "—"
 
         guard = log.guard
         guard_name = getattr(guard, "name", None) or getattr(guard, "email", "Unknown")
         emp_code = getattr(guard, "employee_code", "") or "—"
-        role = getattr(guard, "role", "guard").upper()
-        location_name = log.org_location.name if log.org_location else "—"
+        role = (getattr(guard, "role", "guard") or "guard").upper()
         site_name = log.site.name if log.site else "—"
+        location_name = log.org_location.name if log.org_location else "—"
         shift_name = (getattr(log.shift, "name", None) or getattr(log.shift, "shift_name", None) or "—") if log.shift else "—"
-        lat_val = f"{float(log.latitude):.6f}" if log.latitude is not None else "—"
-        lng_val = f"{float(log.longitude):.6f}" if log.longitude is not None else "—"
+        coords_str = (
+            f"{float(log.latitude):.6f}, {float(log.longitude):.6f}"
+            if (log.latitude is not None and log.longitude is not None)
+            else "—"
+        )
 
-        row_values = [
-            (s_no, align_center),
-            (time_str, align_center),
-            (guard_name, align_left),
-            (emp_code, align_center),
-            (role, align_center),
-            (location_name, align_left),
-            (site_name, align_left),
-            (shift_name, align_left),
-            (lat_val, align_right),
-            (lng_val, align_right),
+        row_data = [
+            idx,
+            time_str,
+            guard_name,
+            emp_code,
+            role,
+            site_name,
+            location_name,
+            shift_name,
+            coords_str,
         ]
-
-        fill_color = zebra_fill if s_no % 2 == 0 else None
+        ws.append(row_data)
+        current_row = ws.max_row
         ws.row_dimensions[current_row].height = 20
 
-        for col_idx, (val, alignment) in enumerate(row_values, start=1):
-            cell = ws.cell(row=current_row, column=col_idx, value=val)
+        for col_idx in range(1, len(row_data) + 1):
+            cell = ws.cell(row=current_row, column=col_idx)
             cell.font = font_data
-            cell.alignment = alignment
             cell.border = border_thin
-            if fill_color:
-                cell.fill = fill_color
+            if col_idx in (1, 2, 4, 5, 9):
+                cell.alignment = align_center
+            else:
+                cell.alignment = align_left
 
-        current_row += 1
-        s_no += 1
+    # Auto-adjust column widths
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = 0
+        for cell in col:
+            val = str(cell.value or "")
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
-    if s_no == 1:
-        # Empty row
-        ws.merge_cells(f"A{current_row}:K{current_row}")
-        empty_cell = ws.cell(row=current_row, column=1, value="No auto-checkout events found for the selected filters.")
-        empty_cell.font = font_data
-        empty_cell.alignment = align_center
-        empty_cell.border = border_thin
-
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 # =============================================================================
-# PDF GENERATOR (ReportLab)
+# PDF GENERATOR (ReportLab) — GTMS Standard Dashboard Report Layout
 # =============================================================================
 
-def generate_auto_checkout_pdf(queryset, requesting_user, context: Optional[dict] = None) -> io.BytesIO:
-    """Produce formatted landscape PDF report of auto-checkout events."""
+def generate_auto_checkout_pdf(queryset, requesting_user, request=None, context: Optional[dict] = None) -> io.BytesIO:
+    """Produce formatted landscape PDF report of auto-checkout events matching GTMS standard report style."""
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import inch
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
 
-    buf = io.BytesIO()
+    from patrol_backend.utils.pdf_report import draw_dashboard_pdf_header_and_footer
+
+    meta = resolve_auto_checkout_export_meta(request, requesting_user)
+    user_tz = meta.get("user_tz") or requesting_user
+
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf,
+        buffer,
         pagesize=landscape(A4),
-        leftMargin=0.4 * inch,
-        rightMargin=0.4 * inch,
-        topMargin=0.4 * inch,
-        bottomMargin=0.4 * inch,
+        leftMargin=0.2 * inch,
+        rightMargin=0.2 * inch,
+        topMargin=1.2 * inch,
+        bottomMargin=0.35 * inch,
     )
-
-    ctx = context or {}
-    loc_name = ctx.get("location_name", "All Locations")
-    period_str = ctx.get("period_display", "All Time")
-    summary = build_auto_checkout_summary(queryset)
-
-    now_local = to_user_timezone(timezone.now(), requesting_user)
-    generated_at_str = now_local.strftime("%d/%m/%Y %H:%M") if now_local else ""
+    doc.report_title = "Auto-Checkout Report"
+    doc.org_name = meta["org_name"]
+    doc.dept_label = meta.get("site_name") or meta["org_name"]
+    doc.range_start = meta["range_start"]
+    doc.range_end = meta["range_end"]
+    doc.printed_at = meta["printed_at"]
 
     styles = getSampleStyleSheet()
 
-    title_style = ParagraphStyle(
-        "AutoTitle",
+    def _para_style(name, **kwargs):
+        base = dict(
+            leftIndent=0,
+            rightIndent=0,
+            firstLineIndent=0,
+            spaceBefore=0,
+            spaceAfter=0,
+        )
+        base.update(kwargs)
+        return ParagraphStyle(name, **base)
+
+    cell_style = _para_style(
+        "AutoPdfCell",
         parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=15,
-        leading=18,
-        textColor=colors.HexColor("#1e293b"),
+        fontSize=6.5,
         alignment=TA_LEFT,
+        leading=8,
     )
-
-    sub_style = ParagraphStyle(
-        "AutoSub",
+    cell_center = _para_style(
+        "AutoPdfCellCenter",
         parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=12,
-        textColor=colors.HexColor("#64748b"),
-        alignment=TA_LEFT,
+        fontSize=6.5,
+        alignment=TA_CENTER,
+        leading=8,
     )
-
-    kpi_style = ParagraphStyle(
-        "AutoKPI",
+    header_style = _para_style(
+        "AutoPdfHeader",
         parent=styles["Normal"],
+        fontSize=6.5,
         fontName="Helvetica-Bold",
-        fontSize=9,
-        leading=11,
-        textColor=colors.HexColor("#1e293b"),
         alignment=TA_CENTER,
+        leading=8,
     )
 
-    th_style = ParagraphStyle(
-        "AutoTH",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8,
-        leading=10,
-        textColor=colors.white,
-        alignment=TA_CENTER,
-    )
+    data = [[Paragraph(h, header_style) for h in AUTO_CHECKOUT_EXPORT_HEADERS]]
 
-    td_style = ParagraphStyle(
-        "AutoTD",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.5,
-        leading=9.5,
-        textColor=colors.HexColor("#334155"),
-        alignment=TA_LEFT,
-    )
-
-    td_center = ParagraphStyle(
-        "AutoTDCenter",
-        parent=td_style,
-        alignment=TA_CENTER,
-    )
-
-    story = []
-
-    # Title & Metadata Header
-    header_data = [
-        [
-            Paragraph("<b>SMART PATROL — BOUNDARY AUTO-CHECKOUT REPORT</b>", title_style),
-            Paragraph(f"<b>Printed:</b> {generated_at_str}", ParagraphStyle("PRT", parent=sub_style, alignment=TA_RIGHT)),
-        ],
-        [
-            Paragraph(f"<b>Location:</b> {loc_name}  |  <b>Period:</b> {period_str}", sub_style),
-            Paragraph(f"<b>Total Events:</b> {summary['total_auto_checkouts']}", ParagraphStyle("TOT", parent=sub_style, alignment=TA_RIGHT)),
-        ],
-    ]
-    header_table = Table(header_data, colWidths=[doc.width * 0.7, doc.width * 0.3])
-    header_table.setStyle(
-        TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
-            ("TOPPADDING", (0, 0), (-1, -1), 1),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ])
-    )
-    story.append(header_table)
-    story.append(Spacer(1, 8))
-
-    # KPI Banner Table
-    kpi_data = [
-        [
-            Paragraph(f"<b>TOTAL AUTO-CHECKOUTS:</b> {summary['total_auto_checkouts']}", kpi_style),
-            Paragraph(f"<b>GUARDS AFFECTED:</b> {summary['unique_guards']}", kpi_style),
-            Paragraph(f"<b>SITES AFFECTED:</b> {summary['unique_sites']}", kpi_style),
-        ]
-    ]
-    kpi_table = Table(kpi_data, colWidths=[doc.width / 3.0] * 3)
-    kpi_table.setStyle(
-        TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f1f5f9")),
-            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ])
-    )
-    story.append(kpi_table)
-    story.append(Spacer(1, 10))
-
-    # Data Table
-    table_headers = [
-        Paragraph("<b>#</b>", th_style),
-        Paragraph("<b>Date & Time</b>", th_style),
-        Paragraph("<b>Guard</b>", th_style),
-        Paragraph("<b>Role</b>", th_style),
-        Paragraph("<b>Location</b>", th_style),
-        Paragraph("<b>Site Name</b>", th_style),
-        Paragraph("<b>Shift</b>", th_style),
-        Paragraph("<b>Coordinates</b>", th_style),
-    ]
-
-    col_widths = [
-        0.40 * inch,  # #
-        1.40 * inch,  # Date & Time
-        2.00 * inch,  # Guard
-        0.90 * inch,  # Role
-        1.80 * inch,  # Location
-        1.99 * inch,  # Site
-        1.20 * inch,  # Shift
-        1.20 * inch,  # Coordinates
-    ]
-
-    table_data = [table_headers]
-    s_no = 1
-
-    for log in queryset:
-        local_time = to_user_timezone(log.timestamp, requesting_user)
-        time_str = local_time.strftime("%d/%m/%Y %H:%M") if local_time else "—"
+    for idx, log in enumerate(queryset, start=1):
+        local_time = to_user_timezone(log.timestamp, user_tz)
+        time_str = local_time.strftime("%Y-%m-%d %H:%M") if local_time else "—"
 
         guard = log.guard
         guard_name = getattr(guard, "name", None) or getattr(guard, "email", "Unknown")
         emp_code = getattr(guard, "employee_code", "") or "—"
-        guard_html = f"<b>{guard_name}</b><br/><font color='#64748b' size=6.5>{emp_code}</font>"
-        role = getattr(guard, "role", "guard").upper()
-        location_name = log.org_location.name if log.org_location else "—"
+        role = (getattr(guard, "role", "guard") or "guard").upper()
         site_name = log.site.name if log.site else "—"
+        location_name = log.org_location.name if log.org_location else "—"
         shift_name = (getattr(log.shift, "name", None) or getattr(log.shift, "shift_name", None) or "—") if log.shift else "—"
+        coords_str = (
+            f"{float(log.latitude):.4f}, {float(log.longitude):.4f}"
+            if (log.latitude is not None and log.longitude is not None)
+            else "—"
+        )
 
-        coords = "—"
-        if log.latitude is not None and log.longitude is not None:
-            coords = f"{float(log.latitude):.4f}, {float(log.longitude):.4f}"
-
-        table_data.append([
-            Paragraph(str(s_no), td_center),
-            Paragraph(time_str, td_center),
-            Paragraph(guard_html, td_style),
-            Paragraph(role, td_center),
-            Paragraph(location_name, td_style),
-            Paragraph(site_name, td_style),
-            Paragraph(shift_name, td_style),
-            Paragraph(coords, td_center),
-        ])
-        s_no += 1
-
-    if s_no == 1:
-        table_data.append([
-            Paragraph("No auto-checkout events recorded.", td_center),
-            "", "", "", "", "", "", ""
+        data.append([
+            Paragraph(str(idx), cell_center),
+            Paragraph(time_str, cell_center),
+            Paragraph(guard_name, cell_style),
+            Paragraph(emp_code, cell_center),
+            Paragraph(role, cell_center),
+            Paragraph(site_name, cell_style),
+            Paragraph(location_name, cell_style),
+            Paragraph(shift_name, cell_style),
+            Paragraph(coords_str, cell_center),
         ])
 
-    data_table = Table(table_data, colWidths=col_widths, repeatRows=1)
-    table_style = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4338ca")),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-    ]
+    if len(data) == 1:
+        data.append(
+            [Paragraph("No auto-checkout records found", cell_style)]
+            + [""] * (len(AUTO_CHECKOUT_EXPORT_HEADERS) - 1)
+        )
 
-    for i in range(1, len(table_data)):
-        if i % 2 == 0:
-            table_style.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#f8fafc")))
+    # 9 columns: #, Date & Time, Guard, Emp Code, Role, Site, Location, Shift, Breach GPS
+    ratios = [0.04, 0.13, 0.16, 0.09, 0.08, 0.15, 0.13, 0.10, 0.12]
+    ratio_sum = sum(ratios)
+    col_widths = [doc.width * (r / ratio_sum) for r in ratios]
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9E1F2")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ]
+        )
+    )
 
-    if s_no == 1:
-        table_style.append(("SPAN", (0, 1), (-1, 1)))
-
-    data_table.setStyle(TableStyle(table_style))
-    story.append(data_table)
-
-    def _add_footer(canvas, d):
-        canvas.saveState()
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(colors.HexColor("#94a3b8"))
-        canvas.drawString(d.leftMargin, 0.25 * inch, "Smart Patrol — Confidential")
-        canvas.drawRightString(d.leftMargin + d.width, 0.25 * inch, f"Page {canvas.getPageNumber()}")
-        canvas.restoreState()
-
-    doc.build(story, onFirstPage=_add_footer, onLaterPages=_add_footer)
-    buf.seek(0)
-    return buf
+    doc.build(
+        [table],
+        onFirstPage=draw_dashboard_pdf_header_and_footer,
+        onLaterPages=draw_dashboard_pdf_header_and_footer,
+    )
+    buffer.seek(0)
+    return buffer
