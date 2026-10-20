@@ -287,7 +287,21 @@ def auto_checkout_user_on_boundary_breach(
 
     matched_site = checkin.site or site
 
-    # Create checkout CheckInLog
+    reason_text = "Boundary breach: moved outside site boundary"
+    try:
+        if matched_site and getattr(matched_site, "latitude", None) and getattr(matched_site, "longitude", None):
+            from geopy.distance import geodesic
+            dist_m = geodesic((lat, lng), (float(matched_site.latitude), float(matched_site.longitude))).meters
+            radius_m = getattr(matched_site, "boundary_radius_m", None)
+            if radius_m and float(radius_m) > 0:
+                excess_m = max(0.0, dist_m - float(radius_m))
+                reason_text = f"Boundary breach: {dist_m:.1f}m from site center (radius: {float(radius_m):.1f}m, {excess_m:.1f}m outside)"
+            else:
+                reason_text = f"Boundary breach: {dist_m:.1f}m from site center"
+    except Exception:
+        pass
+
+    # Create checkout CheckInLog with auto-checkout audit tracking
     checkout_log = CheckInLog.objects.create(
         guard=user,
         assignment=assignment,
@@ -297,6 +311,8 @@ def auto_checkout_user_on_boundary_breach(
         latitude=lat,
         longitude=lng,
         site=matched_site,
+        is_auto_checkout=True,
+        auto_checkout_reason=reason_text,
     )
 
     # Explicitly ensure checkout_time, last_checkout_time and status are set

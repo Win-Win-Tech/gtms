@@ -224,3 +224,121 @@ class LiveTrackingViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.error(f"[HISTORY] Error: {str(e)}", exc_info=True)
             return Response({'error': 'Failed to retrieve location history'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='auto-checkout-logs')
+    def auto_checkout_logs(self, request):
+        """
+        Returns paginated list of auto-checkout events (boundary breaches)
+        with summary statistics and role/location filtering.
+        """
+        try:
+            user = request.user
+            if user.is_anonymous:
+                return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            from .auto_checkout_report import (
+                filter_auto_checkout_queryset,
+                serialize_auto_checkout_log,
+                build_auto_checkout_summary,
+            )
+
+            qs = filter_auto_checkout_queryset(request, user)
+            total_count = qs.count()
+            summary = build_auto_checkout_summary(qs)
+
+            try:
+                page = max(1, int(request.query_params.get('page', 1)))
+                page_size = min(500, max(1, int(request.query_params.get('page_size', 50))))
+            except (ValueError, TypeError):
+                page = 1
+                page_size = 50
+
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            paged_logs = qs[start_idx:end_idx]
+
+            results = [serialize_auto_checkout_log(log, user) for log in paged_logs]
+
+            return Response({
+                'summary': summary,
+                'count': total_count,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': (total_count + page_size - 1) // page_size if page_size else 1,
+                'results': results,
+            }, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.error(f"[AUTO_CHECKOUT_LOGS] Error: {str(e)}", exc_info=True)
+            return Response({'error': 'Failed to retrieve auto-checkout logs'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='auto-checkout-logs/export-excel')
+    def export_auto_checkout_excel(self, request):
+        """Export auto-checkout events to styled Excel (.xlsx)."""
+        try:
+            user = request.user
+            if user.is_anonymous:
+                return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            from django.http import HttpResponse
+            from .auto_checkout_report import (
+                filter_auto_checkout_queryset,
+                generate_auto_checkout_excel,
+            )
+
+            qs = filter_auto_checkout_queryset(request, user)
+
+            start = request.query_params.get('start_date') or ''
+            end = request.query_params.get('end_date') or ''
+            period_str = f"{start} to {end}" if (start and end) else (start or end or "All Time")
+
+            context = {
+                'location_name': getattr(user, 'location', None) and user.location.name or 'All Locations',
+                'period_display': period_str,
+            }
+
+            buf = generate_auto_checkout_excel(qs, user, context)
+            response = HttpResponse(
+                buf.getvalue(),
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            )
+            response['Content-Disposition'] = 'attachment; filename="boundary_auto_checkouts.xlsx"'
+            return response
+
+        except Exception as e:
+            logger.error(f"[EXPORT_AUTO_CHECKOUT_EXCEL] Error: {str(e)}", exc_info=True)
+            return Response({'error': 'Failed to export auto-checkout logs to Excel'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='auto-checkout-logs/export-pdf')
+    def export_auto_checkout_pdf(self, request):
+        """Export auto-checkout events to styled PDF (.pdf)."""
+        try:
+            user = request.user
+            if user.is_anonymous:
+                return Response({'error': 'Authentication required'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            from django.http import HttpResponse
+            from .auto_checkout_report import (
+                filter_auto_checkout_queryset,
+                generate_auto_checkout_pdf,
+            )
+
+            qs = filter_auto_checkout_queryset(request, user)
+
+            start = request.query_params.get('start_date') or ''
+            end = request.query_params.get('end_date') or ''
+            period_str = f"{start} to {end}" if (start and end) else (start or end or "All Time")
+
+            context = {
+                'location_name': getattr(user, 'location', None) and user.location.name or 'All Locations',
+                'period_display': period_str,
+            }
+
+            buf = generate_auto_checkout_pdf(qs, user, context)
+            response = HttpResponse(buf.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = 'attachment; filename="boundary_auto_checkouts.pdf"'
+            return response
+
+        except Exception as e:
+            logger.error(f"[EXPORT_AUTO_CHECKOUT_PDF] Error: {str(e)}", exc_info=True)
+            return Response({'error': 'Failed to export auto-checkout logs to PDF'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
