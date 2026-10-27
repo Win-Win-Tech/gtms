@@ -10,6 +10,7 @@ from .models import (
     CheckpointTemplate,
     ChecklistItem,
     ChecklistTemplate,
+    Vendor,
 )
 from django.utils.timezone import now
 from uuid import UUID
@@ -326,3 +327,40 @@ class ChecklistTemplateSerializer(serializers.ModelSerializer):
         model = ChecklistTemplate
         fields = '__all__'
         read_only_fields = ['id', 'created_on', 'modified_on', 'created_by', 'modified_by', 'deleted_on', 'deleted_by', 'is_deleted']
+
+
+class VendorSerializer(serializers.ModelSerializer):
+    location_name = serializers.CharField(source="location.name", read_only=True)
+    location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.all())
+    users_count = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = Vendor
+        fields = [
+            "id",
+            "name",
+            "location",
+            "location_name",
+            "contact_person",
+            "phone_no",
+            "email",
+            "is_active",
+            "users_count",
+            "created_on",
+            "modified_on",
+        ]
+        read_only_fields = ["id", "created_on", "modified_on"]
+
+    def to_internal_value(self, data):
+        # Backward compatibility in case a client passes location_id or locationId
+        mutable = data.copy() if hasattr(data, 'copy') else dict(data)
+        loc = mutable.get('location') or mutable.get('location_id') or mutable.get('locationId')
+        if loc:
+            mutable['location'] = loc
+        mutable.pop('locationId', None)
+        mutable.pop('location_id', None)
+        return super().to_internal_value(mutable)
+
+    def get_users_count(self, obj):
+        return obj.users.filter(is_deleted=False).count()
+

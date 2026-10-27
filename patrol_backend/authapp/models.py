@@ -68,6 +68,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         blank=True,
         related_name="users"
     )
+    vendor = models.ForeignKey(
+        'scheduler.Vendor',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="users"
+    )
     employee_code = models.CharField(max_length=64, null=True, blank=True)
     face_photo = models.ImageField(
         upload_to="user_faces/",

@@ -138,6 +138,63 @@ class LocationSite(models.Model):
         return f"{self.location.name} - {self.name}"
 
 
+class Vendor(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255)
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name="vendors")
+    contact_person = models.CharField(max_length=255, blank=True, null=True)
+    phone_no = models.CharField(max_length=20, blank=True, null=True)
+    email = models.EmailField(max_length=255, blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+
+    # Audit fields
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vendor_created",
+    )
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vendor_modified",
+    )
+
+    # Soft delete
+    is_deleted = models.BooleanField(default=False)
+    deleted_on = models.DateTimeField(null=True, blank=True)
+    deleted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="vendor_deleted",
+    )
+
+    # Managers
+    objects = ActiveManager()
+    all_objects = models.Manager()
+
+    def delete(self, user=None, using=None, keep_parents=False):
+        self.is_deleted = True
+        self.deleted_on = timezone.now()
+        if user:
+            self.deleted_by = user
+        self.save()
+
+    class Meta:
+        ordering = ["name"]
+        unique_together = ("name", "location")
+
+    def __str__(self):
+        return f"{self.name} ({self.location.name if self.location else ''})"
+
+
 class SiteCamera(models.Model):
     """
     CCTV camera attached to a LocationSite (ANPR / live view).

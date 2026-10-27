@@ -19,6 +19,8 @@ class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
     location = SchedulerLocationSerializer(read_only=True)  # use existing serializer
     locationId = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    vendor = serializers.SerializerMethodField(read_only=True)
+    vendor_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
     timezone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     face_photo = serializers.ImageField(required=False, allow_null=True)
     remove_face_photo = serializers.BooleanField(write_only=True, required=False, default=False)
@@ -26,12 +28,20 @@ class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = ['id', 'email', 'password', 'role', 'is_active', 'created_on',
-                  'modified_on', 'name', 'phone_no', 'location', 'locationId', 'aadhar_no', 'timezone', 'employee_code',
+                  'modified_on', 'name', 'phone_no', 'location', 'locationId',
+                  'vendor', 'vendor_id',
+                  'aadhar_no', 'timezone', 'employee_code',
                   'face_photo', 'remove_face_photo']
         read_only_fields = ['id', 'is_active', 'created_on', 'modified_on']
 
+    def get_vendor(self, obj):
+        if getattr(obj, "vendor_id", None) and obj.vendor:
+            return {"id": str(obj.vendor.id), "name": obj.vendor.name}
+        return None
+
     def create(self, validated_data):
         location_id = validated_data.pop('locationId', None)
+        vendor_id = validated_data.pop('vendor_id', None)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
         validated_data.pop('remove_face_photo', None)
@@ -42,6 +52,9 @@ class UserSerializer(serializers.ModelSerializer):
         if location_id:
             from scheduler.models import Location
             user.location = Location.objects.get(id=location_id)
+        if vendor_id:
+            from scheduler.models import Vendor
+            user.vendor = Vendor.objects.filter(id=vendor_id).first()
         
         # Timezone logic: If admin sends timezone, use it; otherwise, get from location's admin
         if timezone:
@@ -67,6 +80,8 @@ class UserSerializer(serializers.ModelSerializer):
             str(instance.location_id) if getattr(instance, "location_id", None) else None
         )
         location_id = validated_data.pop('locationId', None)
+        _sentinel = object()
+        vendor_id = validated_data.pop('vendor_id', _sentinel)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
         remove_face_photo = validated_data.pop('remove_face_photo', False)
@@ -83,6 +98,12 @@ class UserSerializer(serializers.ModelSerializer):
         if location_id:
             from scheduler.models import Location
             instance.location = Location.objects.get(id=location_id)
+        if vendor_id is not _sentinel:
+            if vendor_id:
+                from scheduler.models import Vendor
+                instance.vendor = Vendor.objects.filter(id=vendor_id).first()
+            else:
+                instance.vendor = None
         
         # Timezone logic: If admin sends timezone, use it; otherwise, get from location's admin
         if timezone:
@@ -113,14 +134,20 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserListSerializer(serializers.ModelSerializer):
     location = SchedulerLocationSerializer(read_only=True)
+    vendor = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = User
         # Intentionally exclude face_photo/face_encoding for list performance
         fields = [
             'id', 'email', 'role', 'is_active', 'created_on', 'modified_on',
-            'name', 'phone_no', 'location', 'aadhar_no', 'timezone', 'employee_code'
+            'name', 'phone_no', 'location', 'vendor', 'aadhar_no', 'timezone', 'employee_code'
         ]
+
+    def get_vendor(self, obj):
+        if getattr(obj, "vendor_id", None) and obj.vendor:
+            return {"id": str(obj.vendor.id), "name": obj.vendor.name}
+        return None
 
 
 def sync_user_face_and_index(user, old_location_id=None, new_location_id=None):

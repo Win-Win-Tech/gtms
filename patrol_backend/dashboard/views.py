@@ -5734,6 +5734,13 @@ class AttendanceCheckinV4ListView(generics.ListAPIView):
         if site_id:
             queryset = queryset.filter(site_id=site_id)
 
+        vendor_id = self.request.query_params.get("vendor_id") or self.request.query_params.get("vendor")
+        if vendor_id:
+            if str(vendor_id).lower() in ("none", "unassigned", "null"):
+                queryset = queryset.filter(guard__vendor__isnull=True)
+            elif str(vendor_id).lower() != "all":
+                queryset = queryset.filter(guard__vendor_id=vendor_id)
+
         status = self.request.query_params.get("status")
         if status:
             queryset = _apply_attendance_v3_status_filter(queryset, status)
@@ -6636,6 +6643,12 @@ def generate_attendance_v4_excel_report_internal(
         queryset = queryset.filter(site_scope_extra_q)
     elif site_id:
         queryset = queryset.filter(site_id=site_id)
+    vendor_id = request.query_params.get("vendor_id") or request.query_params.get("vendor") if request else None
+    if vendor_id:
+        if str(vendor_id).lower() in ("none", "unassigned", "null"):
+            queryset = queryset.filter(guard__vendor__isnull=True)
+        elif str(vendor_id).lower() != "all":
+            queryset = queryset.filter(guard__vendor_id=vendor_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
     if status_filter:
@@ -6699,7 +6712,7 @@ def generate_attendance_v4_excel_report_internal(
     ws = wb.active
     ws.title = "Attendance Checkins V4"
     ws.append([
-        "Shift Date", "Name", "Emp Code", "Designation", "Shift", "Location",
+        "Shift Date", "Name", "Emp Code", "Designation", "Vendor", "Shift", "Location",
         "First Checkin", "Last Checkout", "Checkin Count", "Checkout Count",
         "Live State", "Sessions", "Duration (HH:MM)", "PA Status", "Remarks",
     ])
@@ -6754,6 +6767,7 @@ def generate_attendance_v4_excel_report_internal(
         effective_dt = first_checkin or (to_user_timezone(obj.last_checkin_time, user_tz) if obj.last_checkin_time else to_user_timezone(obj.created_on, user_tz))
         s_date_key = obj.shift_date or (effective_dt.date() if effective_dt else date.min)
         
+        vendor_str = getattr(getattr(obj.guard, "vendor", None), "name", None) or "-"
         rows.append((
             s_date_key,
             effective_dt or datetime.min.replace(tzinfo=user_tz),
@@ -6762,6 +6776,7 @@ def generate_attendance_v4_excel_report_internal(
                 obj.guard.name,
                 getattr(obj.guard, "employee_code", None) or "",
                 (getattr(obj.guard, "role", None) or "").strip(),
+                vendor_str,
                 obj.shift.name if obj.shift else "",
                 obj.org_location.name if obj.org_location else "",
                 first_checkin.strftime('%Y-%m-%d %H:%M:%S') if first_checkin else "",
@@ -7471,6 +7486,12 @@ def _get_monthly_attendance_summary_data_v2(
 
     aq = Assignment.objects.filter(start_date__lte=end_date, end_date__gte=start_date, is_deleted=False)
     if location_id: aq = aq.filter(location_id=location_id)
+    vendor_id = request.query_params.get("vendor_id") or request.query_params.get("vendor") if request else None
+    if vendor_id:
+        if str(vendor_id).lower() in ("none", "unassigned", "null"):
+            aq = aq.filter(guard__vendor__isnull=True)
+        elif str(vendor_id).lower() != "all":
+            aq = aq.filter(guard__vendor_id=vendor_id)
     if user_id: aq = aq.filter(guard_id=user_id)
     elif search and str(search).strip():
         s = str(search).strip()
@@ -7555,6 +7576,8 @@ def _get_monthly_attendance_summary_data_v2(
             "location": data["location"], 
             "employee_code": getattr(guard, "employee_code", None) or "", 
             "designation": (getattr(guard, "role", None) or "").strip(),
+            "vendor_id": str(guard.vendor_id) if getattr(guard, "vendor_id", None) else None,
+            "vendor_name": guard.vendor.name if getattr(guard, "vendor", None) else "-",
             "site_name": site_names.get(str(site_id)) if site_id else "",
             "site_map": {},
             "other_site_map": {},
@@ -7612,7 +7635,7 @@ def generate_monthly_attendance_summary_excel_internal_v2(
     wb = Workbook(); ws = wb.active; ws.title = "Monthly Attendance Summary"
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side; from openpyxl.utils import get_column_letter
     groups = _monthly_group_rows_for_excel(summary_data, date_range)
-    l_heads = ["SNO", "ID NO", "RANK", "NAME"]; 
+    l_heads = ["SNO", "ID NO", "RANK", "NAME", "VENDOR"]; 
     if include_location_column: l_heads.append("LOCATION")
     r_heads, d_heads, dy_heads = ["Total Days", "Week off"], [f"{d.day}-{d.strftime('%b-%y')}" for d in date_range], [d.strftime("%a").upper() for d in date_range]
     total_cols = len(l_heads + d_heads + r_heads); m_lbl, l_lbl = start_date.strftime("%B-%Y").upper(), "ALL LOCATIONS"
@@ -7654,7 +7677,7 @@ def generate_monthly_attendance_summary_excel_internal_v2(
                 elif v: u_t_d += 1
                 r_day_t[rank][k] += 1 if v and v != "W" else 0; r_wk_t[rank][k] += 1 if v == "W" else 0
             r_t_d[rank], r_t_w[rank] = r_t_d[rank] + u_t_d, r_t_w[rank] + u_w_d
-            row_v = [ser, m.get("employee_code") or "", rank, str(m.get("name") or "").upper()]
+            row_v = [ser, m.get("employee_code") or "", rank, str(m.get("name") or "").upper(), m.get("vendor_name") or "-"]
             if include_location_column: row_v.append(m.get("location") or "")
             row_v.extend(stats); row_v.extend([u_t_d, u_w_d])
             for c_n, val in enumerate(row_v, start=1):
@@ -7664,7 +7687,7 @@ def generate_monthly_attendance_summary_excel_internal_v2(
                 else: cell.alignment = Alignment(horizontal="center", vertical="center")
                 if len(l_heads) < c_n <= (len(l_heads) + len(date_range)) and str(val).upper() == "W": cell.fill = w_f
             ws.row_dimensions[cur_r].height, cur_r, ser = 20, cur_r + 1, ser + 1
-        sub_v = ["", "", "TOTAL PRESENT", ""]; 
+        sub_v = ["", "", "TOTAL PRESENT", "", ""]; 
         if include_location_column: sub_v.append("")
         d_ts = [group["date_present_totals"].get(d.strftime("%d-%b"), 0) for d in date_range]
         sub_v.extend(d_ts); sub_v.extend([sum(d_ts), sum(group["date_weekoff_totals"].values())])
@@ -7673,7 +7696,7 @@ def generate_monthly_attendance_summary_excel_internal_v2(
             cell.border = sbrd if c_n <= len(l_heads) + len(d_heads) else brd
         ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
     for r_n in sorted(r_day_t.keys()):
-        f_v = ["", "", r_n, ""]; 
+        f_v = ["", "", r_n, "", ""]; 
         if include_location_column: f_v.append("")
         d_vs = [r_day_t[r_n].get(d.strftime("%d-%b"), 0) for d in date_range]
         f_v.extend(d_vs); f_v.extend([r_t_d[r_n], r_t_w[r_n]])
@@ -7681,13 +7704,13 @@ def generate_monthly_attendance_summary_excel_internal_v2(
             cell = ws.cell(row=cur_r, column=c_n, value=val); cell.font, cell.border, cell.alignment = Font(name="Arial", bold=True, size=10), brd, Alignment(horizontal="center", vertical="center")
         ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
     wk_d_vs = [sum(r_wk_t[r].get(d.strftime("%d-%b"), 0) for r in r_wk_t.keys()) for d in date_range]
-    wk_t_v = ["", "", "WEEK OFF", ""]; 
+    wk_t_v = ["", "", "WEEK OFF", "", ""]; 
     if include_location_column: wk_t_v.append("")
     wk_t_v.extend(wk_d_vs); wk_t_v.extend([sum(wk_d_vs), sum(r_t_w.values())])
     for c_n, val in enumerate(wk_t_v, start=1):
         cell = ws.cell(row=cur_r, column=c_n, value=val); cell.font, cell.border, cell.alignment = Font(name="Arial", bold=True, size=10), brd, Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[cur_r].height, cur_r = 20, cur_r + 1
-    h_c_v = ["", "", "Total Head count", ""]; 
+    h_c_v = ["", "", "Total Head count", "", ""]; 
     if include_location_column: h_c_v.append("")
     d_hccs = [sum(1 for r in summary_data if _monthly_normalize_status(r.get(d.strftime("%d-%b"), "")) != "") for d in date_range]
     h_c_v.extend(d_hccs); h_c_v.extend([sum(r_t_d.values()), sum(r_t_w.values())])

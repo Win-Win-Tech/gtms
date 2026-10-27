@@ -344,10 +344,12 @@ def build_daily_attendance_detail_pdf_bytes(context, employee_groups):
         block = []
         emp_code = group.get("emp_code") or "—"
         emp_name = group.get("emp_name") or "—"
+        vendor = group.get("vendor") or "—"
         block.append(
             Paragraph(
                 f"Emp Code: {emp_code} &nbsp;&nbsp;&nbsp;&nbsp; "
-                f"Employee Name: {emp_name}",
+                f"Employee Name: {emp_name} &nbsp;&nbsp;&nbsp;&nbsp; "
+                f"Vendor: {vendor}",
                 emp_line_style,
             )
         )

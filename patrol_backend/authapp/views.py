@@ -392,6 +392,12 @@ class UserListView(generics.ListAPIView):
                 queryset = queryset.filter(role__iexact=role)
             if location_id:
                 queryset = queryset.filter(location_id=location_id)
+            vendor_id = self.request.query_params.get('vendor_id') or self.request.query_params.get('vendor')
+            if vendor_id:
+                if str(vendor_id).lower() in ('none', 'unassigned', 'null'):
+                    queryset = queryset.filter(vendor__isnull=True)
+                elif str(vendor_id).lower() != 'all':
+                    queryset = queryset.filter(vendor_id=vendor_id)
         return queryset
 
     def list(self, request, *args, **kwargs):

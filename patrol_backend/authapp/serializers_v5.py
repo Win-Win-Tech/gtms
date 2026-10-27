@@ -80,6 +80,11 @@ class UserSerializerV5(UserSerializer):
         if "all_org_sites" in mutable:
             mutable["all_org_sites"] = _parse_bool(mutable.get("all_org_sites"), False)
 
+        if "vendor_id" in mutable:
+            vid = mutable.get("vendor_id")
+            if vid in ("", "null", "none", None):
+                mutable["vendor_id"] = None
+
         return super().to_internal_value(mutable)
 
     def get_assigned_sites(self, obj):

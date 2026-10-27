@@ -348,6 +348,8 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
     shift_name = serializers.CharField(source="shift.name", read_only=True)
     location_name = serializers.CharField(source="org_location.name", read_only=True)
     site_name = serializers.CharField(source="site.name", read_only=True)
+    vendor_id = serializers.CharField(source="guard.vendor_id", read_only=True, default=None)
+    vendor_name = serializers.CharField(source="guard.vendor.name", read_only=True, default="-")
     shift_time = serializers.SerializerMethodField()
     live_state = serializers.SerializerMethodField()
     log_pairs = serializers.SerializerMethodField()
@@ -363,6 +365,8 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
             "guard_name",
             "employee_code",
             "user_role",
+            "vendor_id",
+            "vendor_name",
             "checkin_time",
             "checkout_time",
             "last_checkin_time",

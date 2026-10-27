@@ -145,7 +145,7 @@ def gather_attendance_v4_export_context(
         apply_status_filter_fn = _apply_attendance_v3_status_filter
 
     queryset = AttendanceCheckin.objects.select_related(
-        "guard", "shift", "org_location", "site", "assignment"
+        "guard__vendor", "shift", "org_location", "site", "assignment"
     ).exclude(guard__role__iexact="admin")
 
     if request:
@@ -196,6 +196,12 @@ def gather_attendance_v4_export_context(
         queryset = queryset.filter(site_scope_extra_q)
     elif site_id:
         queryset = queryset.filter(site_id=site_id)
+    vendor_id = request.query_params.get("vendor_id") or request.query_params.get("vendor") if request else None
+    if vendor_id:
+        if str(vendor_id).lower() in ("none", "unassigned", "null"):
+            queryset = queryset.filter(guard__vendor__isnull=True)
+        elif str(vendor_id).lower() != "all":
+            queryset = queryset.filter(guard__vendor_id=vendor_id)
     if shift_id:
         queryset = queryset.filter(shift_id=shift_id)
     if status_filter:
@@ -281,12 +287,14 @@ def gather_attendance_v4_export_context(
         sched_in = obj.shift.start_time.strftime("%H:%M") if obj.shift else ""
         sched_out = obj.shift.end_time.strftime("%H:%M") if obj.shift else ""
 
+        vendor_str = getattr(getattr(obj.guard, "vendor", None), "name", None) or "—"
         detail_rows.append(
             {
                 "guard_id": obj.guard_id,
                 "emp_code": getattr(obj.guard, "employee_code", None) or "",
                 "emp_name": obj.guard.name or "",
                 "designation": (getattr(obj.guard, "role", None) or "").strip(),
+                "vendor": vendor_str,
                 "att_date": shift_day,
                 "att_date_display": shift_day.strftime("%d-%b-%Y") if shift_day else "",
                 "in_time": first_checkin.strftime("%H:%M") if first_checkin else "",
@@ -328,9 +336,9 @@ def gather_attendance_v4_export_context(
             start_date__lte=range_end,
             end_date__gte=range_start,
             is_deleted=False
-        ).select_related("guard", "shift", "location")
+        ).select_related("guard__vendor", "shift", "location")
 
-        users_qs = User.objects.filter(is_active=True, is_deleted=False).select_related("location").exclude(role__iexact="admin")
+        users_qs = User.objects.filter(is_active=True, is_deleted=False).select_related("location", "vendor").exclude(role__iexact="admin")
 
         if guard_id:
             assignments = assignments.filter(guard_id=guard_id)
@@ -359,6 +367,13 @@ def gather_attendance_v4_export_context(
                 users_qs = users_qs.none()
         if shift_id:
             assignments = assignments.filter(shift_id=shift_id)
+        if vendor_id:
+            if str(vendor_id).lower() in ("none", "unassigned", "null"):
+                assignments = assignments.filter(guard__vendor__isnull=True)
+                users_qs = users_qs.filter(vendor__isnull=True)
+            elif str(vendor_id).lower() != "all":
+                assignments = assignments.filter(guard__vendor_id=vendor_id)
+                users_qs = users_qs.filter(vendor_id=vendor_id)
 
         # Cache the users queryset to a list to prevent running a DB query on every date loop iteration
         users_list = list(users_qs)
@@ -398,12 +413,14 @@ def gather_attendance_v4_export_context(
                     shift_name = assignment.shift.name if (assignment and assignment.shift) else ""
                     loc_name = (assignment.location.name if (assignment and assignment.location) else None) or (u.location.name if (u and u.location) else "")
 
+                    u_vendor_name = getattr(getattr(u, "vendor", None), "name", None) or "—"
                     detail_rows.append(
                         {
                             "guard_id": u.id,
                             "emp_code": getattr(u, "employee_code", None) or "",
                             "emp_name": u.name or "",
                             "designation": (getattr(u, "role", None) or "").strip(),
+                            "vendor": u_vendor_name,
                             "att_date": curr_d,
                             "att_date_display": curr_d.strftime("%d-%b-%Y"),
                             "in_time": "",
@@ -456,11 +473,17 @@ def group_detail_rows_by_employee(detail_rows):
     for row in detail_rows:
         gid = row["guard_id"]
         grouped[gid].append(row)
-        meta[gid] = {
-            "emp_code": row["emp_code"],
-            "emp_name": row["emp_name"],
-            "designation": row["designation"],
-        }
+        vendor_val = row.get("vendor")
+        if gid not in meta:
+            meta[gid] = {
+                "emp_code": row.get("emp_code") or "",
+                "emp_name": row.get("emp_name") or "",
+                "designation": row.get("designation") or "",
+                "vendor": vendor_val or "—",
+            }
+        elif vendor_val and vendor_val != "—":
+            meta[gid]["vendor"] = vendor_val
+
     order = sorted(
         grouped.keys(),
         key=lambda g: (
@@ -474,12 +497,21 @@ def group_detail_rows_by_employee(detail_rows):
         total_minutes = sum(int(r.get("work_minutes") or 0) for r in rows)
         present_days = sum(1 for r in rows if r.get("status") == "Present")
         absent_days = sum(1 for r in rows if r.get("status") == "Absent")
+        vendor_name = meta[gid].get("vendor")
+        if not vendor_name or vendor_name == "—":
+            from authapp.models import User
+            u = User.objects.filter(id=gid).select_related("vendor").first()
+            if u and u.vendor:
+                vendor_name = u.vendor.name
+            else:
+                vendor_name = "—"
         result.append(
             {
                 "guard_id": gid,
                 "emp_code": meta[gid]["emp_code"],
                 "emp_name": meta[gid]["emp_name"],
                 "designation": meta[gid]["designation"],
+                "vendor": vendor_name,
                 "rows": rows,
                 "total_duration": _format_hhmm(total_minutes),
                 "present_days": present_days,

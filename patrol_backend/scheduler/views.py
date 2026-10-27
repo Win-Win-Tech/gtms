@@ -2,7 +2,7 @@ import uuid
 
 from rest_framework import viewsets, status as http_status
 from django.db.models import Q, F
-from .models import Location, LocationSite, Shift, Assignment, Checkpoint, SiteSetting
+from .models import Location, LocationSite, Shift, Assignment, Checkpoint, SiteSetting, Vendor
 from checkin.models import CheckIn
 from .serializers import (
     LocationSerializer,
@@ -10,7 +10,8 @@ from .serializers import (
     AssignmentSerializer,
     CheckpointSerializer,
     SiteSettingSerializer,
-    LocationSiteSerializer
+    LocationSiteSerializer,
+    VendorSerializer,
 )
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -339,7 +340,49 @@ class ShiftViewSet(viewsets.ModelViewSet):
             return Response(serializer.data)
         except Exception as e:
             logger.error(f"Error fetching shifts by location: {e}", exc_info=True)
-            return Response({'error': 'Failed to retrieve shifts.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': 'Failed to retrieve shifts.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class VendorViewSet(viewsets.ModelViewSet):
+    queryset = Vendor.objects.filter(is_deleted=False)
+    serializer_class = VendorSerializer
+
+    def get_queryset(self):
+        qs = Vendor.objects.filter(is_deleted=False)
+        location_id = self.request.query_params.get("location_id") or self.request.query_params.get("location")
+        if location_id and location_id != "all":
+            qs = qs.filter(location_id=location_id)
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search)
+                | Q(contact_person__icontains=search)
+                | Q(phone_no__icontains=search)
+                | Q(email__icontains=search)
+            )
+        return qs.order_by("name")
+
+    def perform_create(self, serializer):
+        user = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+        serializer.save(created_by=user, modified_by=user)
+
+    def perform_update(self, serializer):
+        user = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+        serializer.save(modified_by=user)
+
+    def perform_destroy(self, instance):
+        user = self.request.user if getattr(self.request, "user", None) and self.request.user.is_authenticated else None
+        instance.delete(user=user)
+
+    @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
+    def by_location(self, request, location_id=None):
+        try:
+            vendors = Vendor.objects.filter(location_id=location_id, is_deleted=False).order_by("name")
+            serializer = self.get_serializer(vendors, many=True)
+            return Response(serializer.data)
+        except Exception as e:
+            logger.error(f"Error fetching vendors by location: {e}", exc_info=True)
+            return Response({'error': 'Failed to retrieve vendors.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class AssignmentViewSet(viewsets.ModelViewSet):

@@ -80,6 +80,13 @@ def filter_auto_checkout_queryset(request, user):
             | Q(auto_checkout_reason__icontains=search)
         )
 
+    vendor_id = request.query_params.get("vendor_id") or request.query_params.get("vendor")
+    if vendor_id and vendor_id not in ("All", "all", "null"):
+        if str(vendor_id).lower() in ("none", "unassigned"):
+            qs = qs.filter(guard__vendor__isnull=True)
+        else:
+            qs = qs.filter(guard__vendor_id=vendor_id)
+
     # Date range filtering
     start_date_str = request.query_params.get("start_date")
     end_date_str = request.query_params.get("end_date")
@@ -124,6 +131,8 @@ def serialize_auto_checkout_log(log: CheckInLog, requesting_user) -> dict:
         "guard_email": getattr(guard, "email", ""),
         "guard_phone": getattr(guard, "phone", "") or "",
         "role": getattr(guard, "role", "guard"),
+        "vendor_id": str(guard.vendor_id) if getattr(guard, "vendor_id", None) else None,
+        "vendor_name": guard.vendor.name if getattr(guard, "vendor", None) else "—",
         "site_id": str(site.id) if site else None,
         "site_name": site.name if site else "—",
         "org_location_id": str(org_loc.id) if org_loc else None,
@@ -154,6 +163,7 @@ AUTO_CHECKOUT_EXPORT_HEADERS = [
     "Guard",
     "Emp Code",
     "Role",
+    "Vendor",
     "Site",
     "Location",
     "Shift",
@@ -288,12 +298,14 @@ def generate_auto_checkout_excel(queryset, requesting_user, request=None, contex
             else "—"
         )
 
+        vendor_name = getattr(getattr(guard, "vendor", None), "name", None) or "—"
         row_data = [
             idx,
             time_str,
             guard_name,
             emp_code,
             role,
+            vendor_name,
             site_name,
             location_name,
             shift_name,
@@ -417,12 +429,14 @@ def generate_auto_checkout_pdf(queryset, requesting_user, request=None, context:
             else "—"
         )
 
+        vendor_name = getattr(getattr(guard, "vendor", None), "name", None) or "—"
         data.append([
             Paragraph(str(idx), cell_center),
             Paragraph(time_str, cell_center),
             Paragraph(guard_name, cell_style),
             Paragraph(emp_code, cell_center),
             Paragraph(role, cell_center),
+            Paragraph(vendor_name, cell_style),
             Paragraph(site_name, cell_style),
             Paragraph(location_name, cell_style),
             Paragraph(shift_name, cell_style),
@@ -435,8 +449,8 @@ def generate_auto_checkout_pdf(queryset, requesting_user, request=None, context:
             + [""] * (len(AUTO_CHECKOUT_EXPORT_HEADERS) - 1)
         )
 
-    # 9 columns: #, Date & Time, Guard, Emp Code, Role, Site, Location, Shift, Breach GPS
-    ratios = [0.04, 0.13, 0.16, 0.09, 0.08, 0.15, 0.13, 0.10, 0.12]
+    # 10 columns: #, Date & Time, Guard, Emp Code, Role, Vendor, Site, Location, Shift, Breach GPS
+    ratios = [0.04, 0.12, 0.14, 0.08, 0.07, 0.11, 0.14, 0.11, 0.09, 0.10]
     ratio_sum = sum(ratios)
     col_widths = [doc.width * (r / ratio_sum) for r in ratios]
     table = Table(data, colWidths=col_widths, repeatRows=1)

@@ -9,6 +9,7 @@ from .views import (
     CheckpointTemplateViewSet,
     ChecklistItemViewSet,
     ChecklistTemplateViewSet,
+    VendorViewSet,
     AppVersionCheckView,
 )
 from .views_v5 import AssignmentViewSetV5
@@ -22,6 +23,7 @@ from .views_cameras import (
 router = DefaultRouter()
 router.register('locations', LocationViewSet)
 router.register('shifts', ShiftViewSet)
+router.register('vendors', VendorViewSet, basename='vendor')
 router.register('assignments', AssignmentViewSet)
 router.register('checkpoints', CheckpointViewSet)
 router.register('site-settings', SiteSettingViewSet)
