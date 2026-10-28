@@ -13,6 +13,7 @@ from .views import (
     RoleViewSet,
     MobileSelfProfileView,
     RefreshTokenView,
+    MobileConsentView,
 )
 from .views_v5 import (
     MySitesViewV5,
@@ -30,6 +31,8 @@ router.register(r'auth/roles', RoleViewSet, basename='roles')
 urlpatterns = [
     path('auth/users/', UserCreateView.as_view(), name='create_user'),
     path('auth/mobile/profile/', MobileSelfProfileView.as_view(), name='mobile_self_profile'),
+    path('auth/consent/', MobileConsentView.as_view(), name='mobile_consent'),
+    path('auth/mobile/consent/', MobileConsentView.as_view(), name='mobile_consent_alias'),
     path('auth/login/', LoginView.as_view(), name='login_user'),
     path('auth/refresh-token/', RefreshTokenView.as_view(), name='refresh_token'),
     path('auth/users/<uuid:id>/detail/', UserDetailView.as_view(), name='user_detail'),

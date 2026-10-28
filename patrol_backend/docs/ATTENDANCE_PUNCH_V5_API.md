@@ -210,6 +210,22 @@ Same body as above; `site_resolution` is `"nearest"`.
 }
 ```
 
+#### Already checked in (open session exists)
+
+**HTTP `400 Bad Request`**
+
+```json
+{
+  "error": "You already have an active check-in session. Please check out before checking in again.",
+  "code": "already_checked_in",
+  "checkin_time": "2026-10-27T09:13:01+05:30",
+  "checkin_site_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "checkin_site_name": "Ravee Home"
+}
+```
+*(Note: If a duplicate check-in arrives within 15 seconds, e.g. accidental double-tap or network retry, the API returns the existing check-in idempotently with HTTP `200 OK` rather than throwing an error or creating a duplicate row).*
+
+
 #### Face attendance enabled — no image
 
 **HTTP `400 Bad Request`**

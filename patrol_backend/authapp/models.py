@@ -96,6 +96,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         default=False,
         help_text="If true, user can access every site in their organisation (no UserSite rows needed).",
     )
+    is_consent_submitted = models.BooleanField(
+        default=False,
+        help_text="True if user submitted mobile app location and camera consent form",
+    )
+    consent_submitted_on = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Timestamp when user submitted consent form",
+    )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
 

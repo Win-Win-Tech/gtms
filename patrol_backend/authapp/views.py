@@ -9,6 +9,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from scheduler.models import SiteSetting, Location
 from django.db.models import Q, F
+from django.utils import timezone
 from .models import User, Role
 from .serializers import (
     UserSerializer,
@@ -50,6 +51,8 @@ def build_login_user_payload(request, user):
         "deleted_on": user.deleted_on,
         "deleted_by": str(user.deleted_by_id) if user.deleted_by_id else None,
         "face_photo": face_photo_url,
+        "is_profile_already_exist": bool(getattr(user, "face_photo", None) and user.face_photo.name),
+        "is_consent_submitted": bool(getattr(user, "is_consent_submitted", False)),
     }
 
 
@@ -211,6 +214,82 @@ class MobileSelfProfileView(APIView):
             payload = build_flat_profile_data(request, user)
             return Response(
                 api_response("success", "Profile updated successfully", payload, status.HTTP_200_OK),
+                status=status.HTTP_200_OK,
+            )
+        except Exception as e:
+            return Response(
+                api_response("error", str(e), None, status.HTTP_500_INTERNAL_SERVER_ERROR),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class MobileConsentView(APIView):
+    """
+    Mobile app: submit / view location and camera consent status.
+    POST /auth/consent/ - records consent agreement
+    GET  /auth/consent/ - retrieves current consent status
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        return Response(
+            api_response(
+                "success",
+                "Consent status",
+                {
+                    "user_id": str(user.id),
+                    "is_consent_submitted": bool(getattr(user, "is_consent_submitted", False)),
+                    "consent_submitted_on": (
+                        user.consent_submitted_on.isoformat()
+                        if getattr(user, "consent_submitted_on", None)
+                        else None
+                    ),
+                },
+                status.HTTP_200_OK,
+            ),
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request):
+        try:
+            user = request.user
+            if getattr(user, "is_deleted", False):
+                return Response(
+                    api_response("error", "User not found", None, status.HTTP_404_NOT_FOUND),
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            consent_given = request.data.get("is_consent_submitted")
+            if consent_given is None:
+                consent_given = request.data.get("consent", True)
+            if isinstance(consent_given, str):
+                consent_given = consent_given.strip().lower() in ("true", "1", "yes")
+
+            if not consent_given:
+                return Response(
+                    api_response("error", "Consent was declined", None, status.HTTP_400_BAD_REQUEST),
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            from django.utils import timezone
+
+            user.is_consent_submitted = True
+            user.consent_submitted_on = timezone.now()
+            user.save(update_fields=["is_consent_submitted", "consent_submitted_on", "modified_on"])
+
+            return Response(
+                api_response(
+                    "success",
+                    "Consent submitted successfully",
+                    {
+                        "user_id": str(user.id),
+                        "is_consent_submitted": True,
+                        "consent_submitted_on": user.consent_submitted_on.isoformat(),
+                    },
+                    status.HTTP_200_OK,
+                ),
                 status=status.HTTP_200_OK,
             )
         except Exception as e:
@@ -618,7 +697,4 @@ class RoleViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(location_id=updated.location_id)
             elif user.location and not user.is_superuser:
                 qs = qs.filter(location=user.location)
-            qs.update(role=new_name)
-
-
-    
+            qs.update(role=new_name)

@@ -1,6 +1,9 @@
 import logging
 import time as _time
+from datetime import timedelta
 
+from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
@@ -13,7 +16,7 @@ from rest_framework.views import APIView
 logger = logging.getLogger(__name__)
 
 from authapp.site_access import assert_caller_can_access_site, caller_can_access_site, get_site_or_error
-from patrol_backend.utils.timezone_utils import get_user_today, get_user_timezone_from_request
+from patrol_backend.utils.timezone_utils import get_user_today, get_user_timezone_from_request, to_user_timezone
 from scheduler.daily_site import apply_select_site, site_ids_payload
 from scheduler.models import Assignment
 
@@ -687,6 +690,7 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             build_log_window_filter,
             enforce_checkin_allowed_after_checkout,
             get_or_create_attendance_for_shift_day,
+            lock_or_create_attendance_for_shift_day,
         )
         from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
 
@@ -735,6 +739,39 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # Prevent double-checkin / multiple open sessions
+            open_checkin = get_open_checkin_log(
+                user, assignment, shift, org_location, search_start_utc, search_end_utc
+            )
+            if open_checkin:
+                now = timezone.now()
+                burst_seconds = int(getattr(settings, "FACE_KIOSK_DUPLICATE_PUNCH_SECONDS", 15))
+                # Burst duplicate punch (double-tap / client retry within burst window): return existing punch idempotently
+                if (now - open_checkin.timestamp) < timedelta(seconds=burst_seconds):
+                    attendance = get_or_create_attendance_for_shift_day(
+                        user, assignment, shift, org_location, shift_start_date
+                    )
+                    return self._v5_punch_response(
+                        request,
+                        attendance,
+                        matched_site or open_checkin.site,
+                        resolution,
+                        "checkin",
+                        status.HTTP_200_OK,
+                        timing=timing,
+                    )
+                checkin_time_user = to_user_timezone(open_checkin.timestamp, user_tz)
+                return Response(
+                    {
+                        "error": "You already have an active check-in session. Please check out before checking in again.",
+                        "code": "already_checked_in",
+                        "checkin_time": checkin_time_user.isoformat(),
+                        "checkin_site_id": str(open_checkin.site_id) if open_checkin.site_id else None,
+                        "checkin_site_name": getattr(open_checkin.site, "name", None),
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
             raw_bytes = image_file.read() if image_file else None
 
@@ -758,41 +795,71 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                 img_name = getattr(image_file, "name", img_name) or img_name
 
             _t_db = _time.perf_counter()
-            log = CheckInLog.objects.create(
-                guard=user,
-                assignment=assignment,
-                shift=shift,
-                org_location=org_location,
-                type="checkin",
-                latitude=lat,
-                longitude=lon,
-                site=matched_site,
-            )
-            if raw_bytes is not None:
-                log.image.save(img_name, ContentFile(raw_bytes), save=True)
+            with transaction.atomic():
+                attendance = lock_or_create_attendance_for_shift_day(
+                    user, assignment, shift, org_location, shift_start_date
+                )
+                # Re-verify under row lock to prevent concurrent double-punch race conditions
+                open_checkin = get_open_checkin_log(
+                    user, assignment, shift, org_location, search_start_utc, search_end_utc
+                )
+                if open_checkin:
+                    now = timezone.now()
+                    burst_seconds = int(getattr(settings, "FACE_KIOSK_DUPLICATE_PUNCH_SECONDS", 15))
+                    if (now - open_checkin.timestamp) < timedelta(seconds=burst_seconds):
+                        return self._v5_punch_response(
+                            request,
+                            attendance,
+                            matched_site or open_checkin.site,
+                            resolution,
+                            "checkin",
+                            status.HTTP_200_OK,
+                            timing=timing,
+                        )
+                    checkin_time_user = to_user_timezone(open_checkin.timestamp, user_tz)
+                    return Response(
+                        {
+                            "error": "You already have an active check-in session. Please check out before checking in again.",
+                            "code": "already_checked_in",
+                            "checkin_time": checkin_time_user.isoformat(),
+                            "checkin_site_id": str(open_checkin.site_id) if open_checkin.site_id else None,
+                            "checkin_site_name": getattr(open_checkin.site, "name", None),
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
-            attendance = get_or_create_attendance_for_shift_day(
-                user, assignment, shift, org_location, shift_start_date
-            )
-            apply_v4_attendance_after_log(
-                attendance=attendance,
-                user=user,
-                assignment=assignment,
-                shift=shift,
-                org_location=org_location,
-                shift_start_date=shift_start_date,
-                matched_site=matched_site,
-                log_filter=log_filter,
-                search_start_utc=search_start_utc,
-                search_end_utc=search_end_utc,
-                action_mode="checkin",
-                raw_bytes=raw_bytes,
-                img_name=img_name,
-                user_tz=user_tz,
-                refresh_fn=_attendance_v3_refresh_saved_fields,
-                skip_sibling_reconcile=False,
-                timing_dict=timing,
-            )
+                log = CheckInLog.objects.create(
+                    guard=user,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    type="checkin",
+                    latitude=lat,
+                    longitude=lon,
+                    site=matched_site,
+                )
+                if raw_bytes is not None:
+                    log.image.save(img_name, ContentFile(raw_bytes), save=True)
+
+                apply_v4_attendance_after_log(
+                    attendance=attendance,
+                    user=user,
+                    assignment=assignment,
+                    shift=shift,
+                    org_location=org_location,
+                    shift_start_date=shift_start_date,
+                    matched_site=matched_site,
+                    log_filter=log_filter,
+                    search_start_utc=search_start_utc,
+                    search_end_utc=search_end_utc,
+                    action_mode="checkin",
+                    raw_bytes=raw_bytes,
+                    img_name=img_name,
+                    user_tz=user_tz,
+                    refresh_fn=_attendance_v3_refresh_saved_fields,
+                    skip_sibling_reconcile=False,
+                    timing_dict=timing,
+                )
             timing["db_save_ms"] = int((_time.perf_counter() - _t_db) * 1000)
             timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
 
