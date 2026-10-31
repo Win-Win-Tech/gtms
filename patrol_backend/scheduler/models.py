@@ -717,6 +717,14 @@ class SiteSetting(models.Model):
     value = models.TextField(blank=True)
     unit = models.CharField(max_length=10, null=True, blank=True)
     location = models.ForeignKey('Location', on_delete=models.CASCADE, null=True, blank=True, related_name="site_settings")
+    site = models.ForeignKey(
+        'LocationSite',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="site_settings",
+        help_text="When set, this row is a per-physical-site override. Lookup: site → org → global.",
+    )
     propagate_to_orgs = models.BooleanField(
         default=True,
         help_text=(
@@ -726,24 +734,33 @@ class SiteSetting(models.Model):
     )
     is_deleted = models.BooleanField(default=False)
 
-    class Meta:
-        unique_together = ('key', 'location')
-        ordering = ['key']
-        indexes = [
-            models.Index(fields=["is_deleted"]),
-            models.Index(fields=["key", "location"]),
-        ]
-
     @classmethod
-    def get_setting(cls, key, location_id=None, default_value=None):
+    def get_setting(cls, key, location_id=None, default_value=None, site_id=None):
         """
-        Get setting value for a specific location or fallback to global setting.
-        Logic: Specific Location > Global (location is NULL) > default_value
+        Resolve a setting value.
+        When site_id is given: site override > org (location, site NULL) > global > default.
+        When site_id is omitted: org > global (per-site rows are ignored so existing callers stay correct).
         """
-        setting = cls.objects.filter(key=key).filter(
+        qs = cls.objects.filter(key=key)
+        if site_id:
+            qs = qs.filter(
+                models.Q(site_id=site_id)
+                | models.Q(location_id=location_id, site_id__isnull=True)
+                | models.Q(location_id__isnull=True, site_id__isnull=True)
+            )
+            setting = qs.annotate(
+                _prio=models.Case(
+                    models.When(site_id=site_id, then=models.Value(0)),
+                    models.When(location_id=location_id, site_id__isnull=True, then=models.Value(1)),
+                    default=models.Value(2),
+                    output_field=models.IntegerField(),
+                )
+            ).order_by("_prio").first()
+            return setting.value if setting else default_value
+
+        setting = qs.filter(site_id__isnull=True).filter(
             models.Q(location_id=location_id) | models.Q(location_id__isnull=True)
         ).order_by(models.F('location_id').desc(nulls_last=True)).first()
-        
         return setting.value if setting else default_value
 
     # Audit and soft delete fields as before...
@@ -798,8 +815,10 @@ class SiteSetting(models.Model):
 
     class Meta:
         unique_together = ('key', 'location')
+        ordering = ['key']
         indexes = [
             models.Index(fields=["is_deleted"]),
+            models.Index(fields=["key", "site"]),
         ]
 
 

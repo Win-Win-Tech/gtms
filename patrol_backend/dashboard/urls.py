@@ -15,6 +15,7 @@ from .views_v5 import (
     MonthlyAttendanceSummaryViewSetV5,
     ShiftTodayV5,
 )
+from .views_public_holiday import PublicHolidayViewSet
 
 
 router = DefaultRouter()
@@ -30,6 +31,7 @@ v5_router = DefaultRouter()
 v5_router.register(r'attendance', AttendanceCheckinViewSetV5, basename='attendance-v5')
 v5_router.register(r'attendance-summary-v5', MonthlyAttendanceSummaryViewSetV5, basename="attendance-summary-v5")
 v5_router.register(r'attendance-excel-v5', MonthlyAttendanceExcelViewSetV5, basename="attendance-excel-v5")
+v5_router.register(r"public-holidays", PublicHolidayViewSet, basename="public-holidays")
 
 urlpatterns = [
     path('performance/', GuardPerformanceView.as_view()),

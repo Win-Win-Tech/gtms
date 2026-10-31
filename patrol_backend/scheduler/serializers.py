@@ -17,6 +17,16 @@ from uuid import UUID
 
 
 class LocationSiteSerializer(serializers.ModelSerializer):
+    labour_law_limit_enabled = serializers.BooleanField(required=False, allow_null=True)
+    consecutive_work_limit_enabled = serializers.BooleanField(required=False, allow_null=True)
+    max_consecutive_work_days = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1, max_value=31
+    )
+    max_monthly_work_hours = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1, max_value=744
+    )
+    consecutive_work_inherited = serializers.SerializerMethodField()
+
     class Meta:
         model = LocationSite
         fields = [
@@ -31,7 +41,87 @@ class LocationSiteSerializer(serializers.ModelSerializer):
             'boundary_enabled',
             'breach_alerts_enabled',
             'location_missing_alerts_enabled',
+            'labour_law_limit_enabled',
+            'consecutive_work_limit_enabled',
+            'max_consecutive_work_days',
+            'max_monthly_work_hours',
+            'consecutive_work_inherited',
         ]
+
+    def _unpack_labour(self, cached, obj):
+        if cached is not None:
+            if len(cached) == 4:
+                return cached
+            enabled, max_days, inherited = cached
+            return enabled, max_days, None, inherited
+        from patrol_backend.utils.consecutive_work import resolve_labour_law_settings
+
+        return resolve_labour_law_settings(getattr(obj, "location_id", None), obj.id)
+
+    def get_consecutive_work_inherited(self, obj):
+        cached = (self.context.get("consecutive_work_by_site") or {}).get(str(obj.id))
+        return self._unpack_labour(cached, obj)[3]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        cached = (self.context.get("consecutive_work_by_site") or {}).get(str(instance.id))
+        enabled, max_days, max_hours, inherited = self._unpack_labour(cached, instance)
+        data["labour_law_limit_enabled"] = enabled
+        data["consecutive_work_limit_enabled"] = enabled
+        data["max_consecutive_work_days"] = max_days
+        data["max_monthly_work_hours"] = max_hours
+        data["consecutive_work_inherited"] = inherited
+        return data
+
+    def _pop_consecutive_fields(self, validated_data):
+        initial = self.initial_data if self.initial_data is not None else {}
+        enabled_explicit = "labour_law_limit_enabled" in initial or "consecutive_work_limit_enabled" in initial
+        max_explicit = "max_consecutive_work_days" in initial
+        hours_explicit = "max_monthly_work_hours" in initial
+        enabled = validated_data.pop("labour_law_limit_enabled", None)
+        if enabled is None:
+            enabled = validated_data.pop("consecutive_work_limit_enabled", None)
+        else:
+            validated_data.pop("consecutive_work_limit_enabled", None)
+        max_days = validated_data.pop("max_consecutive_work_days", None)
+        max_hours = validated_data.pop("max_monthly_work_hours", None)
+        return (
+            enabled if enabled_explicit else None,
+            max_days if max_explicit else None,
+            max_hours if hours_explicit else None,
+        )
+
+    def create(self, validated_data):
+        enabled, max_days, max_hours = self._pop_consecutive_fields(validated_data)
+        site = super().create(validated_data)
+        if enabled is not None or max_days is not None or max_hours is not None:
+            from patrol_backend.utils.consecutive_work import upsert_site_consecutive_work_settings
+
+            request = self.context.get("request")
+            upsert_site_consecutive_work_settings(
+                site,
+                enabled=enabled,
+                max_days=max_days,
+                max_hours=max_hours,
+                user=getattr(request, "user", None),
+            )
+        return site
+
+    def update(self, instance, validated_data):
+        enabled, max_days, max_hours = self._pop_consecutive_fields(validated_data)
+        site = super().update(instance, validated_data)
+        if enabled is not None or max_days is not None or max_hours is not None:
+            from patrol_backend.utils.consecutive_work import upsert_site_consecutive_work_settings
+
+            request = self.context.get("request")
+            upsert_site_consecutive_work_settings(
+                site,
+                enabled=enabled,
+                max_days=max_days,
+                max_hours=max_hours,
+                user=getattr(request, "user", None),
+            )
+        return site
 
 
 class SiteCameraSerializer(serializers.ModelSerializer):

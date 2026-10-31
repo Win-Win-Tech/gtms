@@ -348,7 +348,11 @@ def auto_checkout_user_on_boundary_breach(
 
     curr_now = now_utc or timezone.now()
     search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
-        shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+        shift_start_date,
+        shift,
+        user_tz,
+        location_id=getattr(org_location, "id", None),
+        site_id=getattr(checkin, "site_id", None) or getattr(site, "id", None),
     )
     if curr_now >= search_end_utc:
         search_end_utc = curr_now + timedelta(minutes=15)

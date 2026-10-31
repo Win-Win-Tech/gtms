@@ -13,10 +13,11 @@ class AttendanceCheckin(models.Model):
     ]
     PA_STATUS_CHOICES = [
         ("P", "Present"),
+        ("HP", "Half Day Present"),
         ("OW", "On Work"),
         ("M", "Missed Checkout"),
         ("LD", "Less Duration"),
-        ("A", "Absent (Legacy)"),
+        ("A", "Absent"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -73,6 +74,9 @@ class AttendanceCheckin(models.Model):
         related_name="attendance_records"
     )
 
+    worked_on_public_holiday = models.BooleanField(default=False, db_index=True)
+    public_holiday_name = models.CharField(max_length=255, null=True, blank=True)
+
     latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     radius_m = models.IntegerField(default=50)
@@ -125,6 +129,9 @@ class AttendanceCheckin(models.Model):
                 condition=models.Q(shift_date__isnull=False),
                 name="uniq_attendance_guard_shift_day",
             ),
+        ]
+        indexes = [
+            models.Index(fields=["guard", "shift_date"], name="att_guard_shiftdate_idx"),
         ]
 
 
@@ -254,3 +261,55 @@ class AttendanceWeekOff(models.Model):
 
     def __str__(self):
         return f"{self.user_id} @ {self.location_id} {self.weekoff_date} [{self.mark}]"
+
+
+class PublicHoliday(models.Model):
+    """Site + optional vendor public holiday. vendor=NULL means the whole site."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    org_location = models.ForeignKey(
+        "scheduler.Location",
+        on_delete=models.CASCADE,
+        related_name="public_holidays",
+    )
+    site = models.ForeignKey(
+        "scheduler.LocationSite",
+        on_delete=models.CASCADE,
+        related_name="public_holidays",
+    )
+    vendor = models.ForeignKey(
+        "scheduler.Vendor",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="public_holidays",
+    )
+    holiday_date = models.DateField(db_index=True)
+    name = models.CharField(max_length=255)
+
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="public_holidays_created",
+    )
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="public_holidays_modified",
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["site", "holiday_date", "vendor"], name="ph_site_date_vendor_idx"),
+            models.Index(fields=["org_location", "holiday_date"], name="ph_org_date_idx"),
+        ]
+
+    def __str__(self):
+        vendor_bit = f" / {self.vendor_id}" if self.vendor_id else " / all"
+        return f"{self.holiday_date} {self.name} @ {self.site_id}{vendor_bit}"

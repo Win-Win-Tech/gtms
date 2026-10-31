@@ -205,6 +205,25 @@ def kiosk_apply_punch(
 
         action_mode = "checkout" if has_open_session else "checkin"
         if action_mode == "checkin":
+            from patrol_backend.utils.consecutive_work import (
+                assert_consecutive_work_allowed,
+                assert_monthly_hours_allowed,
+                shift_length_minutes,
+            )
+
+            assert_consecutive_work_allowed(
+                user,
+                shift_start_date,
+                location_id=getattr(org_location, "id", None),
+                site_id=getattr(matched_site, "id", None),
+            )
+            assert_monthly_hours_allowed(
+                user,
+                shift_start_date,
+                extra_minutes=shift_length_minutes(shift),
+                location_id=getattr(org_location, "id", None),
+                site_id=getattr(matched_site, "id", None),
+            )
             enforce_checkin_allowed_after_checkout(
                 user,
                 assignment,

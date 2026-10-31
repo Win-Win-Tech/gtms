@@ -111,6 +111,41 @@ class CreateAssignmentV5(APIView):
                     if guard and not caller_can_access_site(guard, site) and not guard.is_superuser:
                         raise ValidationError({"site_id": "This guard is not assigned to that site."})
 
+            from authapp.models import User
+            from scheduler.models import Shift
+            from patrol_backend.utils.consecutive_work import (
+                ConsecutiveWorkLimitExceeded,
+                assert_consecutive_work_allowed,
+                assert_consecutive_work_range,
+            )
+
+            target_guard = None
+            if guard_id:
+                target_guard = User.objects.filter(id=guard_id).first()
+            if target_guard is None:
+                target_guard = request.user
+            shift_id = request.data.get("shift_id")
+            if shift_id and target_guard:
+                shift_obj = Shift.objects.filter(id=shift_id, is_deleted=False).only("id", "location_id").first()
+                if shift_obj:
+                    on_date = get_user_today(get_user_timezone_from_request(request))
+                    try:
+                        assert_consecutive_work_range(
+                            target_guard,
+                            on_date,
+                            on_date,
+                            location_id=shift_obj.location_id,
+                            site_id=site_id,
+                        )
+                        assert_consecutive_work_allowed(
+                            target_guard,
+                            on_date,
+                            location_id=shift_obj.location_id,
+                            site_id=site_id,
+                        )
+                    except ConsecutiveWorkLimitExceeded as exc:
+                        return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
+
             from dashboard.views import AttendanceCheckinViewSet
 
             view = AttendanceCheckinViewSet()
@@ -718,7 +753,11 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             )
 
             search_start_utc, search_end_utc, _, _, _ = _attendance_v3_shift_window_utc(
-                shift_start_date, shift, user_tz, location_id=getattr(org_location, "id", None)
+                shift_start_date,
+                shift,
+                user_tz,
+                location_id=getattr(org_location, "id", None),
+                site_id=getattr(matched_site, "id", None),
             )
             log_filter = build_log_window_filter(
                 user, assignment, shift, org_location, search_start_utc, search_end_utc
@@ -771,6 +810,31 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            from patrol_backend.utils.consecutive_work import (
+                ConsecutiveWorkLimitExceeded,
+                MonthlyHourLimitExceeded,
+                assert_consecutive_work_allowed,
+                assert_monthly_hours_allowed,
+                shift_length_minutes,
+            )
+
+            try:
+                assert_consecutive_work_allowed(
+                    user,
+                    shift_start_date,
+                    location_id=getattr(org_location, "id", None),
+                    site_id=getattr(matched_site, "id", None),
+                )
+                assert_monthly_hours_allowed(
+                    user,
+                    shift_start_date,
+                    extra_minutes=shift_length_minutes(shift),
+                    location_id=getattr(org_location, "id", None),
+                    site_id=getattr(matched_site, "id", None),
+                )
+            except (ConsecutiveWorkLimitExceeded, MonthlyHourLimitExceeded) as exc:
+                return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
 
             image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
             raw_bytes = image_file.read() if image_file else None

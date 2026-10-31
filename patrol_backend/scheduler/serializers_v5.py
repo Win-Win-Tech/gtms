@@ -25,7 +25,35 @@ class AssignmentSerializerV5(AssignmentSerializer):
             data.setdefault("guard", self.instance.guard)
             data.setdefault("start_date", self.instance.start_date)
             data.setdefault("end_date", self.instance.end_date)
-        return super().validate(data)
+            data.setdefault("location", self.instance.location)
+            data.setdefault("shift", self.instance.shift)
+        data = super().validate(data)
+
+        from patrol_backend.utils.consecutive_work import (
+            ConsecutiveWorkLimitExceeded,
+            assert_consecutive_work_range,
+        )
+
+        guard = data.get("guard")
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+        location = data.get("location")
+        shift = data.get("shift")
+        location_id = getattr(location, "id", None) or getattr(shift, "location_id", None)
+        site_id = data.get("site_id")
+        if guard and start_date and end_date:
+            try:
+                assert_consecutive_work_range(
+                    guard,
+                    start_date,
+                    end_date,
+                    location_id=location_id,
+                    site_id=site_id,
+                    exclude_assignment_id=getattr(self.instance, "id", None),
+                )
+            except ConsecutiveWorkLimitExceeded as exc:
+                raise serializers.ValidationError(exc.as_serializer_error())
+        return data
 
     def _posted(self, obj):
         cache = getattr(self, "_posted_cache", None)

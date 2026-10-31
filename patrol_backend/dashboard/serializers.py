@@ -10,13 +10,14 @@ from patrol_backend.utils.timezone_utils import (
 )
 
 
-def _get_site_setting_int_local(key, location_id=None, default_value=None):
+def _get_site_setting_int_local(key, location_id=None, default_value=None, site_id=None):
     """Read integer SiteSetting value without importing dashboard.views."""
     try:
         SiteSetting = apps.get_model("scheduler", "SiteSetting")
         raw = SiteSetting.get_setting(
             key=key,
             location_id=location_id,
+            site_id=site_id,
             default_value=default_value,
         )
         if raw is None:
@@ -24,6 +25,62 @@ def _get_site_setting_int_local(key, location_id=None, default_value=None):
         return int(raw)
     except Exception:
         return default_value
+
+
+def _build_log_pairs(logs, user_tz):
+    """Pair checkin→checkout in order. Leftover checkouts (no open checkin, or not after it) stay unpaired."""
+    pairs = []
+    open_checkin = None
+    open_checkin_id = None
+    for log in logs:
+        if log.type == "checkin":
+            if open_checkin is not None:
+                pairs.append(_log_pair_payload(
+                    user_tz, checkin_ts=open_checkin, checkin_id=open_checkin_id
+                ))
+            open_checkin = log.timestamp
+            open_checkin_id = log.id
+        elif log.type == "checkout":
+            if open_checkin is not None and log.timestamp > open_checkin:
+                duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
+                pairs.append(_log_pair_payload(
+                    user_tz,
+                    checkin_ts=open_checkin,
+                    checkin_id=open_checkin_id,
+                    checkout_log=log,
+                    duration_minutes=duration_minutes,
+                ))
+                open_checkin = None
+                open_checkin_id = None
+            else:
+                pairs.append(_log_pair_payload(user_tz, checkout_log=log))
+
+    if open_checkin is not None:
+        pairs.append(_log_pair_payload(
+            user_tz, checkin_ts=open_checkin, checkin_id=open_checkin_id
+        ))
+    return pairs
+
+
+def _log_pair_payload(
+    user_tz,
+    *,
+    checkin_ts=None,
+    checkin_id=None,
+    checkout_log=None,
+    duration_minutes=None,
+):
+    checkout_ts = checkout_log.timestamp if checkout_log is not None else None
+    checkout_id = checkout_log.id if checkout_log is not None else None
+    return {
+        "checkin_id": str(checkin_id) if checkin_id else None,
+        "checkout_id": str(checkout_id) if checkout_id else None,
+        "checkin_time": to_user_timezone(checkin_ts, user_tz).isoformat() if checkin_ts else None,
+        "checkout_time": to_user_timezone(checkout_ts, user_tz).isoformat() if checkout_ts else None,
+        "duration_minutes": duration_minutes,
+        "is_auto_checkout": bool(checkout_log and checkout_log.is_auto_checkout),
+        "auto_checkout_reason": (checkout_log.auto_checkout_reason if checkout_log else None) or None,
+    }
 
 class AttendanceCheckinSerializer(serializers.ModelSerializer):
     status = serializers.ReadOnlyField()
@@ -231,11 +288,12 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
         else:
             shift_end_local = user_tz.localize(datetime.combine(shift_day, obj.shift.end_time))
         
-        # Use dynamic site setting for grace time
+        # Use dynamic site setting for grace time (site → org → global)
         grace_minutes = _get_site_setting_int_local(
             key="shift_grace_time",
             location_id=getattr(obj.org_location, "id", None),
             default_value=30,
+            site_id=getattr(obj, "site_id", None),
         )
 
         # Keep small grace so near-boundary events still appear in popup.
@@ -250,80 +308,11 @@ class AttendanceCheckinDashboardV3Serializer(serializers.ModelSerializer):
             timestamp__gte=search_start_utc,
             timestamp__lt=search_end_utc,
         ).order_by("timestamp")
-
-        pairs = []
-        open_checkin = None
-        open_checkin_id = None
-        for log in logs:
-            if log.type == "checkin":
-                if open_checkin is not None:
-                    pairs.append({
-                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                        "checkout_id": None,
-                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                        "checkout_time": None,
-                        "duration_minutes": None,
-                    })
-                open_checkin = log.timestamp
-                open_checkin_id = log.id
-            elif log.type == "checkout":
-                if open_checkin is not None:
-                    duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
-                    pairs.append({
-                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                        "checkout_id": str(log.id),
-                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                        "duration_minutes": duration_minutes,
-                    })
-                    open_checkin = None
-                    open_checkin_id = None
-                else:
-                    pairs.append({
-                        "checkin_id": None,
-                        "checkout_id": str(log.id),
-                        "checkin_time": None,
-                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                        "duration_minutes": None,
-                    })
-
-        if open_checkin is not None:
-            pairs.append({
-                "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                "checkout_id": None,
-                "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                "checkout_time": None,
-                "duration_minutes": None,
-            })
-        return pairs
+        return _build_log_pairs(logs, user_tz)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get('request')
-        # Keep count/state meaningful even when denormalized DB summary fields are stale.
-        pairs = data.get("log_pairs") or []
-        if pairs:
-            checkins_from_pairs = len(pairs)
-            checkouts_from_pairs = sum(1 for p in pairs if p.get("checkout_time"))
-            if (data.get("checkin_count") in (None, 0)):
-                data["checkin_count"] = checkins_from_pairs
-            if (data.get("checkout_count") in (None, 0)):
-                data["checkout_count"] = checkouts_from_pairs
-
-            has_open_session = any(not p.get("checkout_time") for p in pairs)
-            data["live_state"] = "checked_in" if has_open_session else "checked_out"
-
-            if not data.get("last_checkin_time"):
-                data["last_checkin_time"] = pairs[-1].get("checkin_time")
-            if not data.get("last_checkout_time"):
-                closed = [p for p in pairs if p.get("checkout_time")]
-                if closed:
-                    data["last_checkout_time"] = closed[-1].get("checkout_time")
-        else:
-            eff_checkin = data.get("last_checkin_time") or data.get("checkin_time")
-            eff_checkout = data.get("last_checkout_time") or data.get("checkout_time")
-            data["live_state"] = "checked_in" if (eff_checkin and (not eff_checkout or eff_checkin > eff_checkout)) else "checked_out"
-
         if request:
             user_tz = get_user_timezone_from_request(request)
             if instance.checkin_time:
@@ -445,6 +434,7 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
             key="shift_grace_time",
             location_id=getattr(obj.org_location, "id", None),
             default_value=30,
+            site_id=getattr(obj, "site_id", None),
         )
 
         search_start_utc = (shift_start_local - timedelta(minutes=grace_minutes)).astimezone(pytz.UTC)
@@ -474,78 +464,11 @@ class AttendanceCheckinDashboardV4Serializer(serializers.ModelSerializer):
                 timestamp__lt=search_end_utc,
             ).order_by("timestamp")
 
-        pairs = []
-        open_checkin = None
-        open_checkin_id = None
-        for log in logs:
-            if log.type == "checkin":
-                if open_checkin is not None:
-                    pairs.append({
-                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                        "checkout_id": None,
-                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                        "checkout_time": None,
-                        "duration_minutes": None,
-                    })
-                open_checkin = log.timestamp
-                open_checkin_id = log.id
-            elif log.type == "checkout":
-                if open_checkin is not None:
-                    duration_minutes = int((log.timestamp - open_checkin).total_seconds() // 60)
-                    pairs.append({
-                        "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                        "checkout_id": str(log.id),
-                        "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                        "duration_minutes": duration_minutes,
-                    })
-                    open_checkin = None
-                    open_checkin_id = None
-                else:
-                    pairs.append({
-                        "checkin_id": None,
-                        "checkout_id": str(log.id),
-                        "checkin_time": None,
-                        "checkout_time": to_user_timezone(log.timestamp, user_tz).isoformat(),
-                        "duration_minutes": None,
-                    })
-
-        if open_checkin is not None:
-            pairs.append({
-                "checkin_id": str(open_checkin_id) if open_checkin_id else None,
-                "checkout_id": None,
-                "checkin_time": to_user_timezone(open_checkin, user_tz).isoformat(),
-                "checkout_time": None,
-                "duration_minutes": None,
-            })
-        return pairs
+        return _build_log_pairs(logs, user_tz)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get('request')
-        pairs = data.get("log_pairs") or []
-        if pairs:
-            checkins_from_pairs = len(pairs)
-            checkouts_from_pairs = sum(1 for p in pairs if p.get("checkout_time"))
-            if (data.get("checkin_count") in (None, 0)):
-                data["checkin_count"] = checkins_from_pairs
-            if (data.get("checkout_count") in (None, 0)):
-                data["checkout_count"] = checkouts_from_pairs
-
-            has_open_session = any(not p.get("checkout_time") for p in pairs)
-            data["live_state"] = "checked_in" if has_open_session else "checked_out"
-
-            if not data.get("last_checkin_time"):
-                data["last_checkin_time"] = pairs[-1].get("checkin_time")
-            if not data.get("last_checkout_time"):
-                closed = [p for p in pairs if p.get("checkout_time")]
-                if closed:
-                    data["last_checkout_time"] = closed[-1].get("checkout_time")
-        else:
-            eff_checkin = data.get("last_checkin_time") or data.get("checkin_time")
-            eff_checkout = data.get("last_checkout_time") or data.get("checkout_time")
-            data["live_state"] = "checked_in" if (eff_checkin and (not eff_checkout or eff_checkin > eff_checkout)) else "checked_out"
-
         if request:
             user_tz = get_user_timezone_from_request(request)
             if instance.checkin_time:

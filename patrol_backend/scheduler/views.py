@@ -301,14 +301,27 @@ class LocationViewSet(viewsets.ModelViewSet):
     def sites(self, request, pk=None):
         location = self.get_object()
         if request.method == 'GET':
-            sites = location.sites.filter(is_active=True)
-            serializer = LocationSiteSerializer(sites, many=True)
+            sites = list(location.sites.filter(is_active=True))
+            from patrol_backend.utils.consecutive_work import bulk_resolve_consecutive_work_settings
+
+            consecutive_map = bulk_resolve_consecutive_work_settings(
+                location.id,
+                [s.id for s in sites],
+            )
+            serializer = LocationSiteSerializer(
+                sites,
+                many=True,
+                context={"request": request, "consecutive_work_by_site": consecutive_map},
+            )
             return Response(serializer.data)
 
-        serializer = LocationSiteSerializer(data=request.data)
+        serializer = LocationSiteSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         site = serializer.save(location=location)
-        return Response(LocationSiteSerializer(site).data, status=http_status.HTTP_201_CREATED)
+        return Response(
+            LocationSiteSerializer(site, context={"request": request}).data,
+            status=http_status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=['patch', 'delete'], url_path=r'sites/(?P<site_id>[^/.]+)')
     def site_detail(self, request, pk=None, site_id=None):
@@ -322,10 +335,12 @@ class LocationViewSet(viewsets.ModelViewSet):
             site.save(update_fields=['is_active'])
             return Response(status=http_status.HTTP_204_NO_CONTENT)
 
-        serializer = LocationSiteSerializer(site, data=request.data, partial=True)
+        serializer = LocationSiteSerializer(
+            site, data=request.data, partial=True, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(serializer.data)
+        return Response(LocationSiteSerializer(site, context={"request": request}).data)
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
@@ -1049,6 +1064,7 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
         """Simple, fast queryset for retrieving settings."""
         queryset = SiteSetting.objects.filter(is_deleted=False)
         loc_param = self.request.query_params.get('location')
+        queryset = queryset.filter(site_id__isnull=True)
         
         # 1. Superuser logic
         if self.request.user.is_superuser:
@@ -1093,7 +1109,44 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
                 # Log but don't crash the list view
                 logger.error(f"[SITE_SETTING_SYNC_ERROR] {e}", exc_info=True)
 
-        return super().list(request, *args, **kwargs)
+        try:
+            location_id, site_id, _site = self._settings_scope(request, from_body=False)
+        except ValidationError:
+            location_id, site_id = None, None
+
+        base_qs = SiteSetting.objects.filter(is_deleted=False, site_id__isnull=True)
+        if location_id:
+            base_qs = base_qs.filter(location_id=location_id)
+        elif getattr(user, "is_superuser", False):
+            base_qs = base_qs.filter(location__isnull=True)
+        elif getattr(user, "location_id", None):
+            base_qs = base_qs.filter(location_id=user.location_id)
+        else:
+            base_qs = base_qs.filter(location__isnull=True)
+
+        base_rows = list(base_qs.order_by("key"))
+        if site_id:
+            from scheduler.site_setting_values import overlay_site_setting_rows
+
+            site_rows = list(
+                SiteSetting.objects.filter(is_deleted=False, site_id=site_id)
+            )
+            paired = overlay_site_setting_rows(base_rows, site_rows)
+            payload = []
+            for row, inherited in paired:
+                item = SiteSettingSerializer(row).data
+                item["inherited"] = inherited
+                item["scope"] = "org" if inherited and location_id else (
+                    "global" if inherited else "site"
+                )
+                payload.append(item)
+            return Response(payload)
+
+        payload = SiteSettingSerializer(base_rows, many=True).data
+        for item in payload:
+            item["inherited"] = False
+            item["scope"] = "org" if location_id else "global"
+        return Response(payload)
 
     def _sync_settings(self, location_id, user):
         """Ensures location has overrides for every propagatable global key."""
@@ -1230,6 +1283,166 @@ class SiteSettingViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Error during bulk update: {e}", exc_info=True)
             return Response({'error': 'Failed to update site settings.'}, status=http_status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def _settings_scope(self, request, *, from_body=False):
+        src = request.data if from_body else request.query_params
+        raw_site = src.get("site_id") if from_body else src.get("site")
+        if not raw_site:
+            raw_site = src.get("site")
+        raw_loc = src.get("location_id") if from_body else src.get("location")
+        if not raw_loc:
+            raw_loc = src.get("location")
+
+        def _clean(value):
+            if value is None:
+                return None
+            text = str(value).strip()
+            if text.lower() in ("", "null", "undefined", "all", "none"):
+                return None
+            return text
+
+        site_id = _clean(raw_site)
+        location_id = _clean(raw_loc)
+        user = request.user
+        site = None
+        if site_id:
+            site = LocationSite.objects.filter(id=site_id, is_active=True).first()
+            if not site:
+                raise ValidationError({"site_id": "Site not found or inactive."})
+            location_id = str(site.location_id)
+
+        if not getattr(user, "is_superuser", False):
+            user_location_id = getattr(user, "location_id", None)
+            if not user_location_id:
+                raise ValidationError("No organisation on this account.")
+            location_id = str(user_location_id)
+            if site and str(site.location_id) != location_id:
+                raise ValidationError("Site is not in your organisation.")
+
+        return location_id, (str(site.id) if site else None), site
+
+    @staticmethod
+    def _labour_law_payload(location_id, site_id, enabled, max_days, max_hours, inherited):
+        return {
+            "labour_law_limit_enabled": enabled,
+            "max_consecutive_work_days": max_days,
+            "max_monthly_work_hours": max_hours,
+            "inherited": inherited,
+            "scope": "site" if site_id else ("org" if location_id else "global"),
+            "location_id": str(location_id) if location_id else None,
+            "site_id": str(site_id) if site_id else None,
+        }
+
+    @action(detail=False, methods=["get", "put"], url_path="labour-law")
+    def labour_law(self, request):
+        """Read/write labour-law limits for header Site, or organisation default when Site is All."""
+        from patrol_backend.utils.consecutive_work import (
+            _parse_bool,
+            resolve_labour_law_settings,
+            upsert_org_labour_law_settings,
+            upsert_site_consecutive_work_settings,
+        )
+
+        try:
+            location_id, site_id, site = self._settings_scope(
+                request, from_body=request.method == "PUT"
+            )
+        except ValidationError as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                first = next(iter(detail.values()), "Invalid labour-law scope")
+                detail = first[0] if isinstance(first, list) else first
+            return Response({"error": str(detail)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        if request.method == "GET":
+            enabled, max_days, max_hours, inherited = resolve_labour_law_settings(
+                location_id, site_id
+            )
+            return Response(
+                self._labour_law_payload(
+                    location_id, site_id, enabled, max_days, max_hours, inherited
+                )
+            )
+
+        if "labour_law_limit_enabled" not in request.data:
+            return Response(
+                {"error": "labour_law_limit_enabled is required"},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        enabled = _parse_bool(request.data.get("labour_law_limit_enabled"), False)
+        max_days = request.data.get("max_consecutive_work_days")
+        max_hours = request.data.get("max_monthly_work_hours")
+        user = request.user
+        if site is not None:
+            upsert_site_consecutive_work_settings(
+                site,
+                enabled=enabled,
+                max_days=max_days,
+                max_hours=max_hours,
+                user=user,
+            )
+        else:
+            upsert_org_labour_law_settings(
+                location_id,
+                enabled=enabled,
+                max_days=max_days,
+                max_hours=max_hours,
+                user=user,
+            )
+        enabled, max_days, max_hours, inherited = resolve_labour_law_settings(
+            location_id, site_id
+        )
+        return Response(
+            self._labour_law_payload(
+                location_id, site_id, enabled, max_days, max_hours, inherited
+            )
+        )
+
+    @action(detail=False, methods=["put"], url_path="values")
+    def upsert_values(self, request):
+        """Save setting values for header Site, or organisation default when Site is All."""
+        from scheduler.site_setting_values import upsert_setting_value
+
+        try:
+            location_id, site_id, _site = self._settings_scope(request, from_body=True)
+        except ValidationError as exc:
+            detail = exc.detail
+            if isinstance(detail, dict):
+                first = next(iter(detail.values()), "Invalid settings scope")
+                detail = first[0] if isinstance(first, list) else first
+            return Response({"error": str(detail)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        items = request.data.get("items") if isinstance(request.data, dict) else request.data
+        if not isinstance(items, list) or not items:
+            return Response(
+                {"error": "Expected items: [{key, value, unit}]"},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        updated = []
+        try:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key")
+                if not key:
+                    continue
+                row = upsert_setting_value(
+                    key,
+                    item.get("value"),
+                    item.get("unit"),
+                    location_id=location_id,
+                    site_id=site_id,
+                    user=request.user,
+                )
+                data = SiteSettingSerializer(row).data
+                data["inherited"] = False
+                data["scope"] = "site" if site_id else ("org" if location_id else "global")
+                updated.append(data)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response(updated, status=http_status.HTTP_200_OK)
 
     @action(detail=False, methods=['post'], url_path='bulk-delete')
     def bulk_delete(self, request):

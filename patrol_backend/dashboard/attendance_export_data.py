@@ -56,6 +56,7 @@ def _pa_status_display(pa_status, live_state, has_checkin, has_checkout):
         return "Absent"
     mapping = {
         "P": "Present",
+        "HP": "Half Day Present",
         "OW": "On Work",
         "M": "Missed Checkout",
         "LD": "Less Duration",

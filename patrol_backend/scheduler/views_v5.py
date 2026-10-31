@@ -75,6 +75,22 @@ class AssignmentViewSetV5(AssignmentViewSet):
     serializer_class = AssignmentSerializerV5
     permission_classes = [permissions.IsAuthenticated]
 
+    @staticmethod
+    def _first_serializer_error(errors):
+        if isinstance(errors, str):
+            return errors
+        if isinstance(errors, list) and errors:
+            return AssignmentViewSetV5._first_serializer_error(errors[0])
+        if isinstance(errors, dict):
+            for key in ("error", "message", "non_field_errors", "detail"):
+                if key in errors:
+                    return AssignmentViewSetV5._first_serializer_error(errors[key])
+            for value in errors.values():
+                text = AssignmentViewSetV5._first_serializer_error(value)
+                if text:
+                    return text
+        return None
+
     def _posted_on_date(self):
         raw = self.request.query_params.get("date")
         if raw:
@@ -173,11 +189,21 @@ class AssignmentViewSetV5(AssignmentViewSet):
                     serializer.save()
                     created.append(serializer.data)
                 except ValidationError as e:
-                    errors.append({"index": idx, "errors": e.detail, "data": data})
+                    errors.append({
+                        "index": idx,
+                        "errors": e.detail,
+                        "error": self._first_serializer_error(e.detail),
+                        "data": data,
+                    })
                 except PermissionDenied as e:
                     errors.append({"index": idx, "errors": {"site_id": [str(e)]}, "data": data})
             else:
-                errors.append({"index": idx, "errors": serializer.errors, "data": data})
+                errors.append({
+                    "index": idx,
+                    "errors": serializer.errors,
+                    "error": self._first_serializer_error(serializer.errors),
+                    "data": data,
+                })
 
         if errors:
             return Response({"created": created, "errors": errors}, status=status.HTTP_207_MULTI_STATUS)
