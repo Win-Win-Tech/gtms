@@ -4,6 +4,17 @@
 > **New / Recommended (Ultra-Fast 30-100ms Backend)**: For sub-second face verification using InsightFace + ONNX Runtime, please refer to [docs/INSIGHTFACE_INSTALLATION.md](file:///d:/CloudGen/GTMS/gtms/patrol_backend/docs/INSIGHTFACE_INSTALLATION.md).
 > The instructions below document the baseline `dlib` / `face-recognition` setup and compatibility pins.
 
+`checkin_v6` / `checkout_v6` add MiniFASNet silent liveness (photo / phone-video spoof). v5 is unchanged. MiniFASNet runs only when `Location.is_face_attendance_enabled` is on. Kiosk liveness is `POST /dashboard/attendance/face_attendance_v2/` (`face_attendance` is unchanged). MiniFASNetV2 is warmed on server start so the first punch is not a cold load.
+
+```bash
+# from gtms/patrol_backend with venv active
+pip install "uniface>=1.0.0"
+# MiniFASNetV2.onnx downloads on first v6 punch, or:
+# curl -L "https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/MiniFASNetV2.onnx" -o patrol_backend/ml_models/MiniFASNetV2.onnx
+```
+
+Also add `uniface>=1.0.0` to `requirements.txt` / `requirements-face-attendance.txt`.
+
 This guide is for GTMS `checkin_v4` / `checkout_v4` face attendance.
 
 It includes the production issue you hit on Python 3.12:

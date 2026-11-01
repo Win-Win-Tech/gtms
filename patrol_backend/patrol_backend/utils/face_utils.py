@@ -336,16 +336,41 @@ def verify_user_face(
     tolerance: float = DEFAULT_FACE_TOLERANCE,
     timing_dict: Optional[dict] = None,
     fast: bool = True,
+    require_liveness: Optional[bool] = None,
 ) -> Tuple[bool, str, Optional[float]]:
     """
     1:1 verify live image against user's stored encoding.
     Returns (ok, error_message, distance_or_none).
+    require_liveness=True runs MiniFASNet on the same detected face (v6).
     """
     t_v0 = time.perf_counter()
     if not is_face_attendance_available():
         return False, "Face recognition is not installed on the server", None
 
     from django.conf import settings
+    from patrol_backend.utils.face_liveness import (
+        assert_live_face,
+        assert_live_image_bytes,
+        is_liveness_available,
+        liveness_required,
+    )
+
+    if require_liveness is None:
+        require_liveness = liveness_required()
+
+    # Spoof reject before InsightFace identity so a phone replay does not pay 1:1 encode cost.
+    if require_liveness:
+        if not is_liveness_available():
+            return False, "Face liveness (MiniFASNet) is not installed on the server", None
+        live_ok, live_msg, live_score = assert_live_image_bytes(
+            live_image_bytes, timing_dict=timing_dict
+        )
+        if not live_ok:
+            if timing_dict is not None:
+                timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
+                timing_dict["engine"] = timing_dict.get("liveness_engine") or "minifasnet"
+            return False, live_msg, live_score
+        require_liveness = False
 
     backend = getattr(settings, "FACE_RECOGNITION_BACKEND", "dlib")
     if backend == "insightface":
@@ -353,24 +378,68 @@ def verify_user_face(
             from patrol_backend.utils.face_insight import (
                 compare_insight_embeddings,
                 extract_insightface_embedding,
+                extract_insightface_live_face,
                 get_user_enrolled_insight_embedding,
                 is_insightface_available,
             )
             if is_insightface_available():
-                live_emb, face_count = extract_insightface_embedding(live_image_bytes, timing_dict=timing_dict)
+                if require_liveness:
+                    live_emb, face_count, img_bgr, bbox = extract_insightface_live_face(
+                        live_image_bytes, timing_dict=timing_dict
+                    )
+                else:
+                    live_emb, face_count = extract_insightface_embedding(live_image_bytes, timing_dict=timing_dict)
+                    img_bgr, bbox = None, None
                 if live_emb is not None:
+                    if require_liveness:
+                        if not is_liveness_available():
+                            return False, "Face liveness (MiniFASNet) is not installed on the server", None
+                        live_ok, live_msg, live_score = assert_live_face(
+                            img_bgr, bbox, timing_dict=timing_dict
+                        )
+                        if not live_ok:
+                            if timing_dict is not None:
+                                timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
+                                timing_dict["engine"] = "insightface+minifasnet"
+                            return False, live_msg, live_score
                     ref_emb = get_user_enrolled_insight_embedding(user)
                     if ref_emb is not None:
                         thresh = float(getattr(settings, "FACE_INSIGHT_SIMILARITY_THRESHOLD", 0.40))
                         ok, sim = compare_insight_embeddings(ref_emb, live_emb, threshold=thresh, timing_dict=timing_dict)
                         if timing_dict is not None:
                             timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
-                            timing_dict["engine"] = "insightface"
+                            timing_dict["engine"] = (
+                                "insightface+minifasnet"
+                                if timing_dict.get("liveness_ms") is not None
+                                else "insightface"
+                            )
                         if not ok:
                             return False, "Face does not match enrolled user", sim
                         return True, "", sim
         except Exception as exc:
             logger.warning("InsightFace verification failed, falling back to dlib: %s", exc)
+
+    if require_liveness and not (timing_dict and timing_dict.get("liveness_ms") is not None):
+        if not is_liveness_available():
+            return False, "Face liveness (MiniFASNet) is not installed on the server", None
+        try:
+            import cv2
+
+            img_rgb = load_image_rgb_array(live_image_bytes, max_dimension=640, timing_dict=timing_dict)
+            if img_rgb is None:
+                return False, "No face detected in uploaded image", None
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            h, w = img_bgr.shape[:2]
+            live_ok, live_msg, live_score = assert_live_face(
+                img_bgr, [0, 0, w - 1, h - 1], timing_dict=timing_dict
+            )
+            if not live_ok:
+                return False, live_msg, live_score
+            if timing_dict is not None:
+                timing_dict["engine"] = "dlib+minifasnet"
+        except Exception as exc:
+            logger.warning("MiniFASNet liveness (dlib path) failed: %s", exc)
+            return False, "Liveness check failed: possible photo or video spoof", None
 
     ref = None
     if user.face_encoding:
@@ -396,13 +465,17 @@ def verify_user_face(
     if live is None:
         if timing_dict is not None:
             timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
-            timing_dict["engine"] = "dlib"
+            timing_dict["engine"] = (
+                "dlib+minifasnet" if timing_dict.get("liveness_ms") is not None else "dlib"
+            )
         return False, "No face detected in uploaded image", None
 
     ok, dist = compare_encodings(ref, live, tolerance=tolerance, timing_dict=timing_dict)
     if timing_dict is not None:
         timing_dict["face_verify_total_ms"] = round((time.perf_counter() - t_v0) * 1000.0, 2)
-        timing_dict["engine"] = "dlib"
+        timing_dict["engine"] = (
+            "dlib+minifasnet" if timing_dict.get("liveness_ms") is not None else "dlib"
+        )
     if not ok:
         return False, "Face does not match enrolled user", dist
     return True, "", dist

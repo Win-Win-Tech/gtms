@@ -2457,6 +2457,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             f"{_face_distance:.4f}" if _face_distance is not None else "n/a",
         )
         if not matched_user_id:
+            if face_code == "liveness_failed":
+                return _kiosk_error(
+                    "liveness_failed",
+                    "Liveness check failed: possible photo or video spoof",
+                )
+            if face_code == "liveness_unavailable":
+                return _kiosk_error(
+                    "liveness_unavailable",
+                    "Face liveness (MiniFASNet) is not installed on the server",
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
             if face_code == "face_not_detected":
                 return _kiosk_error("face_not_detected", "No face found in uploaded image")
             if face_code == "multiple_faces_detected":
@@ -3022,6 +3033,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         if parts:
             resp["Server-Timing"] = ", ".join(parts)
         return resp
+
+    @action(detail=False, methods=["post"], url_path="face_attendance_v2")
+    @parser_classes([MultiPartParser, FormParser])
+    def face_attendance_v2(self, request):
+        """Same as face_attendance plus MiniFASNet liveness (photo/video replay reject)."""
+        from patrol_backend.utils.face_liveness import liveness_enabled
+
+        request._gtms_require_liveness = True
+        with liveness_enabled(True):
+            return self.face_attendance(request)
 
     @action(detail=False, methods=["post"], url_path="force-checkout_v3")
     @parser_classes([MultiPartParser, FormParser])

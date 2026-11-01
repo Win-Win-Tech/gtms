@@ -281,6 +281,12 @@ FACE_INSIGHT_MODEL_NAME = "buffalo_s"
 FACE_INSIGHT_SIMILARITY_THRESHOLD = 0.40
 FACE_INSIGHT_IDENTIFY_MIN_MARGIN = 0.05
 
+# checkin_v6 / checkout_v6 MiniFASNet silent liveness (photo / video-replay spoof)
+# Floor on live-class probability after MiniFASNet says "real". Spoof class always rejects.
+FACE_LIVENESS_THRESHOLD = 0.50
+# Optional override; default is patrol_backend/ml_models/MiniFASNetV2.onnx
+# FACE_LIVENESS_MODEL_PATH = r"D:\CloudGen\GTMS\gtms\patrol_backend\patrol_backend\ml_models\MiniFASNetV2.onnx"
+
 # Kiosk face_attendance performance
 FACE_KIOSK_FAST_PATH = True
 FACE_KIOSK_MAX_IMAGE_WIDTH = 640

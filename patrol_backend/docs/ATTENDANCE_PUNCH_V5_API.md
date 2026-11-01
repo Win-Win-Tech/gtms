@@ -15,6 +15,12 @@ Live `checkin_v4` / `checkout_v4` are **unchanged**. Mobile apps that enable sit
 |--------|-----|---------|
 | POST | `/dashboard/attendance/checkin_v5/` | Guard check-in |
 | POST | `/dashboard/attendance/checkout_v5/` | Guard check-out |
+| POST | `/dashboard/attendance/checkin_v6/` | Same as checkin_v5 + MiniFASNet liveness (photo/video spoof reject) |
+| POST | `/dashboard/attendance/checkout_v6/` | Same as checkout_v5 + MiniFASNet liveness |
+| POST | `/dashboard/attendance/face_attendance/` | Kiosk 1:N punch (unchanged) |
+| POST | `/dashboard/attendance/face_attendance_v2/` | Same as kiosk + MiniFASNet liveness |
+
+`checkin_v5` / `checkout_v5` are unchanged. Mobile apps that want server-side liveness should call **v6**. Same multipart fields as v5. v6 runs MiniFASNet **only when** `Location.is_face_attendance_enabled` is on. Liveness failure: `400` `{"error": "Liveness check failed: possible photo or video spoof"}`.
 
 ### Site resolution (both endpoints)
 
@@ -408,7 +414,7 @@ curl -X POST "https://your-domain.com/dashboard/attendance/checkin_v5/" \
 2. Use **check-in and check-out on the same v5 pair** — do not mix `checkin_v4` + `checkout_v5` if you need site-match enforcement.
 3. On `checkout_site_mismatch`, show the user they must checkout at the same site they checked in at (`checkin_site_name`).
 4. v5 success responses are a **superset** of v4 — existing parsers for v4 fields continue to work.
-5. Kiosk `POST /dashboard/attendance/face_attendance/` is separate and still uses GPS auto-detect (not these endpoints).
+5. Kiosk `POST /dashboard/attendance/face_attendance/` is unchanged. Kiosk with MiniFASNet liveness: `POST /dashboard/attendance/face_attendance_v2/` (same fields as `face_attendance`).
 
 ---
 

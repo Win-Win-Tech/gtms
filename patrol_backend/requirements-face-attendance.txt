@@ -11,6 +11,7 @@ opencv-python>=4.8.0
 insightface>=0.7.3
 onnx>=1.16.0
 onnxruntime>=1.18.0
+uniface>=1.0.0
 faiss-cpu>=1.7.0
 scikit-image>=0.21.0
 scipy>=1.11.0

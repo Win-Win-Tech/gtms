@@ -79,6 +79,12 @@ def _log_pair_payload(
         "checkout_time": to_user_timezone(checkout_ts, user_tz).isoformat() if checkout_ts else None,
         "duration_minutes": duration_minutes,
         "is_auto_checkout": bool(checkout_log and checkout_log.is_auto_checkout),
+        "auto_checkout_type": (checkout_log.auto_checkout_type if checkout_log else None) or None,
+        "auto_checkout_type_label": (
+            CheckInLog.AUTO_CHECKOUT_TYPE_LABELS.get(checkout_log.auto_checkout_type)
+            if checkout_log and checkout_log.auto_checkout_type
+            else None
+        ),
         "auto_checkout_reason": (checkout_log.auto_checkout_reason if checkout_log else None) or None,
     }
 

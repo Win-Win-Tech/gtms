@@ -390,6 +390,7 @@ def auto_checkout_user_on_boundary_breach(
         longitude=lng,
         site=matched_site,
         is_auto_checkout=True,
+        auto_checkout_type=CheckInLog.AUTO_CHECKOUT_TYPE_BOUNDARY_BREACH,
         auto_checkout_reason=reason_text,
     )
 

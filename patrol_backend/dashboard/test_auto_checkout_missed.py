@@ -4,6 +4,7 @@ import pytz
 from django.test import SimpleTestCase
 
 from dashboard.attendance_pa_status import compute_closed_pa_status
+from dashboard.models import CheckInLog
 from dashboard.tasks import auto_checkout_reason, shift_grace_deadline_utc
 
 
@@ -19,6 +20,12 @@ class ShiftGraceAutoCheckoutTests(SimpleTestCase):
             auto_checkout_reason(30),
             "Auto-checkout: no checkout by shift end + 30 min grace",
         )
+
+    def test_auto_checkout_types_are_stable(self):
+        self.assertEqual(CheckInLog.AUTO_CHECKOUT_TYPE_SHIFT_END, "shift_end")
+        self.assertEqual(CheckInLog.AUTO_CHECKOUT_TYPE_BOUNDARY_BREACH, "boundary_breach")
+        self.assertEqual(CheckInLog.AUTO_CHECKOUT_TYPE_LABELS["shift_end"], "Shift end")
+        self.assertEqual(CheckInLog.AUTO_CHECKOUT_TYPE_LABELS["boundary_breach"], "Boundary breach")
 
     def test_day_shift_checkout_is_just_inside_deadline(self):
         tz = pytz.timezone("Asia/Kolkata")

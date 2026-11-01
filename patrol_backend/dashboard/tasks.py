@@ -180,6 +180,7 @@ def mark_missed_checkout_v3(batch_size=1000):
                     longitude=lng,
                     site=matched_site,
                     is_auto_checkout=True,
+                    auto_checkout_type=CheckInLog.AUTO_CHECKOUT_TYPE_SHIFT_END,
                     auto_checkout_reason=reason,
                 )
                 CheckInLog.objects.filter(id=log.id).update(timestamp=checkout_ts)

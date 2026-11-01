@@ -78,33 +78,30 @@ def get_face_analysis_app(model_name: str = "buffalo_s"):
             return None
 
 
-def extract_insightface_embedding(
+def extract_insightface_live_face(
     image_bytes_or_rgb: bytes | np.ndarray,
     timing_dict: Optional[dict] = None,
     model_name: str = "buffalo_s",
-) -> Tuple[Optional[np.ndarray], int]:
+) -> Tuple[Optional[np.ndarray], int, Optional[np.ndarray], Optional[list]]:
     """
-    Detect faces and extract 512-d normalized embedding using InsightFace.
-    Returns: (normalized_embedding_or_None, face_count)
+    Detect faces and extract embedding + BGR frame + bbox for reuse (liveness).
+    Returns: (embedding_or_None, face_count, img_bgr_or_None, bbox_xyxy_or_None)
     """
     app = get_face_analysis_app(model_name=model_name)
     if app is None:
-        return None, 0
+        return None, 0, None, None
 
     t_start = time.perf_counter()
 
-    # Load into RGB numpy array
     if isinstance(image_bytes_or_rgb, bytes):
         from patrol_backend.utils.face_utils import load_image_rgb_array
-        # InsightFace works with BGR or RGB; FaceAnalysis expects BGR (cv2 convention)
         img_rgb = load_image_rgb_array(image_bytes_or_rgb, max_dimension=640, timing_dict=timing_dict)
     else:
         img_rgb = image_bytes_or_rgb
 
     if img_rgb is None:
-        return None, 0
+        return None, 0, None, None
 
-    # Convert RGB to BGR for InsightFace
     import cv2
     img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
@@ -118,17 +115,31 @@ def extract_insightface_embedding(
         timing_dict["face_count"] = face_count
 
     if not faces:
-        return None, 0
+        return None, 0, img_bgr, None
 
-    # Pick the largest face in the image
     faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
     best_face = faces[0]
-
-    embedding = best_face.normed_embedding  # 512-d unit vector (already normalized)
+    embedding = best_face.normed_embedding
+    bbox = [float(v) for v in best_face.bbox]
     t_total_ms = (time.perf_counter() - t_start) * 1000.0
     if timing_dict is not None:
         timing_dict["encode_ms"] = round(t_total_ms - t_det_ms, 2)
 
+    return embedding, face_count, img_bgr, bbox
+
+
+def extract_insightface_embedding(
+    image_bytes_or_rgb: bytes | np.ndarray,
+    timing_dict: Optional[dict] = None,
+    model_name: str = "buffalo_s",
+) -> Tuple[Optional[np.ndarray], int]:
+    """
+    Detect faces and extract 512-d normalized embedding using InsightFace.
+    Returns: (normalized_embedding_or_None, face_count)
+    """
+    embedding, face_count, _, _ = extract_insightface_live_face(
+        image_bytes_or_rgb, timing_dict=timing_dict, model_name=model_name
+    )
     return embedding, face_count
 
 

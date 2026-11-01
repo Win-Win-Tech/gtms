@@ -155,9 +155,27 @@ class CheckInLog(models.Model):
     # Optional proof image for each checkin/checkout event
     image = models.ImageField(upload_to="attendance_checkinlog/", null=True, blank=True)
 
+    AUTO_CHECKOUT_TYPE_SHIFT_END = "shift_end"
+    AUTO_CHECKOUT_TYPE_BOUNDARY_BREACH = "boundary_breach"
+    AUTO_CHECKOUT_TYPE_CHOICES = [
+        (AUTO_CHECKOUT_TYPE_SHIFT_END, "Shift end"),
+        (AUTO_CHECKOUT_TYPE_BOUNDARY_BREACH, "Boundary breach"),
+    ]
+    AUTO_CHECKOUT_TYPE_LABELS = {
+        AUTO_CHECKOUT_TYPE_SHIFT_END: "Shift end",
+        AUTO_CHECKOUT_TYPE_BOUNDARY_BREACH: "Boundary breach",
+    }
+
     # Auto-checkout audit tracking
     is_auto_checkout = models.BooleanField(default=False, db_index=True)
     auto_checkout_reason = models.CharField(max_length=255, null=True, blank=True)
+    auto_checkout_type = models.CharField(
+        max_length=32,
+        choices=AUTO_CHECKOUT_TYPE_CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
 
     def __str__(self):
         return f"{self.guard} - {self.type} (auto={self.is_auto_checkout}) @ {self.timestamp}"

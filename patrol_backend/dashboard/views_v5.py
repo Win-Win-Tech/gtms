@@ -15,6 +15,33 @@ from rest_framework.views import APIView
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_v6_liveness_and_face(request, user, org_location, raw_bytes, timing):
+    """Face match + MiniFASNet only when Location.is_face_attendance_enabled. v5 never sets liveness."""
+    from patrol_backend.utils.face_liveness import liveness_required
+    from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
+
+    if not bool(getattr(org_location, "is_face_attendance_enabled", False)):
+        return None
+
+    require_liveness = bool(getattr(request, "_gtms_require_liveness", False)) or liveness_required()
+    if not is_face_attendance_available():
+        return Response(
+            {
+                "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
+                "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
+            },
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not raw_bytes:
+        return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
+    ok, msg, _dist_face = verify_user_face(
+        user, raw_bytes, timing_dict=timing, require_liveness=require_liveness
+    )
+    if not ok:
+        return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+    return None
+
 from authapp.site_access import assert_caller_can_access_site, caller_can_access_site, get_site_or_error
 from patrol_backend.utils.timezone_utils import get_user_today, get_user_timezone_from_request, to_user_timezone
 from scheduler.daily_site import apply_select_site, site_ids_payload
@@ -727,7 +754,6 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             get_or_create_attendance_for_shift_day,
             lock_or_create_attendance_for_shift_day,
         )
-        from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
 
         try:
             _t_req = _time.perf_counter()
@@ -839,20 +865,9 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
             raw_bytes = image_file.read() if image_file else None
 
-            if getattr(org_location, "is_face_attendance_enabled", False):
-                if not is_face_attendance_available():
-                    return Response(
-                        {
-                            "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
-                            "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
-                        },
-                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    )
-                if not raw_bytes:
-                    return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-                ok, msg, _dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
-                if not ok:
-                    return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+            blocked = _apply_v6_liveness_and_face(request, user, org_location, raw_bytes, timing)
+            if blocked is not None:
+                return blocked
 
             img_name = "checkin.jpg"
             if image_file:
@@ -928,13 +943,16 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
 
             logger.info(
-                "[ATTENDANCE_TIMING] action=checkin_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+                "[ATTENDANCE_TIMING] action=checkin_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s liveness_ms=%s liveness_score=%s liveness_label=%s db_save_ms=%s total_ms=%s",
                 getattr(user, "id", "?"),
-                timing.get("engine", "dlib"),
+                timing.get("engine") or timing.get("liveness_engine") or "none",
                 timing.get("decode_ms"),
                 timing.get("detect_ms"),
                 timing.get("encode_ms"),
                 timing.get("match_ms"),
+                timing.get("liveness_ms"),
+                timing.get("liveness_score"),
+                timing.get("liveness_label"),
                 timing.get("db_save_ms"),
                 timing.get("total_ms"),
             )
@@ -944,6 +962,16 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             )
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
+
+    @action(detail=False, methods=["post"], url_path="checkin_v6")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkin_v6(self, request):
+        """Same as checkin_v5 plus MiniFASNet liveness (rejects photo/video replay)."""
+        from patrol_backend.utils.face_liveness import liveness_enabled
+
+        request._gtms_require_liveness = True
+        with liveness_enabled(True):
+            return self.checkin_v5(request)
 
     @action(detail=False, methods=["post"], url_path="checkout_v5")
     @parser_classes([MultiPartParser, FormParser])
@@ -958,7 +986,6 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             build_log_window_filter,
             get_or_create_attendance_for_shift_day,
         )
-        from patrol_backend.utils.face_utils import is_face_attendance_available, verify_user_face
 
         try:
             user = request.user
@@ -1044,20 +1071,9 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             image_file = request.FILES.get("image") or request.FILES.get("checkout_image")
             raw_bytes = image_file.read() if image_file else None
 
-            if getattr(org_location, "is_face_attendance_enabled", False):
-                if not is_face_attendance_available():
-                    return Response(
-                        {
-                            "error": "Face attendance is enabled for this location but face_recognition is not installed on the server.",
-                            "hint": "See docs/FACE_ATTENDANCE_INSTALL.md",
-                        },
-                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    )
-                if not raw_bytes:
-                    return Response({"error": "Face attendance requires an image"}, status=status.HTTP_400_BAD_REQUEST)
-                ok, msg, _dist_face = verify_user_face(user, raw_bytes, timing_dict=timing)
-                if not ok:
-                    return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+            blocked = _apply_v6_liveness_and_face(request, user, org_location, raw_bytes, timing)
+            if blocked is not None:
+                return blocked
 
             img_name = "checkout.jpg"
             if image_file:
@@ -1100,13 +1116,16 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             timing["total_ms"] = int((_time.perf_counter() - _t_req) * 1000)
 
             logger.info(
-                "[ATTENDANCE_TIMING] action=checkout_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s db_save_ms=%s total_ms=%s",
+                "[ATTENDANCE_TIMING] action=checkout_v5 user=%s engine=%s decode_ms=%s detect_ms=%s encode_ms=%s match_ms=%s liveness_ms=%s liveness_score=%s liveness_label=%s db_save_ms=%s total_ms=%s",
                 getattr(user, "id", "?"),
-                timing.get("engine", "dlib"),
+                timing.get("engine") or timing.get("liveness_engine") or "none",
                 timing.get("decode_ms"),
                 timing.get("detect_ms"),
                 timing.get("encode_ms"),
                 timing.get("match_ms"),
+                timing.get("liveness_ms"),
+                timing.get("liveness_score"),
+                timing.get("liveness_label"),
                 timing.get("db_save_ms"),
                 timing.get("total_ms"),
             )
@@ -1116,6 +1135,16 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             )
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
+
+    @action(detail=False, methods=["post"], url_path="checkout_v6")
+    @parser_classes([MultiPartParser, FormParser])
+    def checkout_v6(self, request):
+        """Same as checkout_v5 plus MiniFASNet liveness (rejects photo/video replay)."""
+        from patrol_backend.utils.face_liveness import liveness_enabled
+
+        request._gtms_require_liveness = True
+        with liveness_enabled(True):
+            return self.checkout_v5(request)
 
     @action(detail=False, methods=["get"], url_path="v5/bulk-entry-candidates")
     def bulk_entry_candidates_v5(self, request):

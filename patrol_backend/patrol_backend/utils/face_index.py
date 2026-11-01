@@ -428,6 +428,44 @@ def identify_user_in_location(
             timing_dict["face_identify_total_ms"] = round((time.perf_counter() - t_id_start) * 1000.0, 2)
         return _identify_fail(loc, "no_enrolled_faces", live_image_bytes)
 
+    try:
+        from patrol_backend.utils.face_liveness import (
+            assert_live_image_bytes,
+            is_liveness_available,
+            liveness_required,
+        )
+
+        if liveness_required():
+            if not is_liveness_available():
+                if timing_dict is not None:
+                    timing_dict["face_identify_total_ms"] = round(
+                        (time.perf_counter() - t_id_start) * 1000.0, 2
+                    )
+                return _identify_fail(loc, "liveness_unavailable", live_image_bytes)
+            live_ok, _live_msg, _live_score = assert_live_image_bytes(
+                live_image_bytes, timing_dict=timing_dict
+            )
+            if not live_ok:
+                if timing_dict is not None:
+                    timing_dict["engine"] = timing_dict.get("liveness_engine") or "minifasnet"
+                    timing_dict["face_identify_total_ms"] = round(
+                        (time.perf_counter() - t_id_start) * 1000.0, 2
+                    )
+                return _identify_fail(loc, "liveness_failed", live_image_bytes)
+    except Exception as exc:
+        logger.warning("Kiosk MiniFASNet liveness failed: %s", exc)
+        try:
+            from patrol_backend.utils.face_liveness import liveness_required as _liveness_required
+
+            if _liveness_required():
+                if timing_dict is not None:
+                    timing_dict["face_identify_total_ms"] = round(
+                        (time.perf_counter() - t_id_start) * 1000.0, 2
+                    )
+                return _identify_fail(loc, "liveness_failed", live_image_bytes)
+        except Exception:
+            pass
+
     # -------------------------------------------------------------
     # FAST PATH: InsightFace ONNX Engine (1:N search with FAISS IP)
     # -------------------------------------------------------------

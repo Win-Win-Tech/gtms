@@ -31,5 +31,11 @@ class DashboardConfig(AppConfig):
                     get_face_analysis_app()
             except Exception as exc:
                 logger.warning("InsightFace warmup skipped during startup: %s", exc)
+            try:
+                from patrol_backend.utils.face_liveness import warmup_liveness
+
+                warmup_liveness()
+            except Exception as exc:
+                logger.warning("MiniFASNet warmup skipped during startup: %s", exc)
 
         threading.Thread(target=_warmup, daemon=True).start()

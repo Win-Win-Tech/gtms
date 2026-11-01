@@ -34,7 +34,7 @@ def filter_auto_checkout_queryset(request, user):
     """
     qs = (
         CheckInLog.objects.filter(type="checkout", is_auto_checkout=True)
-        .select_related("guard", "site", "org_location", "shift", "assignment")
+        .select_related("guard", "guard__vendor", "site", "org_location", "shift", "assignment")
         .order_by("-timestamp")
     )
 
@@ -79,6 +79,10 @@ def filter_auto_checkout_queryset(request, user):
             | Q(site__name__icontains=search)
             | Q(auto_checkout_reason__icontains=search)
         )
+
+    auto_type = request.query_params.get("auto_checkout_type") or request.query_params.get("type")
+    if auto_type and auto_type not in ("All", "all", "null", ""):
+        qs = qs.filter(auto_checkout_type=auto_type)
 
     vendor_id = request.query_params.get("vendor_id") or request.query_params.get("vendor")
     if vendor_id and vendor_id not in ("All", "all", "null"):
@@ -141,7 +145,9 @@ def serialize_auto_checkout_log(log: CheckInLog, requesting_user) -> dict:
         "latitude": float(log.latitude) if log.latitude is not None else None,
         "longitude": float(log.longitude) if log.longitude is not None else None,
         "is_auto_checkout": bool(log.is_auto_checkout),
-        "auto_checkout_reason": log.auto_checkout_reason or "Boundary breach: moved outside site boundary",
+        "auto_checkout_type": log.auto_checkout_type or None,
+        "auto_checkout_type_label": CheckInLog.AUTO_CHECKOUT_TYPE_LABELS.get(log.auto_checkout_type) or None,
+        "auto_checkout_reason": log.auto_checkout_reason or None,
     }
 
 
@@ -167,8 +173,13 @@ AUTO_CHECKOUT_EXPORT_HEADERS = [
     "Site",
     "Location",
     "Shift",
-    "Breach GPS",
+    "Type",
+    "GPS",
 ]
+
+
+def _auto_checkout_type_label(log):
+    return CheckInLog.AUTO_CHECKOUT_TYPE_LABELS.get(log.auto_checkout_type) or (log.auto_checkout_type or "—")
 
 
 def resolve_auto_checkout_export_meta(request, requesting_user):
@@ -309,6 +320,7 @@ def generate_auto_checkout_excel(queryset, requesting_user, request=None, contex
             site_name,
             location_name,
             shift_name,
+            _auto_checkout_type_label(log),
             coords_str,
         ]
         ws.append(row_data)
@@ -319,7 +331,7 @@ def generate_auto_checkout_excel(queryset, requesting_user, request=None, contex
             cell = ws.cell(row=current_row, column=col_idx)
             cell.font = font_data
             cell.border = border_thin
-            if col_idx in (1, 2, 4, 5, 9):
+            if col_idx in (1, 2, 4, 5, 9, 10):
                 cell.alignment = align_center
             else:
                 cell.alignment = align_left
@@ -440,6 +452,7 @@ def generate_auto_checkout_pdf(queryset, requesting_user, request=None, context:
             Paragraph(site_name, cell_style),
             Paragraph(location_name, cell_style),
             Paragraph(shift_name, cell_style),
+            Paragraph(_auto_checkout_type_label(log), cell_center),
             Paragraph(coords_str, cell_center),
         ])
 
@@ -449,8 +462,8 @@ def generate_auto_checkout_pdf(queryset, requesting_user, request=None, context:
             + [""] * (len(AUTO_CHECKOUT_EXPORT_HEADERS) - 1)
         )
 
-    # 10 columns: #, Date & Time, Guard, Emp Code, Role, Vendor, Site, Location, Shift, Breach GPS
-    ratios = [0.04, 0.12, 0.14, 0.08, 0.07, 0.11, 0.14, 0.11, 0.09, 0.10]
+    # 11 columns: #, Date & Time, Guard, Emp Code, Role, Vendor, Site, Location, Shift, Type, GPS
+    ratios = [0.04, 0.11, 0.12, 0.07, 0.06, 0.10, 0.12, 0.10, 0.08, 0.10, 0.10]
     ratio_sum = sum(ratios)
     col_widths = [doc.width * (r / ratio_sum) for r in ratios]
     table = Table(data, colWidths=col_widths, repeatRows=1)
