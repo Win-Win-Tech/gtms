@@ -4,7 +4,7 @@
 > **New / Recommended (Ultra-Fast 30-100ms Backend)**: For sub-second face verification using InsightFace + ONNX Runtime, please refer to [docs/INSIGHTFACE_INSTALLATION.md](file:///d:/CloudGen/GTMS/gtms/patrol_backend/docs/INSIGHTFACE_INSTALLATION.md).
 > The instructions below document the baseline `dlib` / `face-recognition` setup and compatibility pins.
 
-`checkin_v6` / `checkout_v6` add MiniFASNet silent liveness (photo / phone-video spoof). v5 is unchanged. MiniFASNet runs only when `Location.is_face_attendance_enabled` is on. Kiosk liveness is `POST /dashboard/attendance/face_attendance_v2/` (`face_attendance` is unchanged). MiniFASNetV2 is warmed on server start so the first punch is not a cold load.
+`checkin_v6` / `checkout_v6` add MiniFASNet silent liveness (photo / phone-video spoof). v5 is unchanged. MiniFASNet runs only when `Location.is_face_attendance_enabled` is on. Kiosk liveness is `POST /dashboard/attendance/face_attendance_v2/` (`face_attendance` is unchanged). MiniFASNetV2 is warmed on server start so the first punch is not a cold load. Liveness scores the **detected face crop**, not the full photo (full-frame scoring false-rejects many real phone selfies).
 
 ```bash
 # from gtms/patrol_backend with venv active

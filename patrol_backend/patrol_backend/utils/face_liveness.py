@@ -344,6 +344,61 @@ def _decode_image_bgr(image_bytes: bytes, timing_dict: Optional[dict] = None):
         return None
 
 
+def _center_face_bbox(img_bgr: np.ndarray) -> list:
+    """Portrait-style center crop. Better than full-frame for MiniFASNet when detector misses."""
+    h, w = img_bgr.shape[:2]
+    side = min(h, w) * 0.72
+    cx, cy = w / 2.0, h * 0.42
+    x1 = max(0.0, cx - side / 2.0)
+    y1 = max(0.0, cy - side / 2.0)
+    x2 = min(float(w - 1), cx + side / 2.0)
+    y2 = min(float(h - 1), cy + side / 2.0)
+    return [x1, y1, x2, y2]
+
+
+def _detect_face_bbox_bgr(img_bgr: np.ndarray, timing_dict: Optional[dict] = None) -> Optional[list]:
+    """
+    MiniFASNet needs a face bbox, not the whole frame.
+    Full-frame scoring false-rejects many real phone selfies.
+    """
+    t0 = time.perf_counter()
+    bbox = None
+    try:
+        from patrol_backend.utils.face_insight import get_face_analysis_app, is_insightface_available
+
+        if is_insightface_available():
+            app = get_face_analysis_app()
+            if app is not None:
+                faces = app.get(img_bgr) or []
+                if faces:
+                    faces.sort(
+                        key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]),
+                        reverse=True,
+                    )
+                    bbox = [float(v) for v in faces[0].bbox]
+    except Exception as exc:
+        logger.warning("InsightFace bbox for liveness failed: %s", exc)
+
+    if bbox is None:
+        try:
+            from uniface import RetinaFace
+
+            detector = RetinaFace()
+            faces = detector.detect(img_bgr) or []
+            if faces:
+                face0 = faces[0]
+                raw = getattr(face0, "bbox", None) or face0
+                bbox = [float(v) for v in raw[:4]]
+        except Exception as exc:
+            logger.warning("RetinaFace bbox for liveness failed: %s", exc)
+
+    if timing_dict is not None:
+        timing_dict["liveness_detect_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        timing_dict["liveness_bbox"] = "face" if bbox is not None else "center_fallback"
+
+    return bbox
+
+
 def warmup_liveness() -> bool:
     """Load MiniFASNetV2 and run one dummy inference so the first punch is not a cold start."""
     t0 = time.perf_counter()
@@ -371,9 +426,12 @@ def assert_live_image_bytes(
     image_bytes: bytes,
     timing_dict: Optional[dict] = None,
 ) -> Tuple[bool, str, float]:
-    """Run MiniFASNet on a punch photo (v6 even when face attendance is off)."""
+    """Run MiniFASNet on the detected face crop (not the full photo)."""
     img_bgr = _decode_image_bgr(image_bytes, timing_dict=timing_dict)
     if img_bgr is None:
         return False, "Liveness check requires a valid image", 0.0
-    h, w = img_bgr.shape[:2]
-    return assert_live_face(img_bgr, [0, 0, w - 1, h - 1], timing_dict=timing_dict)
+    bbox = _detect_face_bbox_bgr(img_bgr, timing_dict=timing_dict)
+    if bbox is None:
+        bbox = _center_face_bbox(img_bgr)
+        logger.info("MiniFASNet using center-face fallback bbox=%s", [round(v, 1) for v in bbox])
+    return assert_live_face(img_bgr, bbox, timing_dict=timing_dict)

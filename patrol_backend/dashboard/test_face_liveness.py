@@ -2,6 +2,7 @@ import numpy as np
 from django.test import SimpleTestCase
 
 from patrol_backend.utils.face_liveness import (
+    _center_face_bbox,
     _crop_face_bgr,
     _parse_spoof_result,
     _softmax,
@@ -47,3 +48,10 @@ class MiniFASNetHelpersTests(SimpleTestCase):
     def test_punch_path_uses_minifasnet_v2_only(self):
         names = [str(getattr(m, "name", m)) for m in _uniface_model_list()]
         self.assertEqual(names, ["V2"])
+
+    def test_center_face_bbox_is_not_full_frame(self):
+        img = np.zeros((640, 480, 3), dtype=np.uint8)
+        bbox = _center_face_bbox(img)
+        self.assertEqual(len(bbox), 4)
+        self.assertGreater(bbox[0], 0)
+        self.assertLess(bbox[2], 479)
