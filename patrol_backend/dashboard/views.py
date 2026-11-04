@@ -2569,8 +2569,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 defer_attendance_v3_refresh,
                 kiosk_apply_punch,
             )
+            from patrol_backend.utils.site_shift_headcount import SiteShiftRoleCapExceeded
 
             defer_refresh = getattr(settings, "FACE_KIOSK_DEFER_METRICS_REFRESH", False)
+            enforce_headcount = bool(getattr(request, "_gtms_enforce_headcount", False))
             try:
                 _t_punch = _time.perf_counter()
                 action_mode, attendance, log, status_code = kiosk_apply_punch(
@@ -2588,6 +2590,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     search_end_utc=search_end_utc,
                     user_tz=user_tz,
                     refresh_fn=None if defer_refresh else _attendance_v3_refresh_saved_fields,
+                    enforce_headcount=enforce_headcount,
                 )
                 timing["db_save_ms"] = int((_time.perf_counter() - _t_punch) * 1000)
                 timing["total_ms"] = _elapsed_ms()
@@ -2635,6 +2638,22 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         "worked_hours": round(exc.worked_minutes / 60.0, 2),
                         "max_monthly_work_hours": exc.max_hours,
                         "blocked_date": exc.blocked_date.isoformat() if exc.blocked_date else None,
+                    },
+                )
+            except SiteShiftRoleCapExceeded as exc:
+                payload = exc.as_dict()
+                return _kiosk_error(
+                    payload.get("code") or "site_shift_role_cap_exceeded",
+                    payload.get("error") or payload.get("message") or str(exc),
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "role": payload.get("role"),
+                        "current": payload.get("current"),
+                        "max": payload.get("max"),
+                        "site_id": payload.get("site_id"),
+                        "shift_id": payload.get("shift_id"),
+                        "date": payload.get("date"),
                     },
                 )
 
@@ -2813,6 +2832,10 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 assert_monthly_hours_allowed,
                 shift_length_minutes,
             )
+            from patrol_backend.utils.site_shift_headcount import (
+                SiteShiftRoleCapExceeded,
+                assert_headcount_allowed,
+            )
 
             try:
                 assert_consecutive_work_allowed(
@@ -2828,6 +2851,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     location_id=getattr(org_location, "id", None),
                     site_id=getattr(matched_site, "id", None),
                 )
+                if getattr(request, "_gtms_enforce_headcount", False) and getattr(
+                    matched_site, "id", None
+                ):
+                    assert_headcount_allowed(
+                        site_id=matched_site.id,
+                        shift_id=shift.id,
+                        on_date=shift_start_date,
+                        role=getattr(user, "role", "") or "",
+                        extra=1,
+                        exclude_guard_id=getattr(user, "id", None),
+                    )
                 enforce_checkin_allowed_after_checkout(
                     user, assignment, shift, org_location, search_start_utc, search_end_utc
                 )
@@ -2864,6 +2898,22 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                         "worked_hours": round(exc.worked_minutes / 60.0, 2),
                         "max_monthly_work_hours": exc.max_hours,
                         "blocked_date": exc.blocked_date.isoformat() if exc.blocked_date else None,
+                    },
+                )
+            except SiteShiftRoleCapExceeded as exc:
+                payload = exc.as_dict()
+                return _kiosk_error(
+                    payload.get("code") or "site_shift_role_cap_exceeded",
+                    payload.get("error") or payload.get("message") or str(exc),
+                    extra={
+                        "user_id": str(user.id),
+                        "has_shift": True,
+                        "role": payload.get("role"),
+                        "current": payload.get("current"),
+                        "max": payload.get("max"),
+                        "site_id": payload.get("site_id"),
+                        "shift_id": payload.get("shift_id"),
+                        "date": payload.get("date"),
                     },
                 )
 
@@ -3041,6 +3091,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
         from patrol_backend.utils.face_liveness import liveness_enabled
 
         request._gtms_require_liveness = True
+        # Phase 5: site+shift+role caps on checkin only (legacy face_attendance unchanged).
+        request._gtms_enforce_headcount = True
         with liveness_enabled(True):
             return self.face_attendance(request)
 
@@ -4371,6 +4423,33 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 })
                 continue
 
+            if getattr(request, "_gtms_enforce_headcount", False) and site_id:
+                from patrol_backend.utils.site_shift_headcount import (
+                    SiteShiftRoleCapExceeded,
+                    assert_headcount_allowed,
+                )
+
+                try:
+                    assert_headcount_allowed(
+                        site_id=site_id,
+                        shift_id=shift.id,
+                        on_date=target_date,
+                        role=getattr(guard, "role", "") or "",
+                        extra=1,
+                        exclude_guard_id=getattr(guard, "id", None),
+                    )
+                except SiteShiftRoleCapExceeded as exc:
+                    payload = exc.as_dict()
+                    failed.append({
+                        "user_id": str(guard.id),
+                        "error": payload.get("error"),
+                        "code": payload.get("code"),
+                        "role": payload.get("role"),
+                        "current": payload.get("current"),
+                        "max": payload.get("max"),
+                    })
+                    continue
+
             try:
                 with transaction.atomic():
                     assignment = Assignment.objects.filter(
@@ -4396,6 +4475,16 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                             end_date=target_date,
                             created_by=actor,
                             modified_by=actor,
+                        )
+
+                    if getattr(request, "_gtms_enforce_headcount", False) and site_id:
+                        from scheduler.daily_site import fill_daily_sites
+
+                        fill_daily_sites(
+                            assignment,
+                            site_id,
+                            date=target_date,
+                            caller=actor,
                         )
 
                     # When bulk-assigning shift/checkin for a weekoff guard, clear that day's weekoff.
@@ -4708,6 +4797,25 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 
         shift = assignment.shift
         org_location = shift.location
+        if getattr(request, "_gtms_enforce_headcount", False) and site_id:
+            from patrol_backend.utils.site_shift_headcount import assert_headcount_allowed
+            from scheduler.daily_site import fill_daily_sites
+
+            assert_headcount_allowed(
+                site_id=site_id,
+                shift_id=shift.id,
+                on_date=target_date,
+                role=getattr(guard, "role", "") or "",
+                extra=1,
+                exclude_guard_id=getattr(guard, "id", None),
+            )
+            fill_daily_sites(
+                assignment,
+                site_id,
+                date=target_date,
+                caller=actor,
+            )
+
         search_start_utc, search_end_utc, shift_start_dt_user, shift_end_dt_user, _ = (
             _attendance_v3_shift_window_utc(
                 target_date,
@@ -4972,6 +5080,7 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
             MonthlyHourLimitExceeded,
             resolve_labour_law_settings,
         )
+        from patrol_backend.utils.site_shift_headcount import SiteShiftRoleCapExceeded
 
         cw_enabled, cw_max_days, cw_max_hours, _ = resolve_labour_law_settings(
             scoped_location_id, site_id
@@ -5038,6 +5147,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                     "worked_hours": payload.get("worked_hours"),
                     "max_monthly_work_hours": payload.get("max_monthly_work_hours"),
                     "blocked_date": payload.get("blocked_date"),
+                })
+            except SiteShiftRoleCapExceeded as exc:
+                payload = exc.as_dict()
+                failed.append({
+                    "user_id": str(user_id),
+                    "date": str(target_date),
+                    "error": payload.get("error"),
+                    "code": payload.get("code"),
+                    "role": payload.get("role"),
+                    "current": payload.get("current"),
+                    "max": payload.get("max"),
                 })
             except Exception as ex:
                 failed.append({"user_id": str(user_id), "date": str(target_date), "error": str(ex)})

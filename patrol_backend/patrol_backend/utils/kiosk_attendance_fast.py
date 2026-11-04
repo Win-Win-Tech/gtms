@@ -131,6 +131,7 @@ def kiosk_apply_punch(
     latest_checkin=None,
     latest_checkout=None,
     has_open_session: Optional[bool] = None,
+    enforce_headcount: bool = False,
 ) -> Tuple[str, Any, Any, int]:
     """
     Create CheckInLog + update AttendanceCheckin using shared v4 rules.
@@ -224,6 +225,18 @@ def kiosk_apply_punch(
                 location_id=getattr(org_location, "id", None),
                 site_id=getattr(matched_site, "id", None),
             )
+            # Phase 5: headcount only on checkin (never checkout); no-op when no caps.
+            if enforce_headcount and getattr(matched_site, "id", None):
+                from patrol_backend.utils.site_shift_headcount import assert_headcount_allowed
+
+                assert_headcount_allowed(
+                    site_id=matched_site.id,
+                    shift_id=shift.id,
+                    on_date=shift_start_date,
+                    role=getattr(user, "role", "") or "",
+                    extra=1,
+                    exclude_guard_id=getattr(user, "id", None),
+                )
             enforce_checkin_allowed_after_checkout(
                 user,
                 assignment,

@@ -145,6 +145,10 @@ class CreateAssignmentV5(APIView):
                 assert_consecutive_work_allowed,
                 assert_consecutive_work_range,
             )
+            from patrol_backend.utils.site_shift_headcount import (
+                SiteShiftRoleCapExceeded,
+                assert_headcount_allowed,
+            )
 
             target_guard = None
             if guard_id:
@@ -172,6 +176,18 @@ class CreateAssignmentV5(APIView):
                         )
                     except ConsecutiveWorkLimitExceeded as exc:
                         return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
+                    if site_id:
+                        try:
+                            assert_headcount_allowed(
+                                site_id=site_id,
+                                shift_id=shift_obj.id,
+                                on_date=on_date,
+                                role=getattr(target_guard, "role", "") or "",
+                                extra=1,
+                                exclude_guard_id=getattr(target_guard, "id", None),
+                            )
+                        except SiteShiftRoleCapExceeded as exc:
+                            return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
 
             from dashboard.views import AttendanceCheckinViewSet
 
@@ -862,6 +878,30 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
             except (ConsecutiveWorkLimitExceeded, MonthlyHourLimitExceeded) as exc:
                 return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
 
+            # Phase 5: cheap site+shift+role headcount (early exit when no caps).
+            # Already-assigned guards pass via exclude_guard_id. Checkout never gated.
+            punch_site_id = getattr(matched_site, "id", None)
+            if punch_site_id:
+                from patrol_backend.utils.site_shift_headcount import (
+                    SiteShiftRoleCapExceeded,
+                    assert_headcount_allowed,
+                )
+
+                try:
+                    _t_hc = _time.perf_counter()
+                    hc_info = assert_headcount_allowed(
+                        site_id=punch_site_id,
+                        shift_id=shift.id,
+                        on_date=shift_start_date,
+                        role=getattr(user, "role", "") or "",
+                        extra=1,
+                        exclude_guard_id=getattr(user, "id", None),
+                    )
+                    timing["headcount_ms"] = int((_time.perf_counter() - _t_hc) * 1000)
+                    timing["headcount_skipped"] = hc_info.get("headcount_skipped") or ""
+                except SiteShiftRoleCapExceeded as exc:
+                    return Response(exc.as_dict(), status=status.HTTP_400_BAD_REQUEST)
+
             image_file = request.FILES.get("image") or request.FILES.get("checkin_image")
             raw_bytes = image_file.read() if image_file else None
 
@@ -1162,6 +1202,8 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
     def bulk_entry_v5(self, request):
         try:
             assert_site_in_scope(request, request.data.get("site_id"))
+            # Phase 4: enforce site+shift+role caps (legacy bulk-entry unchanged).
+            request._gtms_enforce_headcount = True
             return self._live().bulk_entry(request)
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)
@@ -1178,6 +1220,8 @@ class AttendanceCheckinViewSetV5(viewsets.GenericViewSet):
     def monthly_cell_action_v5(self, request):
         try:
             assert_site_in_scope(request, request.data.get("site_id"))
+            # Phase 4: enforce site+shift+role caps on mark_present (legacy monthly unchanged).
+            request._gtms_enforce_headcount = True
             return self._live().monthly_cell_action(request)
         except (ValidationError, PermissionDenied) as exc:
             return _v5_error(exc)

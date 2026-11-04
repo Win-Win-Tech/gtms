@@ -138,6 +138,48 @@ class LocationSite(models.Model):
         return f"{self.location.name} - {self.name}"
 
 
+class SiteShiftRoleCap(models.Model):
+    """
+    Max headcount for one role on one site + shift.
+    Phase 1: config only. Enforcement is added in later phases.
+    Total capacity for a site+shift is the sum of role max_count values.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    site = models.ForeignKey(
+        LocationSite,
+        on_delete=models.CASCADE,
+        related_name="shift_role_caps",
+    )
+    shift = models.ForeignKey(
+        "Shift",
+        on_delete=models.CASCADE,
+        related_name="site_role_caps",
+    )
+    role = models.CharField(max_length=32, help_text="Lowercase User.role, e.g. so / fo / guard")
+    max_count = models.PositiveIntegerField()
+    created_on = models.DateTimeField(auto_now_add=True)
+    modified_on = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "shift", "role"],
+                name="uniq_site_shift_role_cap",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["site", "shift"], name="idx_site_shift_role_cap"),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.role = (self.role or "").strip().lower()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.site_id} {self.shift_id} {self.role}={self.max_count}"
+
+
 class Vendor(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)

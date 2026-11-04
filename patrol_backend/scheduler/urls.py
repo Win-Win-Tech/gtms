@@ -19,6 +19,7 @@ from .views_cameras import (
     CctvMediaMtxSyncView,
     SiteCameraListReplaceView,
 )
+from .views_shift_role_caps import SiteShiftRoleCapView
 
 router = DefaultRouter()
 router.register('locations', LocationViewSet)
@@ -57,4 +58,9 @@ urlpatterns = router.urls + [
         name='cctv-face-events',
     ),
     path('v5/', include(v5_router.urls)),
+    path(
+        'v5/sites/<uuid:site_id>/shift-role-caps/',
+        SiteShiftRoleCapView.as_view(),
+        name='site-shift-role-caps-v5',
+    ),
 ]

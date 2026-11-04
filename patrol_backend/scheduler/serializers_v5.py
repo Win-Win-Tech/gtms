@@ -33,6 +33,10 @@ class AssignmentSerializerV5(AssignmentSerializer):
             ConsecutiveWorkLimitExceeded,
             assert_consecutive_work_range,
         )
+        from patrol_backend.utils.site_shift_headcount import (
+            SiteShiftRoleCapExceeded,
+            assert_headcount_range,
+        )
 
         guard = data.get("guard")
         start_date = data.get("start_date")
@@ -52,6 +56,22 @@ class AssignmentSerializerV5(AssignmentSerializer):
                     exclude_assignment_id=getattr(self.instance, "id", None),
                 )
             except ConsecutiveWorkLimitExceeded as exc:
+                raise serializers.ValidationError(exc.as_serializer_error())
+
+        # Phase 3: site+shift+role headcount (skip when no site_id / no caps configured).
+        if guard and shift and site_id and start_date and end_date:
+            try:
+                assert_headcount_range(
+                    site_id=site_id,
+                    shift_id=getattr(shift, "id", shift),
+                    start_date=start_date,
+                    end_date=end_date,
+                    role=getattr(guard, "role", "") or "",
+                    extra=1,
+                    exclude_guard_id=getattr(guard, "id", None),
+                    only_date=data.get("date"),
+                )
+            except SiteShiftRoleCapExceeded as exc:
                 raise serializers.ValidationError(exc.as_serializer_error())
         return data
 
