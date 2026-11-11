@@ -75,6 +75,30 @@ REPORT_CATALOG = [
         "supports_site_wise": True,
         "default_schedule": Item.SCHEDULE_MONTHLY,
     },
+    {
+        "code": Item.REPORT_PUBLIC_HOLIDAY_WORKED,
+        "label": "Public Holiday Worked",
+        "supports_pdf": True,
+        "supports_excel": True,
+        "supports_site_wise": True,
+        "default_schedule": Item.SCHEDULE_DAILY,
+    },
+    {
+        "code": Item.REPORT_AUTO_CHECKOUT,
+        "label": "Auto Checkout",
+        "supports_pdf": True,
+        "supports_excel": True,
+        "supports_site_wise": True,
+        "default_schedule": Item.SCHEDULE_DAILY,
+    },
+    {
+        "code": Item.REPORT_EMPLOYEE_DURATION,
+        "label": "Employee Duration Report",
+        "supports_pdf": True,
+        "supports_excel": True,
+        "supports_site_wise": True,
+        "default_schedule": Item.SCHEDULE_DAILY,
+    },
 ]
 
 REPORT_CATALOG_BY_CODE = {r["code"]: r for r in REPORT_CATALOG}

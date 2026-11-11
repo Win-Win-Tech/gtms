@@ -14,7 +14,7 @@ class LocationReportEmailItemInline(admin.TabularInline):
 
 @admin.register(LocationReportEmailConfig)
 class LocationReportEmailConfigAdmin(admin.ModelAdmin):
-    list_display = ("location", "is_enabled", "send_time", "recipients")
+    list_display = ("location", "is_enabled", "send_time", "recipients", "cc_recipients")
     inlines = [LocationReportEmailItemInline]
 
 

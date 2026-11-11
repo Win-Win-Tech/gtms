@@ -44,15 +44,22 @@ def parse_recipients(raw) -> list[str]:
     return emails
 
 
-def send_report_email(location, subject, body_lines, attachments, recipients):
+def send_report_email(location, subject, body_lines, attachments, recipients, cc=None):
     """
     Send one email with binary attachments to all recipients.
     attachments: list of {filename, content, mime, display_name, row_count}
+    To: first address in recipients; remaining To addresses go BCC.
+    CC: optional separate list (does not affect To/BCC split).
     """
     to = parse_recipients(recipients)
     if not to:
         logger.warning("No valid recipients for location %s", location.name)
         return {"sent": False, "attachments_count": 0, "reason": "no_recipients"}
+
+    cc_emails = parse_recipients(cc or [])
+    # Avoid duplicating anyone already in To/BCC
+    to_keys = {e.lower() for e in to}
+    cc_emails = [e for e in cc_emails if e.lower() not in to_keys]
 
     valid = [a for a in (attachments or []) if a.get("content") and a.get("filename")]
     if not valid:
@@ -82,16 +89,23 @@ def send_report_email(location, subject, body_lines, attachments, recipients):
         body=body,
         from_email=settings.DEFAULT_FROM_EMAIL,
         to=[to[0]],
+        cc=cc_emails or None,
         bcc=to[1:] if len(to) > 1 else None,
     )
     for att in valid:
         email.attach(att["filename"], att["content"], att.get("mime") or "application/octet-stream")
 
     logger.info(
-        "Sending report email for %s to %s recipient(s) with %s attachment(s)",
+        "Sending report email for %s to %s recipient(s) cc=%s with %s attachment(s)",
         location.name,
         len(to),
+        len(cc_emails),
         len(valid),
     )
     email.send(fail_silently=False)
-    return {"sent": True, "attachments_count": len(valid), "recipients": to}
+    return {
+        "sent": True,
+        "attachments_count": len(valid),
+        "recipients": to,
+        "cc": cc_emails,
+    }

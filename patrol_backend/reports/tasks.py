@@ -196,6 +196,7 @@ def _process_org_config(config: LocationReportEmailConfig, force: bool = False):
         body_lines=[],
         attachments=attachments,
         recipients=recipients,
+        cc=config.cc_list(),
     )
 
     if result.get("sent"):
@@ -322,11 +323,12 @@ def _process_org_config_force_all(config: LocationReportEmailConfig):
 
     subject = f"[TEST] Reports - {location.name} ({now_local.date().isoformat()})"
     return send_report_email(
-                    location=location,
+        location=location,
         subject=subject,
         body_lines=["", "(This is a manual test send.)"],
         attachments=attachments,
         recipients=recipients,
+        cc=config.cc_list(),
     )
 
 

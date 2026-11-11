@@ -16,6 +16,7 @@ from .views_v5 import (
     ShiftTodayV5,
 )
 from .views_public_holiday import PublicHolidayViewSet
+from .employee_duration_report import EmployeeDurationViewSet
 
 
 router = DefaultRouter()
@@ -26,6 +27,7 @@ router.register(r'attendance-excel', MonthlyAttendanceExcelViewSet, basename="at
 router.register(r'attendance-excel-v2', MonthlyAttendanceExcelViewSetV2, basename="attendance-excel-v2")
 router.register(r"attendance-weekoff", AttendanceWeekOffViewSet, basename="attendance-weekoff")
 router.register(r"attendance-weekoff-v2", AttendanceWeekOffViewSetV2, basename="attendance-weekoff-v2")
+router.register(r"employee-duration", EmployeeDurationViewSet, basename="employee-duration")
 
 v5_router = DefaultRouter()
 v5_router.register(r'attendance', AttendanceCheckinViewSetV5, basename='attendance-v5')

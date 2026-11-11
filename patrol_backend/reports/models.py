@@ -24,6 +24,11 @@ class LocationReportEmailConfig(models.Model):
         default="",
         help_text="Comma-separated recipient email addresses",
     )
+    cc_recipients = models.TextField(
+        blank=True,
+        default="",
+        help_text="Comma-separated CC email addresses",
+    )
     send_time = models.TimeField(
         help_text="Local org timezone clock time to send matching reports",
     )
@@ -41,6 +46,11 @@ class LocationReportEmailConfig(models.Model):
         from reports.services.email_sender import parse_recipients
 
         return parse_recipients(self.recipients or "")
+
+    def cc_list(self):
+        from reports.services.email_sender import parse_recipients
+
+        return parse_recipients(self.cc_recipients or "")
 
 
 def default_monthly_send_days():
@@ -98,6 +108,9 @@ class LocationReportEmailItem(models.Model):
     REPORT_VEHICLE_OVERSTAY = "vehicle_overstay"
     REPORT_MONTHLY_ATTENDANCE = "monthly_attendance"
     REPORT_MONTHLY_LOCATION = "monthly_location"
+    REPORT_PUBLIC_HOLIDAY_WORKED = "public_holiday_worked"
+    REPORT_AUTO_CHECKOUT = "auto_checkout"
+    REPORT_EMPLOYEE_DURATION = "employee_duration"
     REPORT_CODE_CHOICES = (
         (REPORT_CHECKIN, "QR Scan Patrol Report"),
         (REPORT_ATTENDANCE, "Attendance Report"),
@@ -108,6 +121,9 @@ class LocationReportEmailItem(models.Model):
         (REPORT_VEHICLE_OVERSTAY, "Vehicle Overstay"),
         (REPORT_MONTHLY_ATTENDANCE, "Monthly Attendance Summary"),
         (REPORT_MONTHLY_LOCATION, "Monthly Location Summary"),
+        (REPORT_PUBLIC_HOLIDAY_WORKED, "Public Holiday Worked"),
+        (REPORT_AUTO_CHECKOUT, "Auto Checkout"),
+        (REPORT_EMPLOYEE_DURATION, "Employee Duration Report"),
     )
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

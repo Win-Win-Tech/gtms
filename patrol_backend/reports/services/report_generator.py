@@ -724,6 +724,176 @@ def _monthly_loc_generate(location_id, period, site_id, request, send_pdf, send_
 
 
 # ---------------------------------------------------------------------------
+# Public Holiday Worked
+# ---------------------------------------------------------------------------
+
+def _ph_worked_queryset(location_id, period, site_id, request):
+    from dashboard.views_public_holiday import _worked_queryset
+
+    return _worked_queryset(request)
+
+
+def _ph_worked_has_data(location_id, period, site_id, request):
+    qs = _ph_worked_queryset(location_id, period, site_id, request)
+    return qs is not None and qs.exists()
+
+
+def _ph_worked_generate(location_id, period, site_id, request, send_pdf, send_excel, label):
+    from dashboard.views_public_holiday import generate_worked_excel, generate_worked_pdf
+
+    qs = _ph_worked_queryset(location_id, period, site_id, request)
+    if qs is None or not qs.exists():
+        return []
+    count = qs.count()
+    attachments = []
+    start, _ = _period_dates(period)
+    base = f"public_holiday_worked_{_safe_name(label)}_{start}"
+
+    if send_excel:
+        buf = generate_worked_excel(qs, request)
+        attachments.append(
+            {
+                "filename": f"{base}.xlsx",
+                "content": buf.getvalue() if hasattr(buf, "getvalue") else buf,
+                "mime": MIME_XLSX,
+                "format": "excel",
+                "row_count": count,
+                "display_name": f"Public Holiday Worked ({label})",
+            }
+        )
+    if send_pdf:
+        buf = generate_worked_pdf(qs, request)
+        attachments.append(
+            {
+                "filename": f"{base}.pdf",
+                "content": buf.getvalue() if hasattr(buf, "getvalue") else buf,
+                "mime": MIME_PDF,
+                "format": "pdf",
+                "row_count": count,
+                "display_name": f"Public Holiday Worked ({label})",
+            }
+        )
+    return attachments
+
+
+# ---------------------------------------------------------------------------
+# Auto Checkout
+# ---------------------------------------------------------------------------
+
+def _auto_checkout_queryset(location_id, period, site_id, request):
+    from livetracking.auto_checkout_report import filter_auto_checkout_queryset
+
+    user = getattr(request, "user", None)
+    return filter_auto_checkout_queryset(request, user)
+
+
+def _auto_checkout_has_data(location_id, period, site_id, request):
+    qs = _auto_checkout_queryset(location_id, period, site_id, request)
+    return qs is not None and qs.exists()
+
+
+def _auto_checkout_generate(location_id, period, site_id, request, send_pdf, send_excel, label):
+    from livetracking.auto_checkout_report import (
+        generate_auto_checkout_excel,
+        generate_auto_checkout_pdf,
+    )
+
+    qs = _auto_checkout_queryset(location_id, period, site_id, request)
+    if qs is None or not qs.exists():
+        return []
+    count = qs.count()
+    user = getattr(request, "user", None)
+    attachments = []
+    start, _ = _period_dates(period)
+    base = f"auto_checkout_{_safe_name(label)}_{start}"
+
+    if send_excel:
+        buf = generate_auto_checkout_excel(qs, user, request=request)
+        attachments.append(
+            {
+                "filename": f"{base}.xlsx",
+                "content": buf.getvalue() if hasattr(buf, "getvalue") else buf,
+                "mime": MIME_XLSX,
+                "format": "excel",
+                "row_count": count,
+                "display_name": f"Auto Checkout ({label})",
+            }
+        )
+    if send_pdf:
+        buf = generate_auto_checkout_pdf(qs, user, request=request)
+        attachments.append(
+            {
+                "filename": f"{base}.pdf",
+                "content": buf.getvalue() if hasattr(buf, "getvalue") else buf,
+                "mime": MIME_PDF,
+                "format": "pdf",
+                "row_count": count,
+                "display_name": f"Auto Checkout ({label})",
+            }
+        )
+    return attachments
+
+
+# ---------------------------------------------------------------------------
+# Employee Duration
+# ---------------------------------------------------------------------------
+
+def _employee_duration_rows(location_id, period, site_id, request):
+    from dashboard.employee_duration_report import build_employee_duration_rows
+
+    data = build_employee_duration_rows(request, paginate=False)
+    if data.get("error"):
+        return []
+    return data.get("results") or []
+
+
+def _employee_duration_has_data(location_id, period, site_id, request):
+    return len(_employee_duration_rows(location_id, period, site_id, request)) > 0
+
+
+def _employee_duration_generate(location_id, period, site_id, request, send_pdf, send_excel, label):
+    from dashboard.employee_duration_report import (
+        generate_employee_duration_excel,
+        generate_employee_duration_pdf,
+    )
+
+    rows = _employee_duration_rows(location_id, period, site_id, request)
+    if not rows:
+        return []
+    count = len(rows)
+    attachments = []
+    start, _ = _period_dates(period)
+    base = f"employee_duration_{_safe_name(label)}_{start}"
+    display = f"Employee Duration ({label})"
+
+    if send_excel:
+        buf = generate_employee_duration_excel(rows, label=display)
+        attachments.append(
+            {
+                "filename": f"{base}.xlsx",
+                "content": buf.getvalue(),
+                "mime": MIME_XLSX,
+                "format": "excel",
+                "row_count": count,
+                "display_name": display,
+            }
+        )
+    if send_pdf:
+        buf = generate_employee_duration_pdf(rows, label=display)
+        attachments.append(
+            {
+                "filename": f"{base}.pdf",
+                "content": buf.getvalue(),
+                "mime": MIME_PDF,
+                "format": "pdf",
+                "row_count": count,
+                "display_name": display,
+            }
+        )
+    return attachments
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -737,6 +907,9 @@ _HANDLERS = {
     Item.REPORT_VEHICLE_OVERSTAY: (_vehicle_overstay_has_data, _vehicle_overstay_generate),
     Item.REPORT_MONTHLY_ATTENDANCE: (_monthly_att_has_data, _monthly_att_generate),
     Item.REPORT_MONTHLY_LOCATION: (_monthly_loc_has_data, _monthly_loc_generate),
+    Item.REPORT_PUBLIC_HOLIDAY_WORKED: (_ph_worked_has_data, _ph_worked_generate),
+    Item.REPORT_AUTO_CHECKOUT: (_auto_checkout_has_data, _auto_checkout_generate),
+    Item.REPORT_EMPLOYEE_DURATION: (_employee_duration_has_data, _employee_duration_generate),
 }
 
 

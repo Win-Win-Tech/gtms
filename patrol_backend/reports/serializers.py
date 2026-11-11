@@ -219,6 +219,7 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
             "location_name",
             "is_enabled",
             "recipients",
+            "cc_recipients",
             "send_time",
             "timezone",
             "items",
@@ -243,6 +244,10 @@ class LocationReportEmailConfigSerializer(serializers.ModelSerializer):
                 "At least one valid recipient email is required when enabled."
             )
         # Always persist as comma-space joined so multi-recipient is unambiguous
+        return ", ".join(emails)
+
+    def validate_cc_recipients(self, value):
+        emails = parse_recipients(value or "")
         return ", ".join(emails)
 
     def validate_send_time(self, value):
