@@ -173,6 +173,11 @@ class UserLiveLocation(models.Model):
         default=BoundaryState.UNKNOWN,
         blank=True,
     )
+    boundary_outside_since = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the user first became continuously outside; cleared on re-entry.",
+    )
     last_location_at = models.DateTimeField(null=True, blank=True)
     active_breach_alert = models.ForeignKey(
         TrackingAlert,

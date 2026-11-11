@@ -15,6 +15,7 @@ from scheduler.models import LocationSite, SiteSetting
 BOUNDARY_SETTING_BREACH_ALERTS_ENABLED = "boundary_breach_alerts_enabled"
 BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED = "location_missing_alerts_enabled"
 BOUNDARY_SETTING_EXIT_BUFFER_M = "boundary_exit_buffer_m"
+BOUNDARY_SETTING_OUTSIDE_BUFFER_MIN = "boundary_outside_buffer_min"
 BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN = "boundary_still_outside_reminder_min"
 BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN = "location_missing_timeout_min"
 
@@ -22,6 +23,7 @@ BOUNDARY_SETTING_DEFAULTS = {
     BOUNDARY_SETTING_BREACH_ALERTS_ENABLED: ("false", None),
     BOUNDARY_SETTING_LOCATION_MISSING_ALERTS_ENABLED: ("false", None),
     BOUNDARY_SETTING_EXIT_BUFFER_M: ("15", "m"),
+    BOUNDARY_SETTING_OUTSIDE_BUFFER_MIN: ("5", "min"),
     BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN: ("0", "min"),
     BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN: ("10", "min"),
 }
@@ -45,20 +47,33 @@ def get_boundary_setting_raw(
     key: str,
     location_id=None,
     default_value=None,
+    site_id=None,
 ):
+    """Resolve setting with site → org → global when site_id is provided."""
     return SiteSetting.get_setting(
         key=key,
         location_id=location_id,
         default_value=default_value,
+        site_id=site_id,
     )
 
 
-def get_boundary_setting_int(key: str, location_id=None, default_value: int = 0) -> int:
+def get_boundary_setting_int(
+    key: str,
+    location_id=None,
+    default_value: int = 0,
+    site_id=None,
+) -> int:
     default = default_value
     if default is None:
         default = 0
     try:
-        raw = get_boundary_setting_raw(key, location_id=location_id, default_value=default)
+        raw = get_boundary_setting_raw(
+            key,
+            location_id=location_id,
+            default_value=default,
+            site_id=site_id,
+        )
         if raw is None:
             return int(default)
         return int(raw)
@@ -66,11 +81,17 @@ def get_boundary_setting_int(key: str, location_id=None, default_value: int = 0)
         return int(default)
 
 
-def get_boundary_setting_bool(key: str, location_id=None, default_value: bool = False) -> bool:
+def get_boundary_setting_bool(
+    key: str,
+    location_id=None,
+    default_value: bool = False,
+    site_id=None,
+) -> bool:
     raw = get_boundary_setting_raw(
         key,
         location_id=location_id,
         default_value="true" if default_value else "false",
+        site_id=site_id,
     )
     return _parse_bool(raw, default=default_value)
 
@@ -132,35 +153,54 @@ def is_boundary_monitoring_active(location_id, site: Optional[LocationSite]) -> 
     return site_has_configured_boundary(site)
 
 
-def get_boundary_exit_buffer_m(location_id) -> int:
+def get_boundary_exit_buffer_m(location_id, site_id=None) -> int:
     return max(
         0,
         get_boundary_setting_int(
             BOUNDARY_SETTING_EXIT_BUFFER_M,
             location_id=location_id,
             default_value=15,
+            site_id=site_id,
         ),
     )
 
 
-def get_boundary_still_outside_reminder_min(location_id) -> int:
+def get_boundary_outside_buffer_min(location_id, site_id=None) -> int:
+    """
+    Minutes a user may stay continuously outside before breach alert + auto-checkout.
+    0 = immediate (legacy). Default 5. Lookup: site → org → global.
+    """
+    return max(
+        0,
+        get_boundary_setting_int(
+            BOUNDARY_SETTING_OUTSIDE_BUFFER_MIN,
+            location_id=location_id,
+            default_value=5,
+            site_id=site_id,
+        ),
+    )
+
+
+def get_boundary_still_outside_reminder_min(location_id, site_id=None) -> int:
     return max(
         0,
         get_boundary_setting_int(
             BOUNDARY_SETTING_STILL_OUTSIDE_REMINDER_MIN,
             location_id=location_id,
             default_value=0,
+            site_id=site_id,
         ),
     )
 
 
-def get_location_missing_timeout_min(location_id) -> int:
+def get_location_missing_timeout_min(location_id, site_id=None) -> int:
     return max(
         1,
         get_boundary_setting_int(
             BOUNDARY_SETTING_LOCATION_MISSING_TIMEOUT_MIN,
             location_id=location_id,
             default_value=10,
+            site_id=site_id,
         ),
     )
 
@@ -261,7 +301,8 @@ def evaluate_site_boundary(
         return None
 
     boundary_type = site.boundary_type
-    exit_buffer_m = get_boundary_exit_buffer_m(loc_id)
+    site_id = getattr(site, "id", None)
+    exit_buffer_m = get_boundary_exit_buffer_m(loc_id, site_id=site_id)
 
     if boundary_type == LocationSite.BoundaryType.CIRCLE:
         radius_m = site.boundary_radius_m

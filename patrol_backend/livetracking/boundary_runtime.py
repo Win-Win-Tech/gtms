@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from patrol_backend.utils.boundary_utils import (
     evaluate_site_boundary,
+    get_boundary_outside_buffer_min,
     get_boundary_still_outside_reminder_min,
     get_location_missing_timeout_min,
     is_boundary_monitoring_active,
@@ -46,7 +47,8 @@ def _maybe_still_outside_reminder(
     breach_alert: TrackingAlert,
     now,
 ) -> None:
-    reminder_min = get_boundary_still_outside_reminder_min(location_id)
+    site_id = getattr(site, "id", None)
+    reminder_min = get_boundary_still_outside_reminder_min(location_id, site_id=site_id)
     if reminder_min <= 0 or not breach_alert:
         return
 
@@ -139,7 +141,10 @@ def process_location_boundary_update(
     if not assigned_site:
         live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN
         live_loc.is_inside_boundary = None
-        live_loc.save(update_fields=["boundary_state", "is_inside_boundary"])
+        live_loc.boundary_outside_since = None
+        live_loc.save(
+            update_fields=["boundary_state", "is_inside_boundary", "boundary_outside_since"]
+        )
         return {
             "assigned_site_id": None,
             "is_inside_boundary": None,
@@ -154,7 +159,10 @@ def process_location_boundary_update(
     if not is_boundary_monitoring_active(location_id, assigned_site):
         live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN
         live_loc.is_inside_boundary = None
-        live_loc.save(update_fields=["boundary_state", "is_inside_boundary"])
+        live_loc.boundary_outside_since = None
+        live_loc.save(
+            update_fields=["boundary_state", "is_inside_boundary", "boundary_outside_since"]
+        )
         _resolve_location_missing_alerts(user, assigned_site)
         return {
             "assigned_site_id": str(assigned_site.id),
@@ -183,7 +191,13 @@ def process_location_boundary_update(
 
     _resolve_location_missing_alerts(user, assigned_site)
 
-    update_fields = ["boundary_state", "is_inside_boundary", "active_breach_alert"]
+    update_fields = [
+        "boundary_state",
+        "is_inside_boundary",
+        "active_breach_alert",
+        "boundary_outside_since",
+    ]
+    site_id = getattr(assigned_site, "id", None)
 
     has_active_breach_alert = bool(
         live_loc.active_breach_alert_id
@@ -200,24 +214,63 @@ def process_location_boundary_update(
         ).exists()
 
     alert = None
-    if new_state == UserLiveLocation.BoundaryState.OUTSIDE and not has_active_breach_alert:
-        alert, _recipients = create_tracking_alert(
-            alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
-            site=assigned_site,
-            subject_user=user,
-            attendance=checkin,
-            latitude=lat,
-            longitude=lng,
-        )
-        if alert:
-            live_loc.active_breach_alert = alert
+    if new_state == UserLiveLocation.BoundaryState.OUTSIDE:
+        # Start / continue outside dwell timer (site → org → global buffer minutes)
+        if live_loc.boundary_outside_since is None:
+            live_loc.boundary_outside_since = now
             logger.info(
-                "[BOUNDARY] Breach alert created user=%s site=%s alert=%s",
+                "[BOUNDARY] Outside dwell started user=%s site=%s since=%s",
                 user.id,
                 assigned_site.id,
-                alert.id,
+                now,
             )
+
+        if not has_active_breach_alert:
+            buffer_min = get_boundary_outside_buffer_min(location_id, site_id=site_id)
+            elapsed_min = (now - live_loc.boundary_outside_since).total_seconds() / 60.0
+            if elapsed_min >= float(buffer_min):
+                alert, _recipients = create_tracking_alert(
+                    alert_type=TrackingAlert.AlertType.BOUNDARY_BREACH,
+                    site=assigned_site,
+                    subject_user=user,
+                    attendance=checkin,
+                    latitude=lat,
+                    longitude=lng,
+                )
+                if alert:
+                    live_loc.active_breach_alert = alert
+                    logger.info(
+                        "[BOUNDARY] Breach alert created user=%s site=%s alert=%s "
+                        "after %.1f min outside (buffer=%s)",
+                        user.id,
+                        assigned_site.id,
+                        alert.id,
+                        elapsed_min,
+                        buffer_min,
+                    )
+            else:
+                logger.debug(
+                    "[BOUNDARY] Outside grace user=%s site=%s elapsed=%.1f buffer=%s — no alert yet",
+                    user.id,
+                    assigned_site.id,
+                    elapsed_min,
+                    buffer_min,
+                )
+        elif (
+            live_loc.active_breach_alert_id
+            and live_loc.active_breach_alert
+            and live_loc.active_breach_alert.is_active
+        ):
+            _maybe_still_outside_reminder(
+                site=assigned_site,
+                location_id=location_id,
+                breach_alert=live_loc.active_breach_alert,
+                now=now,
+            )
+
     elif new_state == UserLiveLocation.BoundaryState.INSIDE:
+        # Re-entry cancels pending grace and resolves active breach alerts
+        live_loc.boundary_outside_since = None
         if live_loc.active_breach_alert_id:
             resolve_tracking_alert(live_loc.active_breach_alert, dispatch_ws=True)
             live_loc.active_breach_alert = None
@@ -242,18 +295,6 @@ def process_location_boundary_update(
         if checkin is None and not get_open_checkin_for_user(user):
             live_loc.assigned_site = None
             update_fields.append("assigned_site")
-    elif (
-        new_state == UserLiveLocation.BoundaryState.OUTSIDE
-        and live_loc.active_breach_alert_id
-        and live_loc.active_breach_alert
-        and live_loc.active_breach_alert.is_active
-    ):
-        _maybe_still_outside_reminder(
-            site=assigned_site,
-            location_id=location_id,
-            breach_alert=live_loc.active_breach_alert,
-            now=now,
-        )
 
     live_loc.boundary_state = new_state
     live_loc.is_inside_boundary = is_inside
@@ -471,6 +512,7 @@ def clear_tracking_state_on_checkout(user, attendance=None, preserve_alert_id=No
         "assigned_site",
         "is_inside_boundary",
         "boundary_state",
+        "boundary_outside_since",
     ]
     if preserve_alert_id and str(live_loc.active_breach_alert_id) == str(preserve_alert_id):
         # Keep active breach alert and assigned_site intact on UserLiveLocation so admins see it
@@ -484,7 +526,10 @@ def clear_tracking_state_on_checkout(user, attendance=None, preserve_alert_id=No
 
     live_loc.is_inside_boundary = None
     live_loc.boundary_state = UserLiveLocation.BoundaryState.UNKNOWN
+    # Manual / shift checkout: reset dwell timer. Boundary auto-checkout keeps timer
+    # while preserve_alert_id is set so re-entry resolution still works.
     if not preserve_alert_id:
+        live_loc.boundary_outside_since = None
         live_loc.last_location_at = None
         update_fields.append("last_location_at")
 
@@ -528,7 +573,9 @@ def run_location_missing_checks(location_id=None) -> dict:
             skipped += 1
             continue
 
-        timeout_min = get_location_missing_timeout_min(org_location_id)
+        timeout_min = get_location_missing_timeout_min(
+            org_location_id, site_id=getattr(site, "id", None)
+        )
         live_loc = UserLiveLocation.objects.filter(user=user).first()
         last_at = live_loc.last_location_at if live_loc else None
         if not last_at:
