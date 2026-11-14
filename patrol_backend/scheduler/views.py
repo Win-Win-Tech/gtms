@@ -344,13 +344,15 @@ class LocationViewSet(viewsets.ModelViewSet):
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
-    queryset = Shift.objects.all()
+    queryset = Shift.objects.all().prefetch_related('sites')
     serializer_class = ShiftSerializer
 
     @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
     def by_location(self, request, location_id=None):
         try:
-            shifts = Shift.objects.filter(location_id=location_id, is_deleted=False)
+            shifts = Shift.objects.filter(
+                location_id=location_id, is_deleted=False
+            ).prefetch_related('sites')
             serializer = self.get_serializer(shifts, many=True)
             return Response(serializer.data)
         except Exception as e:

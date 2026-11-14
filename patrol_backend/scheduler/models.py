@@ -431,6 +431,16 @@ class Shift(models.Model):
     start_time = models.TimeField()
     end_time = models.TimeField()
     is_default = models.BooleanField(default=False)
+    applies_to_all_sites = models.BooleanField(
+        default=True,
+        help_text="When True, shift is available on every site in the organisation.",
+    )
+    sites = models.ManyToManyField(
+        'LocationSite',
+        blank=True,
+        related_name='shifts',
+        help_text="Sites this shift applies to when applies_to_all_sites is False.",
+    )
     checkpoint_template = models.ForeignKey(
         'CheckpointTemplate',
         null=True,

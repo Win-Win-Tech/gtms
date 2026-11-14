@@ -3811,7 +3811,8 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def list_default_shifts(self, request):
         """
-        List default shifts for guard's location.
+        List default shifts for guard's selected site that are in progress
+        or whose start is within ±1 hour of local now.
         Only returns shifts if guard has no shift for today.
         Query params: guard_id
         """
@@ -3845,17 +3846,61 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 {"error": "Guard does not have an assigned location"},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        # Get default shifts for guard's location
+
+        user_tz = get_user_timezone_from_request(request)
+        on_date = get_user_today(user_tz)
+        user_now = get_user_now(user_tz)
+        now_t = user_now.time()
+        now_naive = user_now.replace(tzinfo=None) if getattr(user_now, "tzinfo", None) else user_now
+
+        from scheduler.daily_site import current_site_for
+        selected = current_site_for(guard, on_date)
+        if not selected:
+            return Response({
+                "has_shift": False,
+                "default_shifts": [],
+                "message": "Select a site before choosing a shift",
+                "location_id": str(guard.location.id),
+                "location_name": guard.location.name,
+                "site_id": None,
+                "site_name": None,
+            }, status=status.HTTP_200_OK)
+
+        site_id = selected["id"]
         default_shifts = Shift.objects.filter(
             is_default=True,
             is_deleted=False,
-            location=guard.location
-        ).select_related('checkpoint_template', 'location')
-        
-        # Serialize shifts
-        shifts_data = []
+            location=guard.location,
+        ).filter(
+            Q(applies_to_all_sites=True) | Q(sites__id=site_id)
+        ).select_related('checkpoint_template', 'location').distinct()
+
+        one_hour = timedelta(hours=1)
+
+        def _is_in_progress(start_t, end_t):
+            if end_t <= start_t:
+                return now_t >= start_t or now_t <= end_t
+            return start_t <= now_t <= end_t
+
+        def _start_within_one_hour(start_t):
+            start_today = datetime.combine(on_date, start_t)
+            for start_dt in (start_today - timedelta(days=1), start_today, start_today + timedelta(days=1)):
+                if abs(start_dt - now_naive) <= one_hour:
+                    return True, start_dt
+            return False, start_today
+
+        matched = []
         for shift in default_shifts:
+            in_progress = _is_in_progress(shift.start_time, shift.end_time)
+            near_start, start_dt = _start_within_one_hour(shift.start_time)
+            if not in_progress and not near_start:
+                continue
+            matched.append((0 if in_progress else 1, start_dt, shift, in_progress))
+
+        matched.sort(key=lambda row: (row[0], abs((row[1] - now_naive).total_seconds())))
+
+        shifts_data = []
+        for _, _, shift, in_progress in matched:
             shifts_data.append({
                 "id": str(shift.id),
                 "name": shift.name,
@@ -3865,14 +3910,17 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
                 "location_name": shift.location.name if shift.location else None,
                 "checkpoint_template_id": str(shift.checkpoint_template.id) if shift.checkpoint_template else None,
                 "checkpoint_template_name": shift.checkpoint_template.template_name if shift.checkpoint_template else None,
-                "is_overnight": shift.end_time <= shift.start_time
+                "is_overnight": shift.end_time <= shift.start_time,
+                "in_progress": in_progress,
             })
         
         return Response({
             "has_shift": False,
             "default_shifts": shifts_data,
             "location_id": str(guard.location.id),
-            "location_name": guard.location.name
+            "location_name": guard.location.name,
+            "site_id": site_id,
+            "site_name": selected.get("name"),
         }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])

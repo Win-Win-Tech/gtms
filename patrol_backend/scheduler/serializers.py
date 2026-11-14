@@ -261,10 +261,115 @@ class ShiftSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True
     )
+    site_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+    )
+    site_names = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Shift
-        fields = '__all__'
+        fields = [
+            'id',
+            'name',
+            'location',
+            'start_time',
+            'end_time',
+            'is_default',
+            'applies_to_all_sites',
+            'checkpoint_template',
+            'site_ids',
+            'site_names',
+            'created_on',
+            'modified_on',
+            'created_by',
+            'modified_by',
+            'is_deleted',
+            'deleted_on',
+            'deleted_by',
+        ]
+        read_only_fields = [
+            'created_on',
+            'modified_on',
+            'created_by',
+            'modified_by',
+            'is_deleted',
+            'deleted_on',
+            'deleted_by',
+            'site_names',
+        ]
+
+    def get_site_names(self, obj):
+        if getattr(obj, 'applies_to_all_sites', True):
+            return []
+        return [s.name for s in obj.sites.all()]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if getattr(instance, 'applies_to_all_sites', True):
+            data['site_ids'] = []
+        else:
+            data['site_ids'] = [str(s.id) for s in instance.sites.all()]
+        return data
+
+    def validate(self, attrs):
+        applies_all = attrs.get(
+            'applies_to_all_sites',
+            getattr(self.instance, 'applies_to_all_sites', True) if self.instance else True,
+        )
+        location = attrs.get('location') or (self.instance.location if self.instance else None)
+        site_ids_provided = 'site_ids' in getattr(self, 'initial_data', {})
+        site_ids = attrs.get('site_ids', None)
+
+        if applies_all:
+            attrs['applies_to_all_sites'] = True
+            attrs['_sites'] = []
+            return attrs
+
+        if not site_ids_provided and self.instance is not None:
+            return attrs
+
+        if site_ids is None:
+            site_ids = []
+        if not site_ids:
+            raise serializers.ValidationError(
+                {'site_ids': 'Select at least one site when All sites is off.'}
+            )
+        if location is None:
+            raise serializers.ValidationError({'location': 'Location is required.'})
+        sites = list(LocationSite.objects.filter(id__in=site_ids, location=location))
+        if len(sites) != len({str(sid) for sid in site_ids}):
+            raise serializers.ValidationError(
+                {'site_ids': 'One or more sites are invalid or not in this organisation.'}
+            )
+        attrs['_sites'] = sites
+        return attrs
+
+    def create(self, validated_data):
+        sites = validated_data.pop('_sites', None)
+        validated_data.pop('site_ids', None)
+        applies_all = validated_data.get('applies_to_all_sites', True)
+        shift = super().create(validated_data)
+        if applies_all:
+            shift.sites.clear()
+        elif sites is not None:
+            shift.sites.set(sites)
+        return shift
+
+    def update(self, instance, validated_data):
+        sites = validated_data.pop('_sites', None)
+        validated_data.pop('site_ids', None)
+        shift = super().update(instance, validated_data)
+        if sites is not None:
+            if shift.applies_to_all_sites:
+                shift.sites.clear()
+            else:
+                shift.sites.set(sites)
+        elif shift.applies_to_all_sites:
+            shift.sites.clear()
+        return shift
 
 
 # class AssignmentSerializer(serializers.ModelSerializer):
