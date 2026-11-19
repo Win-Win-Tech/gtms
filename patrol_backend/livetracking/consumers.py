@@ -188,6 +188,20 @@ class LocationConsumer(AsyncWebsocketConsumer):
         event = self._localize_event_timestamps(event)
         await self.send(text_data=json.dumps(event))
 
+    async def notification_inbox(self, event):
+        """Push NotificationLog inbox ping (visitor / support / etc.) to this user."""
+        await self.send(
+            text_data=json.dumps(
+                {
+                    "type": "notification_inbox",
+                    "notification_id": event.get("notification_id"),
+                    "notif_type": event.get("notif_type"),
+                    "title": event.get("title"),
+                    "body": event.get("body"),
+                }
+            )
+        )
+
     def _localize_event_timestamps(self, event):
         """Copy event and add localized timestamp fields for the connected user."""
         event = dict(event)

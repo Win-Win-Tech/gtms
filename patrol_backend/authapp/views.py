@@ -83,6 +83,7 @@ def build_login_client_fields(request, user):
             "Payslip",
             "Live Tracking",
             "Incident",
+            "Support Tickets",
             "Settings",
             "Role Management",
         ]
@@ -587,6 +588,9 @@ class RoleViewSet(viewsets.ModelViewSet):
         if not global_roles.exists():
             return
         for g_role in global_roles:
+            # SUPPORT stays global-only; never seed into organisation role lists.
+            if (g_role.name or "").strip().lower() == "support":
+                continue
             Role.objects.get_or_create(
                 name=g_role.name,
                 location=loc,
@@ -620,6 +624,8 @@ class RoleViewSet(viewsets.ModelViewSet):
         # Admin restriction: Only superusers can see Admin role
         if not user.is_superuser:
             queryset = queryset.exclude(name__iexact='admin')
+            # SUPPORT role is Super-Admin managed only
+            queryset = queryset.exclude(name__iexact='support')
         
         return queryset
 

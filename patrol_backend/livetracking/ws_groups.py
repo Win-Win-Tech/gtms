@@ -56,15 +56,18 @@ def resolve_ws_groups_for_user(user):
     """
     Return channel-layer group names for a connected WebSocket client.
 
+    - All authenticated users: notif_user_{user_id} (NotificationLog inbox refresh)
     - Superadmin: all_locations
     - Live map viewers: location_{org_id}
     - Alert recipients: tracking_user_{user_id} + site_{site_id}_tracking per site
-    - On-duty mobile senders: no listen groups (send-only)
+    - On-duty mobile senders: no listen groups beyond inbox (send-only for map)
     """
     if not user or not getattr(user, "is_authenticated", False):
         return []
 
     groups = set()
+    # Per-user inbox so SUPPORT / hosts / ticket creators get live web badge + list updates.
+    groups.add(f"notif_user_{user.id}")
     location_id = getattr(user, "location_id", None)
 
     if _is_superadmin(user):

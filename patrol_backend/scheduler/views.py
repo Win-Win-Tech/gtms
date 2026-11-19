@@ -40,6 +40,22 @@ logger = logging.getLogger(__name__)
 from datetime import date
 
 
+def _parse_location_uuid(location_id):
+    """
+    Return (uuid|None, error_code|None).
+    error_code is 'missing' or 'invalid' for null/all/undefined/non-UUID strings.
+    """
+    if location_id is None:
+        return None, 'missing'
+    s = str(location_id).strip()
+    if not s or s.lower() in ('null', 'undefined', 'all', 'none'):
+        return None, 'invalid'
+    try:
+        return uuid.UUID(s), None
+    except (ValueError, TypeError, AttributeError):
+        return None, 'invalid'
+
+
 def _parse_version_tuple(raw):
     """Parse '1.2.3' / '1.2' / 'v1.0.0' into a comparable int tuple."""
     s = str(raw or "").strip().lstrip("vV")
@@ -349,9 +365,15 @@ class ShiftViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
     def by_location(self, request, location_id=None):
+        parsed, err = _parse_location_uuid(location_id)
+        if err:
+            return Response(
+                {'error': 'Invalid location_id.', 'detail': 'A valid organisation UUID is required.'},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
         try:
             shifts = Shift.objects.filter(
-                location_id=location_id, is_deleted=False
+                location_id=parsed, is_deleted=False
             ).prefetch_related('sites')
             serializer = self.get_serializer(shifts, many=True)
             return Response(serializer.data)
@@ -367,8 +389,11 @@ class VendorViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         qs = Vendor.objects.filter(is_deleted=False)
         location_id = self.request.query_params.get("location_id") or self.request.query_params.get("location")
-        if location_id and location_id != "all":
-            qs = qs.filter(location_id=location_id)
+        if location_id and str(location_id).strip().lower() not in ('', 'all'):
+            parsed, err = _parse_location_uuid(location_id)
+            if err:
+                return Vendor.objects.none()
+            qs = qs.filter(location_id=parsed)
         search = self.request.query_params.get("search")
         if search:
             qs = qs.filter(
@@ -393,8 +418,14 @@ class VendorViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='by-location/(?P<location_id>[^/.]+)')
     def by_location(self, request, location_id=None):
+        parsed, err = _parse_location_uuid(location_id)
+        if err:
+            return Response(
+                {'error': 'Invalid location_id.', 'detail': 'A valid organisation UUID is required.'},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
         try:
-            vendors = Vendor.objects.filter(location_id=location_id, is_deleted=False).order_by("name")
+            vendors = Vendor.objects.filter(location_id=parsed, is_deleted=False).order_by("name")
             serializer = self.get_serializer(vendors, many=True)
             return Response(serializer.data)
         except Exception as e:

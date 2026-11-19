@@ -85,6 +85,12 @@ class UserSerializerV5(UserSerializer):
             if vid in ("", "null", "none", None):
                 mutable["vendor_id"] = None
 
+        # Pass through locationId=all / empty; UserSerializer validates by role.
+        if "locationId" in mutable:
+            lid = mutable.get("locationId")
+            if lid is None or str(lid).strip() == "":
+                mutable["locationId"] = None
+
         return super().to_internal_value(mutable)
 
     def get_assigned_sites(self, obj):
@@ -101,7 +107,11 @@ class UserSerializerV5(UserSerializer):
         site_ids = validated_data.pop("site_ids", None)
         all_org_sites = validated_data.pop("all_org_sites", None)
         role = (validated_data.get("role") or "").lower()
-        if all_org_sites is None and role == "admin":
+        # SUPPORT is global-only: no org sites / all_org_sites.
+        if role == "support":
+            all_org_sites = False
+            site_ids = []
+        elif all_org_sites is None and role == "admin":
             all_org_sites = True
         if all_org_sites is None:
             all_org_sites = False
@@ -118,7 +128,11 @@ class UserSerializerV5(UserSerializer):
         site_ids = validated_data.pop("site_ids", None)
         all_org_sites = validated_data.pop("all_org_sites", None)
         user = super().update(instance, validated_data)
-        if site_ids is not None or all_org_sites is not None:
+        role = (getattr(user, "role", None) or "").lower()
+        if role == "support":
+            # Clear any org site binding if promoted / kept as SUPPORT.
+            validate_and_sync_user_sites(user, site_ids=[], all_org_sites=False)
+        elif site_ids is not None or all_org_sites is not None:
             validate_and_sync_user_sites(user, site_ids=site_ids, all_org_sites=all_org_sites)
         return user
 

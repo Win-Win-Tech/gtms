@@ -31,6 +31,7 @@ urlpatterns = [
     path('notifications/', include('notifications.urls')),
     path('livetracking/', include('livetracking.urls')),
     path('reports/', include('reports.urls')),
+    path('support/', include('support.urls')),
 ]
 urlpatterns+=static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 

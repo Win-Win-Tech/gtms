@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'notifications',
     'django_celery_beat',
     'livetracking',  # Sokcet app
+    'support',  # Support ticketing
     ]
 
 # Socket config
@@ -234,6 +235,13 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    # Support ticketing (Phase 4) scoped write limits — applied only on support views.
+    'DEFAULT_THROTTLE_RATES': {
+        'support_create': '60/hour',
+        'support_comment': '120/hour',
+        'support_attachment': '60/hour',
+        'support_reopen': '30/hour',
+    },
 }
 
 from datetime import timedelta
@@ -336,6 +344,14 @@ DEFAULT_FROM_EMAIL = 'ravit@cloudgentechnologies.com'
 
 # For development/testing, you can use console backend instead:
 # EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+# Support ticketing SLA defaults (hours from create by priority). Override per env as needed.
+SUPPORT_SLA_HOURS = {
+    "CRITICAL": 4,
+    "HIGH": 8,
+    "MEDIUM": 24,
+    "LOW": 72,
+}
 
 import cloudinary
 import cloudinary.uploader

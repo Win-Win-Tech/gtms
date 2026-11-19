@@ -70,11 +70,21 @@ def assigned_sites_payload(user):
     return [{"id": str(s.id), "name": s.name} for s in sites]
 
 
+def is_global_scope_user(user):
+    """Super Admin / SUPPORT may browse any org's sites via header location_id."""
+    if not user:
+        return False
+    if getattr(user, "is_superuser", False):
+        return True
+    role = (getattr(user, "role", None) or "").strip().lower()
+    return role in ("support", "superadmin", "super_admin")
+
+
 def header_sites_payload(user, location_id=None):
-    """Sites for GET /auth/v5/my-sites/. Super Admin must pass location_id."""
+    """Sites for GET /auth/v5/my-sites/. Super Admin / SUPPORT must pass location_id."""
     if not user or not getattr(user, "is_authenticated", False):
         return []
-    if user.is_superuser:
+    if is_global_scope_user(user):
         if not location_id:
             return []
         sites = LocationSite.objects.filter(

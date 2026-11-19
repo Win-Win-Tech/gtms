@@ -46,6 +46,16 @@ class NotificationLog(models.Model):
     TYPE_VISITOR_REVERTED = "visitor_reverted"
     TYPE_VISITOR_RESCHEDULED = "visitor_rescheduled"
     TYPE_VEHICLE_OVERSTAY = "vehicle_overstay"
+    TYPE_SUPPORT_TICKET_CREATED = "support_ticket_created"
+    TYPE_SUPPORT_TICKET_ASSIGNED = "support_ticket_assigned"
+    TYPE_SUPPORT_TICKET_RESOLVED = "support_ticket_resolved"
+    TYPE_SUPPORT_TICKET_CLOSED = "support_ticket_closed"
+    TYPE_SUPPORT_TICKET_INVALIDATED = "support_ticket_invalidated"
+    TYPE_SUPPORT_TICKET_COMMENT = "support_ticket_comment"
+    TYPE_SUPPORT_TICKET_ATTACHMENT = "support_ticket_attachment"
+    TYPE_SUPPORT_TICKET_REOPENED = "support_ticket_reopened"
+    TYPE_SUPPORT_TICKET_SLA_WARNING = "support_ticket_sla_warning"
+    TYPE_SUPPORT_TICKET_SLA_BREACH = "support_ticket_sla_breach"
     TYPE_CHOICES = [
         (TYPE_VISITOR_PENDING, "Visitor pending approval"),
         (TYPE_VISITOR_APPROVED, "Visitor approved"),
@@ -53,6 +63,16 @@ class NotificationLog(models.Model):
         (TYPE_VISITOR_REVERTED, "Visitor reverted"),
         (TYPE_VISITOR_RESCHEDULED, "Visitor rescheduled"),
         (TYPE_VEHICLE_OVERSTAY, "Vehicle overstay"),
+        (TYPE_SUPPORT_TICKET_CREATED, "Support ticket created"),
+        (TYPE_SUPPORT_TICKET_ASSIGNED, "Support ticket assigned"),
+        (TYPE_SUPPORT_TICKET_RESOLVED, "Support ticket resolved"),
+        (TYPE_SUPPORT_TICKET_CLOSED, "Support ticket closed"),
+        (TYPE_SUPPORT_TICKET_INVALIDATED, "Support ticket invalidated"),
+        (TYPE_SUPPORT_TICKET_COMMENT, "Support ticket comment"),
+        (TYPE_SUPPORT_TICKET_ATTACHMENT, "Support ticket attachment"),
+        (TYPE_SUPPORT_TICKET_REOPENED, "Support ticket reopened"),
+        (TYPE_SUPPORT_TICKET_SLA_WARNING, "Support ticket SLA warning"),
+        (TYPE_SUPPORT_TICKET_SLA_BREACH, "Support ticket SLA breach"),
     ]
 
     CHANNEL_PUSH = "push"

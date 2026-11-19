@@ -1,10 +1,26 @@
 import logging
+import uuid
 
 from rest_framework import serializers
 from .models import User, Role
 from scheduler.serializers import LocationSerializer as SchedulerLocationSerializer
 
 logger = logging.getLogger(__name__)
+
+# Multipart / UI may send these instead of a real org UUID (global scope).
+_LOCATION_ID_EMPTY = frozenset({"", "null", "none"})
+_LOCATION_ID_GLOBAL = frozenset({"all"})
+
+
+def _normalize_role_name(value):
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def _is_support_role(role_name):
+    return _normalize_role_name(role_name) == "support"
+
 
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:
@@ -18,7 +34,10 @@ class RoleSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
     location = SchedulerLocationSerializer(read_only=True)  # use existing serializer
-    locationId = serializers.UUIDField(write_only=True, required=False, allow_null=True)
+    # CharField (not UUIDField): SUPPORT may send locationId=all / empty / omit.
+    locationId = serializers.CharField(
+        write_only=True, required=False, allow_null=True, allow_blank=True
+    )
     vendor = serializers.SerializerMethodField(read_only=True)
     vendor_id = serializers.UUIDField(write_only=True, required=False, allow_null=True)
     timezone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -39,17 +58,91 @@ class UserSerializer(serializers.ModelSerializer):
             return {"id": str(obj.vendor.id), "name": obj.vendor.name}
         return None
 
+    def _caller_is_super_admin(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if not user or not getattr(user, "is_authenticated", False):
+            return False
+        if getattr(user, "is_superuser", False):
+            return True
+        role = (getattr(user, "role", None) or "").strip().lower()
+        return role in ("superadmin", "super_admin")
+
+    def _effective_role(self, attrs):
+        if "role" in attrs and attrs.get("role") is not None:
+            return _normalize_role_name(attrs.get("role"))
+        if self.instance is not None:
+            return _normalize_role_name(getattr(self.instance, "role", ""))
+        return ""
+
+    def _coerce_location_id(self, raw, *, is_support):
+        """
+        SUPPORT: missing / empty / null / all → None (global, no org).
+        Other roles: missing / empty / null → None; otherwise must be a UUID.
+        """
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        key = s.lower()
+        if is_support:
+            if key in _LOCATION_ID_EMPTY or key in _LOCATION_ID_GLOBAL:
+                return None
+            # Ignore any accidental org UUID for SUPPORT — always global.
+            return None
+        if key in _LOCATION_ID_EMPTY:
+            return None
+        try:
+            return uuid.UUID(s)
+        except (TypeError, ValueError, AttributeError):
+            raise serializers.ValidationError(
+                {"locationId": "Must be a valid UUID."}
+            )
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        new_role = attrs.get("role", None)
+        role = self._effective_role(attrs)
+        old_role = (
+            _normalize_role_name(getattr(self.instance, "role", None))
+            if self.instance
+            else ""
+        )
+
+        # Super-Admin-only guard when creating/assigning SUPPORT (keep even if role unchanged skip).
+        if new_role is not None or self.instance is None:
+            assigning_support = role == "support" and (
+                self.instance is None or old_role != "support"
+            )
+            if assigning_support and not self._caller_is_super_admin():
+                raise serializers.ValidationError(
+                    {"role": "Only Super Admin can create or assign the SUPPORT role."}
+                )
+
+        is_support = _is_support_role(role)
+        if "locationId" in attrs or is_support:
+            raw_loc = attrs.get("locationId", None)
+            # On partial update without locationId, only force-clear when role is/becomes support.
+            if "locationId" not in attrs and is_support and self.instance is not None:
+                # Keep existing null location; still force None so create/update paths clear org.
+                attrs["locationId"] = None
+            else:
+                attrs["locationId"] = self._coerce_location_id(raw_loc, is_support=is_support)
+        return attrs
+
     def create(self, validated_data):
         location_id = validated_data.pop('locationId', None)
         vendor_id = validated_data.pop('vendor_id', None)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
         validated_data.pop('remove_face_photo', None)
-        
+
+        role = _normalize_role_name(validated_data.get("role"))
         user = User(**validated_data)
         if password:
             user.set_password(password)
-        if location_id:
+        if role == "support":
+            user.location = None
+        elif location_id:
             from scheduler.models import Location
             user.location = Location.objects.get(id=location_id)
         if vendor_id:
@@ -79,13 +172,14 @@ class UserSerializer(serializers.ModelSerializer):
         old_location_id = (
             str(instance.location_id) if getattr(instance, "location_id", None) else None
         )
+        location_id_provided = "locationId" in validated_data
         location_id = validated_data.pop('locationId', None)
         _sentinel = object()
         vendor_id = validated_data.pop('vendor_id', _sentinel)
         password = validated_data.pop('password', None)
         timezone = validated_data.pop('timezone', None)
         remove_face_photo = validated_data.pop('remove_face_photo', False)
-        
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         if remove_face_photo:
@@ -95,9 +189,16 @@ class UserSerializer(serializers.ModelSerializer):
             instance.face_encoding = None
         if password:
             instance.set_password(password)
-        if location_id:
-            from scheduler.models import Location
-            instance.location = Location.objects.get(id=location_id)
+
+        role = _normalize_role_name(getattr(instance, "role", ""))
+        if role == "support":
+            instance.location = None
+        elif location_id_provided:
+            if location_id:
+                from scheduler.models import Location
+                instance.location = Location.objects.get(id=location_id)
+            else:
+                instance.location = None
         if vendor_id is not _sentinel:
             if vendor_id:
                 from scheduler.models import Vendor

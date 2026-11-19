@@ -228,6 +228,9 @@ class UserSite(models.Model):
 def propagate_new_global_role(sender, instance, created, **kwargs):
     """When a global role template is created, copy it to all existing locations."""
     if created and instance.location is None:
+        # SUPPORT is global-only (no org/site); do not copy into organisations.
+        if (instance.name or "").strip().lower() == "support":
+            return
         for loc in Location.objects.filter(is_deleted=False):
             Role.objects.get_or_create(
                 name=instance.name,

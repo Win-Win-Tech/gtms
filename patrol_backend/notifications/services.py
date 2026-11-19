@@ -144,6 +144,36 @@ def send_push_to_user(
     return _send_fcm(tokens, title, body or "", str_data)
 
 
+def _dispatch_notification_inbox_ws(user, log: NotificationLog) -> None:
+    """
+    Best-effort WebSocket ping so the web header badge + NotificationHistory refresh
+    without a full page reload (support tickets, visitor, etc.).
+    """
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+
+        channel_layer = get_channel_layer()
+        if channel_layer is None:
+            return
+        async_to_sync(channel_layer.group_send)(
+            f"notif_user_{user.id}",
+            {
+                "type": "notification_inbox",
+                "notification_id": str(log.id),
+                "notif_type": log.type,
+                "title": log.title or "",
+                "body": log.body or "",
+            },
+        )
+    except Exception:
+        logger.exception(
+            "notification inbox WS dispatch failed user=%s log=%s",
+            getattr(user, "id", None),
+            getattr(log, "id", None),
+        )
+
+
 def notify_user(
     user,
     notif_type: str,
@@ -153,7 +183,7 @@ def notify_user(
     entry=None,
 ) -> Optional[NotificationLog]:
     """
-    Create history row + attempt FCM to android/ios tokens.
+    Create history row + attempt FCM to android/ios tokens + web inbox WS ping.
     Returns NotificationLog or None if user is missing.
     """
     if not user:
@@ -172,6 +202,9 @@ def notify_user(
         channel=NotificationLog.CHANNEL_PUSH,
         delivery_status=NotificationLog.STATUS_PENDING,
     )
+
+    # Web clients: refresh badge/list even when no mobile tokens exist.
+    _dispatch_notification_inbox_ws(user, log)
 
     tokens = get_active_mobile_tokens(user)
 

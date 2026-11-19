@@ -14,6 +14,7 @@ from .site_access import (
     assert_caller_can_access_site,
     get_site_or_error,
     header_sites_payload,
+    is_global_scope_user,
     is_org_admin,
     users_queryset_for_site,
 )
@@ -238,6 +239,7 @@ class MySitesViewV5(APIView):
             "sites": header_sites_payload(caller, location_id=location_id),
             "all_org_sites": bool(
                 caller.is_superuser
+                or is_global_scope_user(caller)
                 or is_org_admin(caller)
                 or getattr(caller, "all_org_sites", False)
             ),
@@ -261,7 +263,8 @@ class MySitesViewV5(APIView):
         caller = request.user
         location_id = request.query_params.get("location_id") or None
         try:
-            if location_id and not caller.is_superuser:
+            # Super Admin / SUPPORT: header org switcher may list any org's sites.
+            if location_id and not is_global_scope_user(caller):
                 if not caller.location_id or str(caller.location_id) != str(location_id):
                     raise PermissionDenied("You can only list sites for your organisation.")
             on_date = self._on_date(request, request.query_params.get("date"))
