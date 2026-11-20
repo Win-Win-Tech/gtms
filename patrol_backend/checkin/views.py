@@ -815,6 +815,294 @@ class CheckInViewSet(viewsets.ModelViewSet):
         response_data["success"] = True
         return Response(response_data, status=status.HTTP_201_CREATED)
 
+    def _assignment_has_scheduled_checkpoints(self, assignment):
+        """True when assignment has at least one scheduled checkpoint slot (id + time)."""
+        for cp in (assignment.checkpoints or []):
+            if cp.get("checkpoint_id") and cp.get("time"):
+                return True
+        return False
+
+    def _parse_scan_timestamp(self, data):
+        """Parse optional request timestamp; fall back to now() in UTC."""
+        scan_timestamp_str = data.get("timestamp")
+        if scan_timestamp_str:
+            try:
+                if isinstance(scan_timestamp_str, str) and scan_timestamp_str.strip():
+                    s = scan_timestamp_str.strip().replace("Z", "+00:00")
+                    parsed = datetime.fromisoformat(s)
+                    if parsed.tzinfo is None:
+                        parsed = make_aware(parsed, pytz.UTC)
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+        return now()
+
+    def _resolve_active_shift_window(self, assignment, shift, user_tz, checkin_time_user):
+        """
+        Resolve the active shift instance (overnight-aware) that covers checkin_time_user
+        and is within the assignment date range.
+
+        Returns (shift_start_date, shift_start_dt_user, shift_end_dt_user) or None.
+        Uses strict shift start/end — no scheduled-slot grace / delay window.
+        """
+        today = checkin_time_user.date()
+        yesterday = today - timedelta(days=1)
+        is_overnight = shift.end_time <= shift.start_time
+        candidates = []
+
+        if assignment.start_date <= today <= assignment.end_date:
+            start_dt = to_user_timezone(
+                combine_date_time_in_user_tz(today, shift.start_time, user_tz),
+                user_tz,
+            )
+            if is_overnight:
+                end_dt = to_user_timezone(
+                    combine_date_time_in_user_tz(
+                        today + timedelta(days=1), shift.end_time, user_tz
+                    ),
+                    user_tz,
+                )
+            else:
+                end_dt = to_user_timezone(
+                    combine_date_time_in_user_tz(today, shift.end_time, user_tz),
+                    user_tz,
+                )
+            candidates.append((today, start_dt, end_dt))
+
+        if is_overnight and assignment.start_date <= yesterday <= assignment.end_date:
+            start_dt = to_user_timezone(
+                combine_date_time_in_user_tz(yesterday, shift.start_time, user_tz),
+                user_tz,
+            )
+            end_dt = to_user_timezone(
+                combine_date_time_in_user_tz(today, shift.end_time, user_tz),
+                user_tz,
+            )
+            candidates.append((yesterday, start_dt, end_dt))
+
+        for shift_start_date, start_dt, end_dt in candidates:
+            if start_dt <= checkin_time_user <= end_dt:
+                return shift_start_date, start_dt, end_dt
+        return None
+
+    def _validate_unscheduled_scan_request(self, request):
+        """
+        Validation for free (non-scheduled) shift scans.
+
+        Reuses scheduled-scan rules for guard/assignment/QR/radius/overnight shift window.
+        Does NOT match against assigned checkpoint times or +- grace/delay for those slots.
+        Rejects assignments that already have scheduled checkpoint slots.
+        """
+        data = request.data
+        guard_id = data.get("guard")
+        shift_id = data.get("shift")
+        assigned_id = data.get("assign_id")
+        checkpoint_id = data.get("checkpoint")
+        latitude = data.get("latitude")
+        longitude = data.get("longitude")
+        qr_data = data.get("data")
+
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Invalid latitude or longitude"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        user_tz = get_user_timezone_from_request(request)
+
+        try:
+            guard = User.objects.get(id=guard_id)
+        except (User.DoesNotExist, TypeError, ValueError):
+            return Response(
+                {"error": "Invalid guard ID"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        assignment = Assignment.objects.filter(
+            id=assigned_id,
+            guard=guard,
+            shift_id=shift_id,
+        ).first()
+        if not assignment:
+            return Response(
+                {"error": "No matching assignment found for guard and shift"},
+                status=status.HTTP_403_FORBIDDEN,
+            ), None
+
+        if self._assignment_has_scheduled_checkpoints(assignment):
+            return Response(
+                {
+                    "error": (
+                        "This assignment has scheduled checkpoints. "
+                        "Use the scheduled scan API."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        shift = Shift.objects.filter(id=shift_id).first()
+        if not shift:
+            return Response(
+                {"error": "Shift not found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
+        if not checkpoint:
+            return Response(
+                {"error": "Checkpoint not found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        org_id = assignment.location_id or guard.location_id
+        if not org_id or str(checkpoint.location_id) != str(org_id):
+            return Response(
+                {"error": "Checkpoint does not belong to this organisation"},
+                status=status.HTTP_403_FORBIDDEN,
+            ), None
+
+        if qr_data != checkpoint.data:
+            return Response(
+                {"detail": "Check-in not allowed. QR code mismatch."},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        if checkpoint.latitude is None or checkpoint.longitude is None:
+            return Response(
+                {"error": "Checkpoint location coordinates are not configured"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        distance = geodesic(
+            (checkpoint.latitude, checkpoint.longitude),
+            (latitude, longitude),
+        ).meters
+        allowed_distance_str = SiteSetting.get_setting(
+            key="distance",
+            location_id=guard.location_id,
+            default_value="150",
+        )
+        allowed_distance = int(allowed_distance_str)
+        if distance > allowed_distance:
+            return Response(
+                {
+                    "error": (
+                        f"Check-in location is too far from checkpoint "
+                        f"({int(distance)}m)"
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            ), None
+
+        checkin_time_utc = self._parse_scan_timestamp(data)
+        checkin_time_user = to_user_timezone(checkin_time_utc, user_tz)
+        window = self._resolve_active_shift_window(
+            assignment, shift, user_tz, checkin_time_user
+        )
+        if window is None:
+            return Response(
+                {"error": "Scan not allowed outside the shift window"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        shift_start_date, shift_start_dt_user, shift_end_dt_user = window
+
+        # Allow re-scan of same checkpoint, but not within 1 minute
+        recent = CheckIn.objects.filter(
+            guard=guard,
+            checkpoint=checkpoint,
+            timestamp__gte=checkin_time_utc - timedelta(minutes=1),
+            timestamp__lte=checkin_time_utc + timedelta(seconds=5),
+        ).exists()
+        if recent:
+            return Response(
+                {
+                    "error": (
+                        "Same checkpoint was scanned within the last minute. "
+                        "Please wait before scanning again."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+
+        ctx = {
+            "guard": guard,
+            "assignment": assignment,
+            "checkpoint": checkpoint,
+            "shift": shift,
+            "distance": distance,
+            "data": data,
+            "user_tz": user_tz,
+            "checkin_time_utc": checkin_time_utc,
+            "checkin_time_user": checkin_time_user,
+            "latitude": latitude,
+            "longitude": longitude,
+            "shift_start_date": shift_start_date,
+            "shift_start_dt_user": shift_start_dt_user,
+            "shift_end_dt_user": shift_end_dt_user,
+        }
+        return None, ctx
+
+    @action(detail=False, methods=["post"], url_path="scan_unscheduled")
+    def scan_unscheduled(self, request):
+        """
+        Free scan for assignments with NO scheduled checkpoint list.
+
+        Guard may scan any organisation checkpoint while inside the shift
+        window. Does not use scheduled slot times or +- delay grace.
+        Scheduled assignments must continue using scan / scan_v2.
+        """
+        logger.info("========== [SCAN_UNSCHEDULED_API] START ==========")
+        try:
+            err, ctx = self._validate_unscheduled_scan_request(request)
+            if err is not None:
+                logger.warning(
+                    "[SCAN_UNSCHEDULED_API] Validation failed: %s",
+                    getattr(err, "data", err),
+                )
+                return err
+
+            payload = {
+                "guard": str(ctx["guard"].id),
+                "shift": str(ctx["shift"].id),
+                "checkpoint": str(ctx["checkpoint"].id),
+                "latitude": ctx["latitude"],
+                "longitude": ctx["longitude"],
+                "timestamp": ctx["checkin_time_utc"],
+                "has_checklist": False,
+                "synced": True,
+            }
+            serializer = self.get_serializer(data=payload)
+            serializer.is_valid(raise_exception=True)
+            serializer.context["request"] = request
+            serializer.save()
+
+            response_data = serializer.data
+            response_data.update({
+                "scan_mode": "unscheduled",
+                "requires_checklist": False,
+                "message": "Checkpoint Successfully Scanned",
+                "success": True,
+                "distance_from_checkpoint_m": round(ctx["distance"], 2),
+                "shift_start_date": ctx["shift_start_date"].isoformat(),
+            })
+            logger.info(
+                "[SCAN_UNSCHEDULED_API] SUCCESS: guard=%s checkpoint=%s",
+                ctx["guard"].id,
+                ctx["checkpoint"].id,
+            )
+            logger.info("========== [SCAN_UNSCHEDULED_API] END ==========")
+            return Response(response_data, status=status.HTTP_201_CREATED)
+        except Exception:
+            logger.exception("[SCAN_UNSCHEDULED_API] UNEXPECTED ERROR")
+            return Response(
+                {"error": "An unexpected error occurred during check-in."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
     @action(detail=True, methods=["get"], url_path="checklist")
     def checklist(self, request, pk=None):
         """

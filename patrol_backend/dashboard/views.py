@@ -5367,6 +5367,180 @@ class AttendanceCheckinViewSet(viewsets.ModelViewSet):
 # CORE FUNCTION: Shared business logic for check-in reports
 # ============================================================================
 
+def _assignment_has_scheduled_checkpoints(assignment):
+    """True when assignment has at least one scheduled checkpoint slot (id + time)."""
+    for cp in (assignment.checkpoints or []):
+        if cp.get("checkpoint_id") and cp.get("time"):
+            return True
+    return False
+
+
+def _append_unscheduled_checkin_report_rows(
+    *,
+    report,
+    assignments,
+    date_range,
+    start_dt_user,
+    end_date,
+    today,
+    user_tz,
+    attendance_site_map=None,
+    checkins_by_guard_shift=None,
+    checkpoints_lookup=None,
+    answer_map=None,
+):
+    """
+    For assignments with no scheduled checkpoint slots, emit one report row per
+    actual CheckIn inside the shift window. Status is always "Scanned"
+    (no expected time → no On Time / Missed).
+    """
+    attendance_site_map = attendance_site_map or {}
+    checkpoints_lookup = checkpoints_lookup or {}
+    answer_map = answer_map or {}
+    seen_checkin_ids = set()
+
+    for assignment in assignments:
+        if _assignment_has_scheduled_checkpoints(assignment):
+            continue
+
+        guard = assignment.guard
+        shift = assignment.shift
+        location = assignment.location
+        if not guard or not shift:
+            continue
+
+        is_overnight = shift.end_time <= shift.start_time
+        dates_to_check = list(date_range)
+        if is_overnight:
+            prev_day = start_dt_user.date() - timedelta(days=1)
+            if assignment.start_date <= prev_day <= assignment.end_date:
+                if prev_day not in dates_to_check:
+                    dates_to_check.insert(0, prev_day)
+
+        for check_date in dates_to_check:
+            if check_date > today:
+                continue
+            if not (assignment.start_date <= check_date <= assignment.end_date):
+                continue
+
+            shift_start_dt_user = combine_date_time_in_user_tz(
+                check_date, shift.start_time, user_tz
+            ).astimezone(user_tz)
+            if is_overnight:
+                shift_end_dt_user = combine_date_time_in_user_tz(
+                    check_date + timedelta(days=1), shift.end_time, user_tz
+                ).astimezone(user_tz)
+            else:
+                shift_end_dt_user = combine_date_time_in_user_tz(
+                    check_date, shift.end_time, user_tz
+                ).astimezone(user_tz)
+
+            search_start_utc = shift_start_dt_user.astimezone(pytz.UTC)
+            search_end_utc = shift_end_dt_user.astimezone(pytz.UTC)
+
+            if checkins_by_guard_shift is not None:
+                candidates = checkins_by_guard_shift.get(
+                    (str(guard.id), str(shift.id)), []
+                )
+                window_checkins = [
+                    c
+                    for c in candidates
+                    if search_start_utc <= c.timestamp <= search_end_utc
+                ]
+            else:
+                window_checkins = list(
+                    CheckIn.objects.filter(
+                        guard=guard,
+                        shift=shift,
+                        timestamp__gte=search_start_utc,
+                        timestamp__lte=search_end_utc,
+                    ).order_by("timestamp")
+                )
+
+            for checkin in window_checkins:
+                checkin_id_str = str(checkin.id)
+                if checkin_id_str in seen_checkin_ids:
+                    continue
+                seen_checkin_ids.add(checkin_id_str)
+
+                actual_time_user = to_user_timezone(checkin.timestamp, user_tz)
+                report_date = actual_time_user.date()
+                if not (start_dt_user.date() <= report_date <= end_date):
+                    continue
+
+                checkpoint_id = str(checkin.checkpoint_id) if checkin.checkpoint_id else None
+                checkpoint_name = (
+                    checkpoints_lookup.get(checkpoint_id)
+                    if checkpoint_id
+                    else None
+                )
+                if not checkpoint_name and checkpoint_id:
+                    cp_obj = Checkpoint.objects.filter(id=checkpoint_id).first()
+                    checkpoint_name = cp_obj.label if cp_obj else "Unknown Checkpoint"
+                    if cp_obj:
+                        checkpoints_lookup[checkpoint_id] = checkpoint_name
+                if not checkpoint_name:
+                    checkpoint_name = "Unknown Checkpoint"
+
+                has_checklist = bool(getattr(checkin, "has_checklist", False))
+                checklist_template_name = None
+                checklist_remarks = None
+                checklist_checked_count = None
+                checklist_total_count = None
+                checklist_answers = None
+                if has_checklist:
+                    answer = answer_map.get(checkin_id_str)
+                    if answer is None:
+                        answer = CheckInChecklistAnswer.objects.filter(
+                            checkin_id=checkin.id, is_deleted=False
+                        ).select_related("checklist_template").first()
+                    if answer:
+                        checklist_template_name = (
+                            answer.checklist_template.name
+                            if answer.checklist_template
+                            else None
+                        )
+                        checklist_remarks = answer.remarks
+                        checklist_answers = answer.answers or []
+                        try:
+                            checklist_total_count = len(checklist_answers)
+                            checklist_checked_count = sum(
+                                1 for a in checklist_answers if a.get("checked") is True
+                            )
+                        except Exception:
+                            checklist_total_count = None
+                            checklist_checked_count = None
+
+                report.append({
+                    "date": report_date.strftime("%Y-%m-%d"),
+                    "guard_id": str(guard.id),
+                    "guard_name": guard.name,
+                    "employee_code": getattr(guard, "employee_code", None) or "",
+                    "designation": (getattr(guard, "role", None) or "").strip(),
+                    "location_id": str(location.id) if location else None,
+                    "location_name": location.name if location else "",
+                    "shift_id": str(shift.id) if shift else None,
+                    "shift_name": shift.name if shift else "",
+                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_name": checkpoint_name,
+                    "site_name": attendance_site_map.get(
+                        (str(guard.id), str(check_date), str(shift.id)), ""
+                    ),
+                    "expected_time": None,
+                    "actual_checkin_time": actual_time_user,
+                    "status": "Scanned",
+                    "delay_minutes": None,
+                    "checkin_id": checkin_id_str,
+                    "has_checklist": has_checklist,
+                    "checklist_template_name": checklist_template_name,
+                    "checklist_remarks": checklist_remarks,
+                    "checklist_checked_count": checklist_checked_count,
+                    "checklist_total_count": checklist_total_count,
+                    "checklist_answers": checklist_answers,
+                    "scan_mode": "unscheduled",
+                })
+
+
 def _get_checkin_report_data(
     filter_type='today',
     start_date_str=None,
@@ -5692,6 +5866,16 @@ def _get_checkin_report_data(
                     'checklist_total_count': checklist_total_count,
                     'checklist_answers': checklist_answers,
                 })
+
+    _append_unscheduled_checkin_report_rows(
+        report=report,
+        assignments=assignments,
+        date_range=date_range,
+        start_dt_user=start_dt_user,
+        end_date=end_date,
+        today=today,
+        user_tz=user_tz,
+    )
     
     # Sort report by date, then by guard_name, then by checkpoint_name, then by expected_time
     # This ensures all checkpoints for a date are grouped together
@@ -9136,10 +9320,12 @@ def _get_checkin_report_data_v2(
     all_checkins = list(all_checkins_query.order_by('timestamp'))
     
     checkin_map = defaultdict(list)
+    checkins_by_guard_shift = defaultdict(list)
     checkin_ids = []
     for c in all_checkins:
         key = (str(c.guard_id), str(c.shift_id), str(c.checkpoint_id))
         checkin_map[key].append(c)
+        checkins_by_guard_shift[(str(c.guard_id), str(c.shift_id))].append(c)
         if getattr(c, 'has_checklist', False):
             checkin_ids.append(c.id)
             
@@ -9173,6 +9359,9 @@ def _get_checkin_report_data_v2(
         for cp in (assignment.checkpoints or []):
             if cp.get('checkpoint_id'):
                 all_checkpoint_ids.add(str(cp.get('checkpoint_id')))
+    for c in all_checkins:
+        if c.checkpoint_id:
+            all_checkpoint_ids.add(str(c.checkpoint_id))
                 
     checkpoints_lookup = {}
     if all_checkpoint_ids:
@@ -9335,10 +9524,26 @@ def _get_checkin_report_data_v2(
                     'checklist_total_count': checklist_total_count,
                     'checklist_answers': checklist_answers,
                 })
+
+    _append_unscheduled_checkin_report_rows(
+        report=report,
+        assignments=assignments,
+        date_range=date_range,
+        start_dt_user=start_dt_user,
+        end_date=end_date,
+        today=today,
+        user_tz=user_tz,
+        attendance_site_map=attendance_site_map,
+        checkins_by_guard_shift=checkins_by_guard_shift,
+        checkpoints_lookup=checkpoints_lookup,
+        answer_map=answer_map,
+    )
                 
     report.sort(key=lambda r: (
         r['date'],
-        str(r['expected_time']) if r['expected_time'] else '',
+        str(r['expected_time']) if r['expected_time'] else (
+            str(r['actual_checkin_time']) if r.get('actual_checkin_time') else ''
+        ),
         r['guard_name'],
         r['checkpoint_name'],
     ))

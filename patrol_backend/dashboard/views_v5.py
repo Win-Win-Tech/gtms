@@ -43,7 +43,13 @@ def _apply_v6_liveness_and_face(request, user, org_location, raw_bytes, timing):
     return None
 
 from authapp.site_access import assert_caller_can_access_site, caller_can_access_site, get_site_or_error
-from patrol_backend.utils.timezone_utils import get_user_today, get_user_timezone_from_request, to_user_timezone
+from patrol_backend.utils.timezone_utils import (
+    combine_date_time_in_user_tz,
+    get_user_now,
+    get_user_today,
+    get_user_timezone_from_request,
+    to_user_timezone,
+)
 from scheduler.daily_site import apply_select_site, site_ids_payload
 from scheduler.models import Assignment
 
@@ -98,7 +104,10 @@ class ShiftTodayV5(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        from dashboard.views import AttendanceCheckinViewSet
+        from dashboard.views import (
+            AttendanceCheckinViewSet,
+            _assignment_has_scheduled_checkpoints,
+        )
 
         view = AttendanceCheckinViewSet()
         view.request = request
@@ -111,6 +120,38 @@ class ShiftTodayV5(APIView):
         on_date = get_user_today(user_tz)
         data = dict(response.data)
         data.update(site_ids_payload(request.user, on_date))
+
+        # allow_unschedule_scan: True when shift today AND no scheduled checkpoints.
+        # Mobile should call scan_unscheduled when this is true.
+        allow_unschedule_scan = False
+        if data.get("has_shift"):
+            assignment, _ = view.get_today_assignment_v2(request.user, request)
+            if not assignment:
+                # Mirror shift_today_v3 fallback: closest assignment covering today
+                today = get_user_today(user_tz)
+                user_now = get_user_now(user_tz)
+                candidates = Assignment.objects.filter(
+                    guard_id=request.user.id,
+                    start_date__lte=today,
+                    end_date__gte=today,
+                ).select_related("shift")
+                best = None
+                best_distance = None
+                for assgn in candidates:
+                    shift = assgn.shift
+                    if not shift:
+                        continue
+                    shift_start_dt = combine_date_time_in_user_tz(
+                        today, shift.start_time, user_tz
+                    )
+                    distance_seconds = abs((shift_start_dt - user_now).total_seconds())
+                    if best_distance is None or distance_seconds < best_distance:
+                        best_distance = distance_seconds
+                        best = assgn
+                assignment = best
+            if assignment and not _assignment_has_scheduled_checkpoints(assignment):
+                allow_unschedule_scan = True
+        data["allow_unschedule_scan"] = allow_unschedule_scan
         return Response(data, status=status.HTTP_200_OK)
 
 
