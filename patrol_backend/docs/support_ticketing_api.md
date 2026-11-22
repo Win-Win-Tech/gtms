@@ -621,8 +621,8 @@ curl -X GET "http://127.0.0.1:8000/support/dashboard/?organisation_id=<uuid>" \
 | `GET` | `/support/reports/export-excel/` | SUPPORT / Super Admin |
 | `GET` | `/support/reports/export-pdf/` | SUPPORT / Super Admin |
 | `GET` | `/support/support-users/` | Super Admin only |
-| `POST` | `/support/support-users/` | Super Admin only (create SUPPORT user; location always null) |
-| `PATCH` | `/support/support-users/<id>/` | Super Admin only (name / email / password / is_active) |
+| `POST` | `/support/support-users/` | Super Admin only (create SUPPORT user; location always null; optional `timezone`) |
+| `PATCH` | `/support/support-users/<id>/` | Super Admin only (name / email / password / is_active / timezone) |
 | `POST` | `/support/tickets/` | Any authenticated user (multipart create) |
 | `GET` | `/support/tickets/my/` | Any authenticated user (own tickets) |
 | `GET` | `/support/support/tickets/` | SUPPORT / Super Admin |
@@ -692,11 +692,20 @@ Dedicated APIs (do **not** reuse Users v5 for this tab):
 
 | Method | Path | Notes |
 |--------|------|--------|
-| `GET` | `/support/support-users/` | List SUPPORT-role users (`include_inactive=0` to hide inactive); paginated (`page` / `page_size`, default 25 — see §12) |
-| `POST` | `/support/support-users/` | Body: `name`, `email`, `password` — role fixed to `support`, `location` null |
-| `PATCH` | `/support/support-users/<id>/` | Optional `name`, `email`, `password`, `is_active` |
+| `GET` | `/support/support-users/` | List SUPPORT-role users (`include_inactive=0` to hide inactive); paginated (`page` / `page_size`, default 25 — see §12); includes `timezone` |
+| `POST` | `/support/support-users/` | Body: `name`, `email`, `password`, optional `timezone` (IANA, default `Asia/Kolkata`) — role fixed to `support`, `location` null |
+| `PATCH` | `/support/support-users/<id>/` | Optional `name`, `email`, `password`, `is_active`, `timezone` |
 
 `GET /support/support/agents/` remains the active-agent picker for assign/transfer.
+
+### Display timezone for ticket timestamps
+
+List/detail/report ticket datetimes (`created_on`, `updated_on`, `due_at`, comment/activity `created_on`, etc.) are returned in the **viewer’s** timezone via `get_user_timezone_from_request`:
+
+- SUPPORT / Super Admin → their stored `User.timezone`
+- Org users → same lookup (user timezone / org-admin pattern used elsewhere)
+
+Values remain timezone-aware ISO strings (with offset). Storage stays UTC.
 
 ---
 

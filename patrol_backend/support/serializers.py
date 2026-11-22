@@ -1,5 +1,10 @@
 from rest_framework import serializers
 
+from patrol_backend.utils.timezone_utils import (
+    get_user_timezone_from_request,
+    to_user_timezone,
+)
+
 from .models import (
     SupportTicket,
     TicketActivityLog,
@@ -10,6 +15,28 @@ from .models import (
 from .permissions import is_support_user
 from .services import TicketWorkflowError, compute_ticket_durations, create_ticket
 from .sla import sla_hours_for_priority, ticket_is_overdue
+
+
+def _localize_dt_fields(representation, fields, request):
+    """Convert listed datetime fields to the viewer's timezone (ISO with offset)."""
+    if not request or not representation:
+        return representation
+    user_tz = get_user_timezone_from_request(request)
+    for field in fields:
+        value = representation.get(field)
+        if not value:
+            continue
+        # ModelSerializer may already have stringified the datetime
+        from django.utils.dateparse import parse_datetime
+        from datetime import datetime
+
+        dt = value
+        if isinstance(value, str):
+            dt = parse_datetime(value)
+        if not isinstance(dt, datetime):
+            continue
+        representation[field] = to_user_timezone(dt, user_tz).isoformat()
+    return representation
 
 
 class TicketCategorySerializer(serializers.ModelSerializer):
@@ -32,8 +59,19 @@ class SupportUserSerializer(serializers.Serializer):
     email = serializers.EmailField(allow_null=True)
     role = serializers.CharField()
     is_active = serializers.BooleanField()
+    timezone = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     created_on = serializers.DateTimeField(required=False, allow_null=True)
     modified_on = serializers.DateTimeField(required=False, allow_null=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get("timezone") and hasattr(instance, "timezone"):
+            data["timezone"] = instance.timezone
+        return _localize_dt_fields(
+            data,
+            ["created_on", "modified_on"],
+            self.context.get("request"),
+        )
 
 
 class TicketAttachmentSerializer(serializers.ModelSerializer):
@@ -68,6 +106,12 @@ class TicketAttachmentSerializer(serializers.ModelSerializer):
             return None
         return u.name or u.email
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        return _localize_dt_fields(
+            data, ["created_on"], self.context.get("request")
+        )
+
 
 class TicketCommentSerializer(serializers.ModelSerializer):
     author_name = serializers.SerializerMethodField()
@@ -88,6 +132,12 @@ class TicketCommentSerializer(serializers.ModelSerializer):
         if not obj.author:
             return None
         return obj.author.name or obj.author.email
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        return _localize_dt_fields(
+            data, ["created_on"], self.context.get("request")
+        )
 
 
 class TicketActivityLogSerializer(serializers.ModelSerializer):
@@ -112,6 +162,12 @@ class TicketActivityLogSerializer(serializers.ModelSerializer):
         if not obj.actor:
             return None
         return obj.actor.name or obj.actor.email
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        return _localize_dt_fields(
+            data, ["created_on"], self.context.get("request")
+        )
 
 
 class SupportTicketListSerializer(serializers.ModelSerializer):
@@ -162,6 +218,14 @@ class SupportTicketListSerializer(serializers.ModelSerializer):
     def get_sla_hours(self, obj):
         return sla_hours_for_priority(obj.priority)
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        return _localize_dt_fields(
+            data,
+            ["due_at", "created_on", "updated_on"],
+            self.context.get("request"),
+        )
+
 
 class SupportTicketDetailSerializer(SupportTicketListSerializer):
     description = serializers.CharField()
@@ -199,16 +263,29 @@ class SupportTicketDetailSerializer(SupportTicketListSerializer):
         qs = obj.comments.select_related("author").all()
         if not self._viewer_is_support():
             qs = qs.filter(visibility=TicketComment.Visibility.PUBLIC)
-        return TicketCommentSerializer(qs, many=True).data
+        return TicketCommentSerializer(
+            qs, many=True, context=self.context
+        ).data
 
     def get_activity(self, obj):
-        return TicketActivityLogSerializer(self._filtered_activity_qs(obj), many=True).data
+        return TicketActivityLogSerializer(
+            self._filtered_activity_qs(obj), many=True, context=self.context
+        ).data
 
     def get_durations(self, obj):
         # Prefer already-prefetched activity; durations use public+internal timestamps
         # for accurate lifecycle (creators still only see public activity rows).
         activity_rows = list(obj.activity_logs.all())
         return compute_ticket_durations(obj, activity_rows=activity_rows)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Parent already localized due_at/created_on/updated_on; localize terminal stamps.
+        return _localize_dt_fields(
+            data,
+            ["resolved_at", "closed_at"],
+            self.context.get("request"),
+        )
 
 
 class SupportTicketCreateSerializer(serializers.Serializer):

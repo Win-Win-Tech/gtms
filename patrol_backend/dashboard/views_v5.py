@@ -121,9 +121,10 @@ class ShiftTodayV5(APIView):
         data = dict(response.data)
         data.update(site_ids_payload(request.user, on_date))
 
-        # allow_unschedule_scan: True when shift today AND no scheduled checkpoints.
-        # Mobile should call scan_unscheduled when this is true.
+        # assignment_id + allow_unschedule_scan for mobile checkpoint scanning.
+        assignment_id = None
         allow_unschedule_scan = False
+        assignment = None
         if data.get("has_shift"):
             assignment, _ = view.get_today_assignment_v2(request.user, request)
             if not assignment:
@@ -149,8 +150,11 @@ class ShiftTodayV5(APIView):
                         best_distance = distance_seconds
                         best = assgn
                 assignment = best
-            if assignment and not _assignment_has_scheduled_checkpoints(assignment):
-                allow_unschedule_scan = True
+            if assignment:
+                assignment_id = str(assignment.id)
+                if not _assignment_has_scheduled_checkpoints(assignment):
+                    allow_unschedule_scan = True
+        data["assignment_id"] = assignment_id
         data["allow_unschedule_scan"] = allow_unschedule_scan
         return Response(data, status=status.HTTP_200_OK)
 

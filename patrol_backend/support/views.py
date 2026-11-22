@@ -189,21 +189,14 @@ class MyTicketListCreateView(APIView):
             .select_related("category", "organisation", "site", "created_by", "current_assignee")
             .order_by("-created_on")
         )
-        status_filter = request.query_params.get("status")
-        if status_filter:
-            qs = qs.filter(status=status_filter.upper())
-        overdue = (request.query_params.get("overdue") or "").strip().lower()
-        if overdue in ("1", "true", "yes"):
-            from django.utils import timezone as dj_tz
-            from .sla import ACTIVE_SLA_STATUSES
-
-            qs = qs.filter(
-                status__in=ACTIVE_SLA_STATUSES,
-                due_at__isnull=False,
-                due_at__lt=dj_tz.now(),
-            )
+        # Same status / date / overdue filters as queue & reports
+        qs = filter_support_tickets_queryset(
+            qs, request.query_params, actor=request.user, request=request
+        )
         page_qs, pagination = paginate_queryset(qs, request)
-        ser = SupportTicketListSerializer(page_qs, many=True)
+        ser = SupportTicketListSerializer(
+            page_qs, many=True, context={"request": request}
+        )
         return _ok("My tickets fetched", ser.data, pagination=pagination)
 
     def post(self, request):
@@ -302,7 +295,7 @@ def _add_ticket_comment(request, ticket, *, return_detail=False):
         )
     return _ok(
         "Comment added",
-        TicketCommentSerializer(comment).data,
+        TicketCommentSerializer(comment, context={"request": request}).data,
         status.HTTP_201_CREATED,
     )
 
@@ -349,7 +342,9 @@ class TicketActivityListView(APIView):
         qs = filtered_activity_qs(ticket, request.user)
         return _ok(
             "Activity timeline fetched",
-            TicketActivityLogSerializer(qs, many=True).data,
+            TicketActivityLogSerializer(
+                qs, many=True, context={"request": request}
+            ).data,
         )
 
 
@@ -443,10 +438,12 @@ class SupportTicketQueueView(APIView):
             "category", "organisation", "site", "created_by", "current_assignee"
         ).order_by("-created_on")
         qs = filter_support_tickets_queryset(
-            qs, request.query_params, actor=request.user
+            qs, request.query_params, actor=request.user, request=request
         )
         page_qs, pagination = paginate_queryset(qs, request, default_page_size=50)
-        ser = SupportTicketListSerializer(page_qs, many=True)
+        ser = SupportTicketListSerializer(
+            page_qs, many=True, context={"request": request}
+        )
         return _ok("Support ticket queue fetched", ser.data, pagination=pagination)
 
 
@@ -795,7 +792,9 @@ def _support_report_queryset(request):
     qs = SupportTicket.objects.select_related(
         "category", "organisation", "site", "created_by", "current_assignee"
     ).order_by("-created_on")
-    return filter_support_tickets_queryset(qs, request.query_params, actor=request.user)
+    return filter_support_tickets_queryset(
+        qs, request.query_params, actor=request.user, request=request
+    )
 
 
 class SupportTicketReportView(APIView):
@@ -808,7 +807,9 @@ class SupportTicketReportView(APIView):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         qs = _support_report_queryset(request)
         page_qs, pagination = paginate_queryset(qs, request, default_page_size=50)
-        ser = SupportTicketListSerializer(page_qs, many=True)
+        ser = SupportTicketListSerializer(
+            page_qs, many=True, context={"request": request}
+        )
         return _ok("Support ticket report fetched", ser.data, pagination=pagination)
 
 
@@ -860,7 +861,9 @@ class SupportUserListCreateView(APIView):
         page_qs, pagination = paginate_queryset(users, request)
         return _ok(
             "Support users fetched",
-            SupportUserSerializer(page_qs, many=True).data,
+            SupportUserSerializer(
+                page_qs, many=True, context={"request": request}
+            ).data,
             pagination=pagination,
         )
 
@@ -873,12 +876,13 @@ class SupportUserListCreateView(APIView):
                 name=request.data.get("name"),
                 email=request.data.get("email"),
                 password=request.data.get("password"),
+                timezone=request.data.get("timezone"),
             )
         except TicketWorkflowError as exc:
             return _workflow_err(exc)
         return _ok(
             "Support user created",
-            SupportUserSerializer(user).data,
+            SupportUserSerializer(user, context={"request": request}).data,
             code=status.HTTP_201_CREATED,
         )
 
@@ -905,7 +909,13 @@ class SupportUserDetailView(APIView):
                 is_active=request.data.get("is_active")
                 if "is_active" in request.data
                 else None,
+                timezone=request.data.get("timezone")
+                if "timezone" in request.data
+                else None,
             )
         except TicketWorkflowError as exc:
             return _workflow_err(exc)
-        return _ok("Support user updated", SupportUserSerializer(user).data)
+        return _ok(
+            "Support user updated",
+            SupportUserSerializer(user, context={"request": request}).data,
+        )

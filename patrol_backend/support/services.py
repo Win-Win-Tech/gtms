@@ -7,9 +7,16 @@ from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Count
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from django.utils.text import get_valid_filename
 
 from authapp.site_access import caller_can_access_site
+from patrol_backend.utils.timezone_utils import (
+    convert_date_range_to_utc,
+    get_user_timezone,
+    get_user_timezone_from_request,
+    get_user_today,
+)
 from scheduler.models import LocationSite
 
 from .models import (
@@ -913,8 +920,14 @@ def resolve_attachment_content_type(attachment) -> str:
     return _EXT_MIME_FALLBACKS.get(ext) or stored or "application/octet-stream"
 
 
-def filter_support_tickets_queryset(qs, params, *, actor=None):
-    """Apply common queue/report filters from query params."""
+def filter_support_tickets_queryset(qs, params, *, actor=None, request=None):
+    """Apply common queue/report filters from query params.
+
+    Date presets (today/yesterday/…) and custom ranges are evaluated in the
+    viewer's timezone — the same TZ used when serializing created_on — then
+    converted to UTC bounds for the query. Using created_on__date alone would
+    filter on the DB/UTC calendar day and disagree with the UI timestamps.
+    """
     status_filter = (params.get("status") or "").strip()
     if status_filter and status_filter.lower() not in ("all", ""):
         qs = qs.filter(status=status_filter.upper())
@@ -950,12 +963,19 @@ def filter_support_tickets_queryset(qs, params, *, actor=None):
             due_at__lt=timezone.now(),
         )
 
+    if request is not None:
+        viewer_tz = get_user_timezone_from_request(request)
+    elif actor is not None:
+        viewer_tz = get_user_timezone(actor)
+    else:
+        viewer_tz = get_user_timezone(None)
+
     date_filter = (params.get("date_filter") or "").strip().lower()
     date_from = (params.get("date_from") or params.get("start_date") or "").strip()
     date_to = (params.get("date_to") or params.get("end_date") or "").strip()
 
     if date_filter and date_filter not in ("all", "custom", ""):
-        today = timezone.localdate()
+        today = get_user_today(viewer_tz)
         if date_filter == "today":
             date_from = date_to = today.isoformat()
         elif date_filter == "yesterday":
@@ -983,10 +1003,15 @@ def filter_support_tickets_queryset(qs, params, *, actor=None):
             date_from = last_prev.replace(day=1).isoformat()
             date_to = last_prev.isoformat()
 
-    if date_from:
-        qs = qs.filter(created_on__date__gte=date_from)
-    if date_to:
-        qs = qs.filter(created_on__date__lte=date_to)
+    start_d = parse_date(str(date_from)) if date_from else None
+    end_d = parse_date(str(date_to)) if date_to else None
+
+    if start_d or end_d:
+        # Inclusive calendar-day bounds in viewer TZ → UTC for created_on
+        range_start = start_d or end_d
+        range_end = end_d or start_d
+        start_utc, end_utc = convert_date_range_to_utc(range_start, range_end, viewer_tz)
+        qs = qs.filter(created_on__gte=start_utc, created_on__lte=end_utc)
 
     return qs
 
@@ -1001,8 +1026,23 @@ def list_support_users(*, include_inactive=True):
     return qs
 
 
+def _normalize_support_user_timezone(timezone_name):
+    """Validate IANA timezone; default Asia/Kolkata."""
+    import pytz
+
+    tz_name = (timezone_name or "").strip() or "Asia/Kolkata"
+    try:
+        pytz.timezone(tz_name)
+    except pytz.UnknownTimeZoneError as exc:
+        raise TicketWorkflowError(
+            f"Invalid timezone: {tz_name}",
+            code="invalid_timezone",
+        ) from exc
+    return tz_name
+
+
 @transaction.atomic
-def create_support_user(*, actor, name, email, password):
+def create_support_user(*, actor, name, email, password, timezone=None):
     if not is_super_admin_user(actor):
         raise TicketWorkflowError(
             "Only Super Admin can manage support users.",
@@ -1022,6 +1062,7 @@ def create_support_user(*, actor, name, email, password):
             "A user with this email already exists.",
             code="email_taken",
         )
+    tz_name = _normalize_support_user_timezone(timezone)
     user = User.objects.create_user(
         email=email,
         password=password,
@@ -1029,6 +1070,7 @@ def create_support_user(*, actor, name, email, password):
         role="support",
         location=None,
         all_org_sites=False,
+        timezone=tz_name,
         created_by=actor,
     )
     return user
@@ -1043,6 +1085,7 @@ def update_support_user(
     email=None,
     password=None,
     is_active=None,
+    timezone=None,
 ):
     if not is_super_admin_user(actor):
         raise TicketWorkflowError(
@@ -1086,6 +1129,9 @@ def update_support_user(
     if is_active is not None:
         user.is_active = bool(is_active)
         update_fields.append("is_active")
+    if timezone is not None:
+        user.timezone = _normalize_support_user_timezone(timezone)
+        update_fields.append("timezone")
     if password:
         user.set_password(password)
         update_fields.append("password")

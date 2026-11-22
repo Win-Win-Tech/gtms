@@ -1848,6 +1848,7 @@ class SupportTicketingEnhancementsTests(TestCase):
                 "name": "New Agent",
                 "email": "new-agent@example.com",
                 "password": "Password123!",
+                "timezone": "Asia/Dubai",
             },
             format="json",
         )
@@ -1855,9 +1856,11 @@ class SupportTicketingEnhancementsTests(TestCase):
         data = create.data["data"]
         self.assertEqual(data["role"], "support")
         self.assertTrue(data["is_active"])
+        self.assertEqual(data.get("timezone"), "Asia/Dubai")
         user = User.objects.get(id=data["id"])
         self.assertIsNone(user.location_id)
         self.assertFalse(user.all_org_sites)
+        self.assertEqual(user.timezone, "Asia/Dubai")
 
         listed = self.client.get("/support/support-users/")
         self.assertEqual(listed.status_code, status.HTTP_200_OK)
@@ -1875,12 +1878,19 @@ class SupportTicketingEnhancementsTests(TestCase):
 
         patch = self.client.patch(
             f"/support/support-users/{data['id']}/",
-            {"name": "Renamed Agent", "is_active": False},
+            {
+                "name": "Renamed Agent",
+                "is_active": False,
+                "timezone": "Asia/Kolkata",
+            },
             format="json",
         )
         self.assertEqual(patch.status_code, status.HTTP_200_OK, patch.data)
         self.assertEqual(patch.data["data"]["name"], "Renamed Agent")
         self.assertFalse(patch.data["data"]["is_active"])
+        self.assertEqual(patch.data["data"].get("timezone"), "Asia/Kolkata")
+        user.refresh_from_db()
+        self.assertEqual(user.timezone, "Asia/Kolkata")
 
         # SUPPORT agent picker still excludes inactive
         self.client.force_authenticate(user=self.support_user)

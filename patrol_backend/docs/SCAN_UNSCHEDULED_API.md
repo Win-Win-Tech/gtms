@@ -53,6 +53,8 @@ Auth: Bearer token (same as other check-in APIs)
 | Key | Meaning |
 |-----|---------|
 | `has_shift` | Guard has a shift today |
+| `assignment_id` | Today's `Assignment` UUID (or `null` if no shift) — send as `assign_id` on scan APIs |
+| `shift_id` | Shift UUID — send as `shift` on scan APIs |
 | `allow_unschedule_scan` | `true` when shift today **and** no scheduled checkpoints → use `scan_unscheduled`; otherwise `false` |
 
 ### QR patrol report
