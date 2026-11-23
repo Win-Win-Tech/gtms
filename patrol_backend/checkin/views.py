@@ -1064,12 +1064,20 @@ class CheckInViewSet(viewsets.ModelViewSet):
         """
         logger.info("========== [SCAN_UNSCHEDULED_API] START ==========")
         try:
+            request_body = dict(request.data.items()) if hasattr(request.data, "items") else request.data
+            logger.info("[SCAN_UNSCHEDULED_API] Auth user: %s", getattr(request.user, "id", None))
+            logger.info("[SCAN_UNSCHEDULED_API] Request body: %s", request_body)
+
             err, ctx = self._validate_unscheduled_scan_request(request)
             if err is not None:
+                response_body = getattr(err, "data", err)
+                status_code = getattr(err, "status_code", None)
                 logger.warning(
-                    "[SCAN_UNSCHEDULED_API] Validation failed: %s",
-                    getattr(err, "data", err),
+                    "[SCAN_UNSCHEDULED_API] Validation failed status=%s response=%s",
+                    status_code,
+                    response_body,
                 )
+                logger.info("========== [SCAN_UNSCHEDULED_API] END ==========")
                 return err
 
             payload = {
@@ -1082,6 +1090,11 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 "has_checklist": False,
                 "synced": True,
             }
+            logger.info(
+                "[SCAN_UNSCHEDULED_API] Resolved checkpoint_id=%s from data=%s",
+                ctx["checkpoint"].id,
+                request_body.get("data") if isinstance(request_body, dict) else None,
+            )
             serializer = self.get_serializer(data=payload)
             serializer.is_valid(raise_exception=True)
             serializer.context["request"] = request
@@ -1097,16 +1110,22 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 "shift_start_date": ctx["shift_start_date"].isoformat(),
             })
             logger.info(
-                "[SCAN_UNSCHEDULED_API] SUCCESS: guard=%s checkpoint=%s",
+                "[SCAN_UNSCHEDULED_API] SUCCESS status=201 guard=%s checkpoint=%s response=%s",
                 ctx["guard"].id,
                 ctx["checkpoint"].id,
+                response_data,
             )
             logger.info("========== [SCAN_UNSCHEDULED_API] END ==========")
             return Response(response_data, status=status.HTTP_201_CREATED)
         except Exception:
-            logger.exception("[SCAN_UNSCHEDULED_API] UNEXPECTED ERROR")
+            error_body = {"error": "An unexpected error occurred during check-in."}
+            logger.exception(
+                "[SCAN_UNSCHEDULED_API] UNEXPECTED ERROR status=500 response=%s",
+                error_body,
+            )
+            logger.info("========== [SCAN_UNSCHEDULED_API] END ==========")
             return Response(
-                {"error": "An unexpected error occurred during check-in."},
+                error_body,
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
