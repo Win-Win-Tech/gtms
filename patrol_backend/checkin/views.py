@@ -889,7 +889,9 @@ class CheckInViewSet(viewsets.ModelViewSet):
         """
         Validation for free (non-scheduled) shift scans.
 
-        Reuses scheduled-scan rules for guard/assignment/QR/radius/overnight shift window.
+        Checkpoint is resolved from QR `data` within the organisation —
+        `checkpoint` / `checkpoint_id` in the body are ignored.
+        Reuses scheduled-scan rules for guard/assignment/radius/overnight shift window.
         Does NOT match against assigned checkpoint times or +- grace/delay for those slots.
         Rejects assignments that already have scheduled checkpoint slots.
         """
@@ -897,10 +899,16 @@ class CheckInViewSet(viewsets.ModelViewSet):
         guard_id = data.get("guard")
         shift_id = data.get("shift")
         assigned_id = data.get("assign_id")
-        checkpoint_id = data.get("checkpoint")
+        # checkpoint / checkpoint_id intentionally ignored — resolve by QR `data`
         latitude = data.get("latitude")
         longitude = data.get("longitude")
         qr_data = data.get("data")
+        if qr_data is None or str(qr_data).strip() == "":
+            return Response(
+                {"error": "QR data is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            ), None
+        qr_data = str(qr_data).strip()
 
         try:
             latitude = float(latitude)
@@ -950,23 +958,22 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             ), None
 
-        checkpoint = Checkpoint.objects.filter(id=checkpoint_id, is_deleted=False).first()
-        if not checkpoint:
+        org_id = assignment.location_id or guard.location_id
+        if not org_id:
             return Response(
-                {"error": "Checkpoint not found"},
+                {"error": "Organisation not found for this assignment"},
                 status=status.HTTP_400_BAD_REQUEST,
             ), None
 
-        org_id = assignment.location_id or guard.location_id
-        if not org_id or str(checkpoint.location_id) != str(org_id):
+        # Resolve checkpoint from scanned QR payload within the organisation
+        checkpoint = Checkpoint.objects.filter(
+            data=qr_data,
+            location_id=org_id,
+            is_deleted=False,
+        ).first()
+        if not checkpoint:
             return Response(
-                {"error": "Checkpoint does not belong to this organisation"},
-                status=status.HTTP_403_FORBIDDEN,
-            ), None
-
-        if qr_data != checkpoint.data:
-            return Response(
-                {"detail": "Check-in not allowed. QR code mismatch."},
+                {"error": "Checkpoint not found for this QR code"},
                 status=status.HTTP_400_BAD_REQUEST,
             ), None
 

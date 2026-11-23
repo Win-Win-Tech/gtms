@@ -22,20 +22,28 @@ Auth: Bearer token (same as other check-in APIs)
   "guard": "<uuid>",
   "shift": "<uuid>",
   "assign_id": "<uuid>",
-  "checkpoint": "<uuid>",
   "latitude": 12.9716,
   "longitude": 77.5946,
-  "data": "<qr payload matching checkpoint.data>",
+  "data": "<qr payload>",
   "timestamp": "<optional ISO datetime>"
 }
 ```
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `guard` | yes | Guard UUID |
+| `shift` | yes | Shift UUID |
+| `assign_id` | yes | Today’s assignment UUID (`assignment_id` from `shift_today_v5`) |
+| `data` | yes | Scanned QR payload — used to **look up** the org checkpoint (`Checkpoint.data`) |
+| `latitude` / `longitude` | yes | Guard scan location |
+| `timestamp` | no | ISO datetime; defaults to now |
+| `checkpoint` / `checkpoint_id` | **ignored** | Do not send; checkpoint is resolved from `data` only |
 
 ### Rules (kept from scheduled scan, except slot timing)
 
 - Guard + assignment + shift must match
 - Assignment must **not** have scheduled checkpoint slots
-- Checkpoint must belong to the assignment/guard **organisation** (checkpoints have no site)
-- QR `data` must match checkpoint
+- Checkpoint is resolved by QR `data` within the assignment/guard **organisation**
 - Distance ≤ org `distance` site setting (default 150 m)
 - Scan time must fall inside the **shift window** (overnight-aware: yesterday’s overnight still open, or today’s instance)
 - No checklist path on this API
@@ -80,10 +88,10 @@ Same `CheckIn` row as scheduled scans (`has_checklist=false`), plus:
 
 | Case | Status |
 |------|--------|
+| Missing / empty QR `data` | `400` — QR data is required |
+| No org checkpoint for that QR `data` | `400` — Checkpoint not found for this QR code |
 | Assignment has scheduled checkpoints | `400` — use scheduled scan API |
 | Outside shift window | `400` |
 | Same CP scanned within 1 minute | `400` |
-| QR mismatch | `400` |
 | Too far | `403` |
-| Checkpoint not in organisation | `403` |
 | No matching assignment | `403` |

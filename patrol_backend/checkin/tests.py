@@ -75,7 +75,6 @@ class ScanUnscheduledAPITests(TestCase):
             "guard": str(self.guard.id),
             "shift": str(self.shift.id),
             "assign_id": str(self.assignment.id),
-            "checkpoint": str(self.checkpoint.id),
             "latitude": 12.9716,
             "longitude": 77.5946,
             "data": "QR-GATE-A",
@@ -115,23 +114,36 @@ class ScanUnscheduledAPITests(TestCase):
     def test_rejects_other_organisation_checkpoint(self):
         res = self.client.post(
             "/checkin/checkins/scan_unscheduled/",
-            self._payload(
-                checkpoint=str(self.other_org_checkpoint.id),
-                data="QR-OTHER",
-            ),
+            self._payload(data="QR-OTHER"),
             format="json",
         )
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not found", (res.data.get("error") or "").lower())
         self.assertEqual(CheckIn.objects.count(), 0)
 
-    def test_rejects_qr_mismatch(self):
+    def test_rejects_unknown_qr_data(self):
         res = self.client.post(
             "/checkin/checkins/scan_unscheduled/",
             self._payload(data="WRONG-QR"),
             format="json",
         )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not found", (res.data.get("error") or "").lower())
         self.assertEqual(CheckIn.objects.count(), 0)
+
+    def test_ignores_checkpoint_id_and_resolves_by_data(self):
+        res = self.client.post(
+            "/checkin/checkins/scan_unscheduled/",
+            self._payload(
+                checkpoint=str(self.other_org_checkpoint.id),
+                checkpoint_id=str(self.other_org_checkpoint.id),
+                data="QR-GATE-A",
+            ),
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        checkin = CheckIn.objects.get(guard=self.guard)
+        self.assertEqual(checkin.checkpoint_id, self.checkpoint.id)
 
     def test_rejects_outside_shift_window(self):
         # Force a short window that does not include now
