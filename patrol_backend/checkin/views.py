@@ -17,8 +17,9 @@ import uuid
 from patrol_backend.utils.timezone_utils import (
     get_user_timezone_from_request,
     get_user_today,
+    get_user_now,
     combine_date_time_in_user_tz,
-    to_user_timezone
+    to_user_timezone,
 )
 
 User = get_user_model()
@@ -885,6 +886,59 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 return shift_start_date, start_dt, end_dt
         return None
 
+    def _resolve_shift_window_for_list(self, assignment, shift, user_tz, now_user):
+        """
+        Prefer the active shift window covering now; otherwise the most recent
+        candidate that has already started (so mobile can still see scans after
+        the shift ends).
+        """
+        active = self._resolve_active_shift_window(
+            assignment, shift, user_tz, now_user
+        )
+        if active is not None:
+            return active
+
+        today = now_user.date()
+        yesterday = today - timedelta(days=1)
+        is_overnight = shift.end_time <= shift.start_time
+        candidates = []
+
+        if assignment.start_date <= today <= assignment.end_date:
+            start_dt = to_user_timezone(
+                combine_date_time_in_user_tz(today, shift.start_time, user_tz),
+                user_tz,
+            )
+            if is_overnight:
+                end_dt = to_user_timezone(
+                    combine_date_time_in_user_tz(
+                        today + timedelta(days=1), shift.end_time, user_tz
+                    ),
+                    user_tz,
+                )
+            else:
+                end_dt = to_user_timezone(
+                    combine_date_time_in_user_tz(today, shift.end_time, user_tz),
+                    user_tz,
+                )
+            candidates.append((today, start_dt, end_dt))
+
+        if is_overnight and assignment.start_date <= yesterday <= assignment.end_date:
+            start_dt = to_user_timezone(
+                combine_date_time_in_user_tz(yesterday, shift.start_time, user_tz),
+                user_tz,
+            )
+            end_dt = to_user_timezone(
+                combine_date_time_in_user_tz(today, shift.end_time, user_tz),
+                user_tz,
+            )
+            candidates.append((yesterday, start_dt, end_dt))
+
+        started = [c for c in candidates if c[1] <= now_user]
+        if not started:
+            return None
+        # Most recent start
+        return max(started, key=lambda c: c[1])
+
     def _validate_unscheduled_scan_request(self, request):
         """
         Validation for free (non-scheduled) shift scans.
@@ -1109,6 +1163,138 @@ class CheckInViewSet(viewsets.ModelViewSet):
                 {"error": "An unexpected error occurred during check-in."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+    def _empty_unscheduled_scanned_response(self, assign_id=None):
+        return Response(
+            {
+                "assign_id": str(assign_id) if assign_id else None,
+                "shift_id": None,
+                "shift_start_date": None,
+                "shift_start": None,
+                "shift_end": None,
+                "window_active": False,
+                "scanned": [],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["get"], url_path="unscheduled_scanned")
+    def unscheduled_scanned(self, request):
+        """
+        List checkpoints already scanned in the current unscheduled shift window.
+
+        Client sends only `assign_id`. Guard and shift are taken from the
+        assignment. Missing / invalid assign_id → empty scanned list (200).
+        """
+        assign_id = (request.query_params.get("assign_id") or "").strip()
+        if not assign_id:
+            return self._empty_unscheduled_scanned_response()
+
+        try:
+            assignment = (
+                Assignment.objects.filter(id=assign_id)
+                .select_related("shift", "location", "guard")
+                .first()
+            )
+        except (TypeError, ValueError):
+            return self._empty_unscheduled_scanned_response(assign_id)
+        if not assignment:
+            return self._empty_unscheduled_scanned_response(assign_id)
+
+        # Only the assignment's guard (or staff) may list its scans
+        caller = request.user
+        is_owner = str(assignment.guard_id) == str(getattr(caller, "id", ""))
+        is_staff = bool(getattr(caller, "is_superuser", False))
+        if not is_owner and not is_staff:
+            return self._empty_unscheduled_scanned_response(assign_id)
+
+        if self._assignment_has_scheduled_checkpoints(assignment):
+            return Response(
+                {
+                    "error": (
+                        "This assignment has scheduled checkpoints. "
+                        "Use the upcoming-checkpoints API."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        shift = assignment.shift
+        guard = assignment.guard
+        if not shift or not guard:
+            return self._empty_unscheduled_scanned_response(assign_id)
+
+        user_tz = get_user_timezone_from_request(request)
+        now_user = get_user_now(user_tz)
+        window = self._resolve_shift_window_for_list(
+            assignment, shift, user_tz, now_user
+        )
+        if window is None:
+            return Response(
+                {
+                    "assign_id": str(assignment.id),
+                    "shift_id": str(shift.id),
+                    "shift_start_date": None,
+                    "shift_start": None,
+                    "shift_end": None,
+                    "window_active": False,
+                    "scanned": [],
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        shift_start_date, shift_start_dt_user, shift_end_dt_user = window
+        start_utc = shift_start_dt_user.astimezone(pytz.UTC)
+        end_utc = shift_end_dt_user.astimezone(pytz.UTC)
+        window_active = shift_start_dt_user <= now_user <= shift_end_dt_user
+
+        checkins = (
+            CheckIn.objects.filter(
+                guard=guard,
+                shift=shift,
+                timestamp__gte=start_utc,
+                timestamp__lte=end_utc,
+                synced=True,
+            )
+            .select_related("checkpoint")
+            .order_by("timestamp")
+        )
+
+        scanned = []
+        for row in checkins:
+            cp = row.checkpoint
+            if not cp or getattr(cp, "is_deleted", False):
+                continue
+            scanned_at = to_user_timezone(row.timestamp, user_tz)
+            scanned.append(
+                {
+                    "checkin_id": str(row.id),
+                    "assign_id": str(assignment.id),
+                    "checkpoint_id": str(cp.id),
+                    "label": cp.label,
+                    "lat": cp.latitude,
+                    "lon": cp.longitude,
+                    "qr": cp.data,
+                    "shift_id": str(shift.id),
+                    "status": "completed",
+                    "synced": True,
+                    "scanned_at": scanned_at.isoformat() if scanned_at else None,
+                    "scan_mode": "unscheduled",
+                }
+            )
+
+        return Response(
+            {
+                "assign_id": str(assignment.id),
+                "shift_id": str(shift.id),
+                "shift_start_date": shift_start_date.isoformat(),
+                "shift_start": shift_start_dt_user.isoformat(),
+                "shift_end": shift_end_dt_user.isoformat(),
+                "window_active": window_active,
+                "scanned": scanned,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["get"], url_path="checklist")
     def checklist(self, request, pk=None):

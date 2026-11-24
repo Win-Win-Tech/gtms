@@ -10,10 +10,20 @@ Those APIs are **unchanged**.
 | Has scheduled checkpoints (`[{checkpoint_id, time, ...}, ...]`) | Existing `scan` / `scan_v2` |
 | Has shift assignment with **empty** `checkpoints` | **`scan_unscheduled`** |
 
-## Endpoint
+## Endpoints
 
-`POST /checkin/checkins/scan_unscheduled/`  
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/checkin/checkins/scan_unscheduled/` | Create an unscheduled scan |
+| `GET` | `/checkin/checkins/unscheduled_scanned/` | List checkpoints **already scanned** in the unscheduled shift window |
+
 Auth: Bearer token (same as other check-in APIs)
+
+There is **no upcoming list** for unscheduled (any org checkpoint may be scanned). Use this GET instead of `GET /scheduler/assignments/upcoming-checkpoints/<user_id>/` when `allow_unschedule_scan` is true.
+
+---
+
+## Scan — `POST /checkin/checkins/scan_unscheduled/`
 
 ### Body
 
@@ -95,3 +105,80 @@ Same `CheckIn` row as scheduled scans (`has_checklist=false`), plus:
 | Same CP scanned within 1 minute | `400` |
 | Too far | `403` |
 | No matching assignment | `403` |
+
+---
+
+## Scanned list — `GET /checkin/checkins/unscheduled_scanned/`
+
+Returns checkpoints scanned during the resolved unscheduled **shift window** (same overnight-aware window as scan). Not for scheduled assignments.
+
+### Query params
+
+| Param | Required | Notes |
+|-------|----------|-------|
+| `assign_id` | yes (for data) | Assignment UUID from `shift_today_v5` (`assignment_id`). Guard + shift are loaded from the assignment — **do not send** `guard` / `shift`. |
+
+Missing / blank / unknown `assign_id` → **200** with empty `scanned` (not an error).
+
+### cURL
+
+```bash
+curl -G "http://127.0.0.1:8000/checkin/checkins/unscheduled_scanned/" \
+  -H "Authorization: Bearer <access_token>" \
+  --data-urlencode "assign_id=99999999-8888-7777-6666-555555555555"
+```
+
+### Success (`200`) — with scans
+
+```json
+{
+  "assign_id": "99999999-8888-7777-6666-555555555555",
+  "shift_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "shift_start_date": "2026-11-24",
+  "shift_start": "2026-11-24T09:00:00+05:30",
+  "shift_end": "2026-11-24T18:00:00+05:30",
+  "window_active": true,
+  "scanned": [
+    {
+      "checkin_id": "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1",
+      "assign_id": "99999999-8888-7777-6666-555555555555",
+      "checkpoint_id": "cp000001-0000-0000-0000-000000000001",
+      "label": "Gate A",
+      "lat": 12.9716,
+      "lon": 77.5946,
+      "qr": "QR-GATE-A",
+      "shift_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "status": "completed",
+      "synced": true,
+      "scanned_at": "2026-11-24T10:15:00+05:30",
+      "scan_mode": "unscheduled"
+    }
+  ]
+}
+```
+
+### Success (`200`) — no `assign_id`
+
+```json
+{
+  "assign_id": null,
+  "shift_id": null,
+  "shift_start_date": null,
+  "shift_start": null,
+  "shift_end": null,
+  "window_active": false,
+  "scanned": []
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `window_active` | `true` if now is inside the shift window |
+| `scanned` | Ordered by scan time ascending; empty if none yet |
+| `scanned[].status` | Always `completed` for physical unscheduled scans |
+
+### Common errors
+
+| Case | Status |
+|------|--------|
+| Assignment has scheduled checkpoints | `400` — use upcoming-checkpoints |

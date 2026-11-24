@@ -217,3 +217,48 @@ class ScanUnscheduledAPITests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
         self.assertIn("too far", (res.data.get("error") or "").lower())
         self.assertEqual(CheckIn.objects.count(), 0)
+
+    def test_unscheduled_scanned_list_empty_then_after_scan(self):
+        empty = self.client.get(
+            "/checkin/checkins/unscheduled_scanned/",
+            {"assign_id": str(self.assignment.id)},
+        )
+        self.assertEqual(empty.status_code, status.HTTP_200_OK, empty.data)
+        self.assertEqual(empty.data.get("scanned"), [])
+
+        scan = self.client.post(
+            "/checkin/checkins/scan_unscheduled/",
+            self._payload(),
+            format="json",
+        )
+        self.assertEqual(scan.status_code, status.HTTP_201_CREATED, scan.data)
+
+        listed = self.client.get(
+            "/checkin/checkins/unscheduled_scanned/",
+            {"assign_id": str(self.assignment.id)},
+        )
+        self.assertEqual(listed.status_code, status.HTTP_200_OK, listed.data)
+        scanned = listed.data.get("scanned") or []
+        self.assertEqual(len(scanned), 1)
+        self.assertEqual(scanned[0]["checkpoint_id"], str(self.checkpoint.id))
+        self.assertEqual(scanned[0]["status"], "completed")
+        self.assertEqual(scanned[0]["scan_mode"], "unscheduled")
+        self.assertEqual(listed.data.get("assign_id"), str(self.assignment.id))
+
+    def test_unscheduled_scanned_missing_assign_id_returns_empty(self):
+        res = self.client.get("/checkin/checkins/unscheduled_scanned/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data.get("scanned"), [])
+        self.assertIsNone(res.data.get("assign_id"))
+
+    def test_unscheduled_scanned_rejects_scheduled_assignment(self):
+        self.assignment.checkpoints = [
+            {"checkpoint_id": str(self.checkpoint.id), "time": "10:00"}
+        ]
+        self.assignment.save(update_fields=["checkpoints"])
+        res = self.client.get(
+            "/checkin/checkins/unscheduled_scanned/",
+            {"assign_id": str(self.assignment.id)},
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("scheduled", (res.data.get("error") or "").lower())
