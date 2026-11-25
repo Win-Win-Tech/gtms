@@ -51,6 +51,7 @@ class NotificationLog(models.Model):
     TYPE_SUPPORT_TICKET_RESOLVED = "support_ticket_resolved"
     TYPE_SUPPORT_TICKET_CLOSED = "support_ticket_closed"
     TYPE_SUPPORT_TICKET_INVALIDATED = "support_ticket_invalidated"
+    TYPE_SUPPORT_TICKET_REFERRED_BACK = "support_ticket_referred_back"
     TYPE_SUPPORT_TICKET_COMMENT = "support_ticket_comment"
     TYPE_SUPPORT_TICKET_ATTACHMENT = "support_ticket_attachment"
     TYPE_SUPPORT_TICKET_REOPENED = "support_ticket_reopened"
@@ -68,6 +69,7 @@ class NotificationLog(models.Model):
         (TYPE_SUPPORT_TICKET_RESOLVED, "Support ticket resolved"),
         (TYPE_SUPPORT_TICKET_CLOSED, "Support ticket closed"),
         (TYPE_SUPPORT_TICKET_INVALIDATED, "Support ticket invalidated"),
+        (TYPE_SUPPORT_TICKET_REFERRED_BACK, "Support ticket referred back"),
         (TYPE_SUPPORT_TICKET_COMMENT, "Support ticket comment"),
         (TYPE_SUPPORT_TICKET_ATTACHMENT, "Support ticket attachment"),
         (TYPE_SUPPORT_TICKET_REOPENED, "Support ticket reopened"),

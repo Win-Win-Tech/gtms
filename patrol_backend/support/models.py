@@ -31,7 +31,7 @@ class SupportTicket(models.Model):
         IN_PROGRESS = "IN_PROGRESS", "In Progress"
         RESOLVED = "RESOLVED", "Resolved"
         CLOSED = "CLOSED", "Closed"
-        INVALID = "INVALID", "Invalid"
+        REFERRED_BACK = "REFERRED_BACK", "Referred Back"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     ticket_number = models.CharField(max_length=32, unique=True, editable=False, db_index=True)
@@ -81,7 +81,22 @@ class SupportTicket(models.Model):
         related_name="support_tickets_assigned",
     )
     resolution_summary = models.TextField(blank=True, default="")
+    # Legacy column. New refer-backs write referred_back_reason and mirror here
+    # so older clients that still read invalidation_reason keep working.
     invalidation_reason = models.TextField(blank=True, default="")
+    referred_back_reason = models.TextField(blank=True, default="")
+    referred_back_at = models.DateTimeField(null=True, blank=True)
+    auto_closed = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="True when Celery closed the ticket after 24h in RESOLVED or REFERRED_BACK.",
+    )
+    status_entered_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When the ticket entered its current status. Auto-close clock for RESOLVED and REFERRED_BACK.",
+    )
     created_on = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_on = models.DateTimeField(auto_now=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
@@ -115,6 +130,10 @@ class SupportTicket(models.Model):
             models.Index(fields=["priority", "status"], name="support_tkt_priority_status"),
             models.Index(fields=["organisation", "site", "status"], name="support_tkt_org_site_st"),
             models.Index(fields=["due_at", "status"], name="support_tkt_due_status"),
+            models.Index(
+                fields=["status", "status_entered_at"],
+                name="support_tkt_status_entered",
+            ),
         ]
 
     def __str__(self):
@@ -147,6 +166,7 @@ class TicketAssignment(models.Model):
         ASSIGN = "ASSIGN", "Assign"
         REASSIGN = "REASSIGN", "Reassign"
         TRANSFER = "TRANSFER", "Transfer"
+        REFER_BACK = "REFER_BACK", "Refer back"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     ticket = models.ForeignKey(

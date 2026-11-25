@@ -22,6 +22,7 @@ from .views import (
     TicketDetailView,
     TicketInvalidateView,
     TicketPickupView,
+    TicketReferBackView,
     TicketReopenView,
     TicketResolveView,
     TicketTransferView,
@@ -98,6 +99,11 @@ urlpatterns = [
         "tickets/<uuid:pk>/invalidate/",
         TicketInvalidateView.as_view(),
         name="support-ticket-invalidate",
+    ),
+    path(
+        "tickets/<uuid:pk>/refer-back/",
+        TicketReferBackView.as_view(),
+        name="support-ticket-refer-back",
     ),
     path(
         "tickets/<uuid:pk>/resolve/",

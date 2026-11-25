@@ -23,6 +23,7 @@ class SupportTicketAdmin(admin.ModelAdmin):
         "priority",
         "created_by",
         "current_assignee",
+        "auto_closed",
         "created_on",
     )
     list_filter = ("status", "priority")

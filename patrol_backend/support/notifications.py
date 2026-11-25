@@ -23,6 +23,7 @@ TYPE_TICKET_ASSIGNED = "support_ticket_assigned"
 TYPE_TICKET_RESOLVED = "support_ticket_resolved"
 TYPE_TICKET_CLOSED = "support_ticket_closed"
 TYPE_TICKET_INVALIDATED = "support_ticket_invalidated"
+TYPE_TICKET_REFERRED_BACK = "support_ticket_referred_back"
 TYPE_TICKET_COMMENT = "support_ticket_comment"
 TYPE_TICKET_ATTACHMENT = "support_ticket_attachment"
 TYPE_TICKET_REOPENED = "support_ticket_reopened"
@@ -229,11 +230,19 @@ def notify_ticket_closed(ticket, *, actor=None) -> int:
     return count
 
 
+def notify_ticket_referred_back(ticket) -> None:
+    """Notify the requester. No fan-out to other support agents."""
+    title = f"Ticket {ticket.ticket_number} referred back"
+    reason = (
+        getattr(ticket, "referred_back_reason", None) or ticket.invalidation_reason or ""
+    ).strip()
+    body = reason[:400] if reason else "Your support ticket was referred back."
+    _safe_notify(ticket.created_by, TYPE_TICKET_REFERRED_BACK, title, body, ticket)
+
+
 def notify_ticket_invalidated(ticket) -> None:
-    title = f"Ticket {ticket.ticket_number} marked invalid"
-    reason = (ticket.invalidation_reason or "").strip()
-    body = reason[:400] if reason else "Your support ticket was marked invalid."
-    _safe_notify(ticket.created_by, TYPE_TICKET_INVALIDATED, title, body, ticket)
+    """Deprecated alias of notify_ticket_referred_back."""
+    notify_ticket_referred_back(ticket)
 
 
 def notify_ticket_public_comment(ticket, *, author, comment_preview: str) -> None:

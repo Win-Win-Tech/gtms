@@ -21,6 +21,11 @@ def is_super_admin_user(user):
     return role in ("superadmin", "super_admin")
 
 
+def is_support_console_user(user):
+    """SUPPORT role or Super Admin — ticket queue, dashboard, reports."""
+    return is_support_user(user) or is_super_admin_user(user)
+
+
 def is_organisation_admin(user):
     """Organisation-scoped Admin role (role == 'admin', not Super Admin)."""
     return is_org_admin(user)
@@ -35,7 +40,7 @@ def can_view_ticket(user, ticket):
     """
     if not user or not getattr(user, "is_authenticated", False):
         return False
-    if is_support_user(user):
+    if is_support_console_user(user):
         return True
     if str(getattr(ticket, "created_by_id", "")) == str(getattr(user, "id", "")):
         return True

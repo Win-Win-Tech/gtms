@@ -400,6 +400,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'dashboard.tasks.cleanup_old_media_files',
         'schedule': crontab(day_of_week="Sunday", hour=0,minute=0),
     },
+    'auto-close-support-tickets': {
+        'task': 'support.tasks.auto_close_resolved_and_referred_tickets',
+        'schedule': crontab(minute='*/15'),
+    },
 }
 
 # Use Django DB backend for Celery Beat schedule (recommended for production)

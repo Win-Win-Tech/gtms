@@ -11,7 +11,7 @@ from .pagination import paginate_queryset
 from .permissions import (
     IsTicketCreatorOrSupport,
     is_super_admin_user,
-    is_support_user,
+    is_support_console_user,
 )
 from .serializers import (
     SupportAgentSerializer,
@@ -27,6 +27,7 @@ from .serializers import (
 from .services import (
     TicketWorkflowError,
     add_ticket_attachment,
+    assert_viewer_may_mutate,
     assign_ticket,
     build_dashboard_metrics,
     close_ticket,
@@ -34,17 +35,17 @@ from .services import (
     filter_support_tickets_queryset,
     filtered_activity_qs,
     get_ticket_attachment,
-    invalidate_ticket,
     list_support_agents,
     list_support_users,
     log_activity,
+    my_tickets_queryset,
     pickup_ticket,
+    refer_back_ticket,
     reopen_ticket,
     resolve_attachment_content_type,
     resolve_ticket,
     transfer_ticket,
     update_support_user,
-    visible_tickets_queryset,
 )
 from .throttles import (
     SupportAttachmentThrottle,
@@ -152,7 +153,15 @@ def _create_ticket_from_request(request):
 
     Optional multipart media (assets / audio / legacy file) is stored in the same
     create transaction (same validation rules as POST .../attachments/).
+
+    Support agents do not raise tickets; requesters and org admins do.
     """
+    role = (getattr(request.user, "role", None) or "").strip().lower()
+    if role == "support" and not is_super_admin_user(request.user):
+        return _err(
+            "Support users cannot raise tickets.",
+            code=status.HTTP_403_FORBIDDEN,
+        )
     media = _extract_media_uploads(request)
     ser = SupportTicketCreateSerializer(
         data=request.data,
@@ -170,7 +179,10 @@ def _create_ticket_from_request(request):
 
 class MyTicketListCreateView(APIView):
     """
-    GET  /support/tickets/my/  — list tickets created by current user
+    GET  /support/tickets/my/
+      SUPPORT / Super Admin → assigned to me
+      Org Admin → organisation tickets
+      Everyone else → tickets I created
     POST /support/tickets/my/  — create ticket (alias; prefer POST /support/tickets/)
     """
 
@@ -184,11 +196,7 @@ class MyTicketListCreateView(APIView):
         return super().get_throttles()
 
     def get(self, request):
-        qs = (
-            SupportTicket.objects.filter(created_by=request.user)
-            .select_related("category", "organisation", "site", "created_by", "current_assignee")
-            .order_by("-created_on")
-        )
+        qs = my_tickets_queryset(request.user)
         # Same status / date / overdue filters as queue & reports
         qs = filter_support_tickets_queryset(
             qs, request.query_params, actor=request.user, request=request
@@ -248,18 +256,19 @@ class TicketDetailView(APIView):
 
 def _add_ticket_comment(request, ticket, *, return_detail=False):
     """Shared comment create used by /comments/ and /actions/."""
-    if ticket.status in (
-        SupportTicket.Status.CLOSED,
-        SupportTicket.Status.INVALID,
-    ):
-        return _err("Cannot comment on a closed or invalid ticket.")
+    if ticket.status == SupportTicket.Status.CLOSED:
+        return _err("Cannot comment on a closed ticket.")
+    try:
+        assert_viewer_may_mutate(ticket, request.user)
+    except TicketWorkflowError as exc:
+        return _workflow_err(exc)
 
     body = (request.data.get("body") or "").strip()
     if not body:
         return _err("Comment body is required.", {"body": ["This field is required."]})
 
     visibility = (request.data.get("visibility") or TicketComment.Visibility.PUBLIC).upper()
-    if visibility == TicketComment.Visibility.INTERNAL and not is_support_user(request.user):
+    if visibility == TicketComment.Visibility.INTERNAL and not is_support_console_user(request.user):
         return _err(
             "Only SUPPORT users can add internal notes.",
             code=status.HTTP_403_FORBIDDEN,
@@ -432,7 +441,7 @@ class SupportTicketQueueView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         qs = SupportTicket.objects.select_related(
             "category", "organisation", "site", "created_by", "current_assignee"
@@ -456,7 +465,7 @@ class SupportDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         org_id = request.query_params.get("organisation_id") or request.query_params.get(
             "location_id"
@@ -484,7 +493,7 @@ class SupportAgentListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         agents = list_support_agents()
         return _ok("Support agents fetched", SupportAgentSerializer(agents, many=True).data)
@@ -494,7 +503,7 @@ class _SupportTicketActionBase(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def _run(self, request, pk, fn, success_message):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         try:
             ticket = fn()
@@ -520,7 +529,9 @@ class TicketActionsView(APIView):
     Combined JSON workflow endpoint. Discriminator field: `action`.
 
     Supported actions:
-      pickup | assign | transfer | resolve | invalidate | reopen | comment
+      pickup | assign | transfer | resolve | refer_back | reopen | comment
+
+    `invalidate` remains as a deprecated alias of `refer_back`.
 
     Create (multipart media) and close (multipart evidence) stay on their own
     endpoints — they are intentionally not part of this JSON actions API.
@@ -572,7 +583,7 @@ class TicketActionsView(APIView):
             return _ok("Ticket reopened", _detail_payload(ticket, request))
 
         if action == "pickup":
-            if not is_support_user(request.user):
+            if not is_support_console_user(request.user):
                 return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
             try:
                 ticket = pickup_ticket(ticket_id=pk, actor=request.user)
@@ -581,7 +592,7 @@ class TicketActionsView(APIView):
             return _ok("Ticket picked up", _detail_payload(ticket, request))
 
         if action == "assign":
-            if not is_support_user(request.user):
+            if not is_support_console_user(request.user):
                 return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
             assignee_id = request.data.get("assignee_id")
             if not assignee_id:
@@ -602,7 +613,7 @@ class TicketActionsView(APIView):
             return _ok("Ticket assigned", _detail_payload(ticket, request))
 
         if action == "transfer":
-            if not is_support_user(request.user):
+            if not is_support_console_user(request.user):
                 return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
             assignee_id = request.data.get("assignee_id")
             comment = request.data.get("comment") or ""
@@ -623,7 +634,7 @@ class TicketActionsView(APIView):
             return _ok("Ticket transferred", _detail_payload(ticket, request))
 
         if action == "resolve":
-            if not is_support_user(request.user):
+            if not is_support_console_user(request.user):
                 return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
             summary = _resolve_summary_from_data(request.data)
             try:
@@ -634,24 +645,24 @@ class TicketActionsView(APIView):
                 return _workflow_err(exc)
             return _ok("Ticket resolved", _detail_payload(ticket, request))
 
-        if action == "invalidate":
-            if not is_support_user(request.user):
+        if action in ("refer_back", "invalidate"):
+            if not is_support_console_user(request.user):
                 return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
             reason = request.data.get("reason") or request.data.get("comment") or ""
             try:
-                ticket = invalidate_ticket(
+                ticket = refer_back_ticket(
                     ticket_id=pk, actor=request.user, reason=reason
                 )
             except TicketWorkflowError as exc:
                 return _workflow_err(exc)
-            return _ok("Ticket invalidated", _detail_payload(ticket, request))
+            return _ok("Ticket referred back", _detail_payload(ticket, request))
 
         return _err(
             f"Unknown action '{action}'.",
             {
                 "action": [
                     "Must be one of: pickup, assign, transfer, resolve, "
-                    "invalidate, reopen, comment"
+                    "refer_back, reopen, comment"
                 ]
             },
         )
@@ -712,15 +723,28 @@ class TicketTransferView(_SupportTicketActionBase):
 
 
 class TicketInvalidateView(_SupportTicketActionBase):
-    """Deprecated — prefer POST .../actions/ with action=invalidate."""
+    """Deprecated — prefer POST .../actions/ with action=refer_back."""
 
     def post(self, request, pk):
         reason = request.data.get("reason") or request.data.get("comment") or ""
         return self._run(
             request,
             pk,
-            lambda: invalidate_ticket(ticket_id=pk, actor=request.user, reason=reason),
-            "Ticket invalidated",
+            lambda: refer_back_ticket(ticket_id=pk, actor=request.user, reason=reason),
+            "Ticket referred back",
+        )
+
+
+class TicketReferBackView(_SupportTicketActionBase):
+    """POST /support/tickets/<id>/refer-back/ — OPEN or IN_PROGRESS, reason required."""
+
+    def post(self, request, pk):
+        reason = request.data.get("reason") or request.data.get("comment") or ""
+        return self._run(
+            request,
+            pk,
+            lambda: refer_back_ticket(ticket_id=pk, actor=request.user, reason=reason),
+            "Ticket referred back",
         )
 
 
@@ -737,36 +761,38 @@ class TicketResolveView(_SupportTicketActionBase):
         )
 
 
-class TicketCloseView(_SupportTicketActionBase):
+class TicketCloseView(APIView):
     """
     POST /support/tickets/<id>/close/
     JSON or multipart; optional proof/evidence media (assets/audio like create).
+
+    Creator may close RESOLVED or REFERRED_BACK. Assignee or Super Admin may close RESOLVED.
     """
 
+    permission_classes = [permissions.IsAuthenticated]
     parser_classes = [JSONParser, FormParser, MultiPartParser]
 
     def post(self, request, pk):
         comment = request.data.get("comment") or ""
         media = _extract_media_uploads(request)
-        return self._run(
-            request,
-            pk,
-            lambda: close_ticket(
+        try:
+            ticket = close_ticket(
                 ticket_id=pk,
                 actor=request.user,
                 comment=comment,
                 uploaded_files=media or None,
-            ),
-            "Ticket closed",
-        )
+            )
+        except TicketWorkflowError as exc:
+            return _workflow_err(exc)
+        return _ok("Ticket closed", _detail_payload(ticket, request))
 
 
 class TicketReopenView(APIView):
     """
     Deprecated — prefer POST .../actions/ with action=reopen.
 
-    - Creator: RESOLVED only
-    - SUPPORT / Super Admin: RESOLVED, CLOSED, or INVALID (CLOSED/INVALID need comment);
+    - Creator: RESOLVED or REFERRED_BACK (CLOSED stays blocked)
+    - Assignee / Super Admin: RESOLVED, REFERRED_BACK, or CLOSED (CLOSED needs a comment);
       optional target_status OPEN|IN_PROGRESS
     """
 
@@ -803,7 +829,7 @@ class SupportTicketReportView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         qs = _support_report_queryset(request)
         page_qs, pagination = paginate_queryset(qs, request, default_page_size=50)
@@ -819,7 +845,7 @@ class SupportTicketExportExcelView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         qs = _support_report_queryset(request)
         return generate_support_excel(qs, request)
@@ -831,7 +857,7 @@ class SupportTicketExportPdfView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        if not is_support_user(request.user):
+        if not is_support_console_user(request.user):
             return _err("SUPPORT role required.", code=status.HTTP_403_FORBIDDEN)
         qs = _support_report_queryset(request)
         try:

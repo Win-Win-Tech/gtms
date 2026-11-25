@@ -1,4 +1,5 @@
 from datetime import timedelta
+from io import BytesIO
 
 from django.contrib.auth import get_user_model
 from django.core import mail
@@ -25,12 +26,17 @@ from support.notifications import (
     TYPE_TICKET_CLOSED,
     TYPE_TICKET_COMMENT,
     TYPE_TICKET_CREATED,
-    TYPE_TICKET_INVALIDATED,
+    TYPE_TICKET_REFERRED_BACK,
     TYPE_TICKET_REOPENED,
     TYPE_TICKET_RESOLVED,
     TYPE_TICKET_SLA_BREACH,
 )
-from support.services import pickup_ticket, reopen_ticket
+from support.services import (
+    auto_close_stale_tickets,
+    migrate_invalid_status_rows,
+    pickup_ticket,
+    reopen_ticket,
+)
 from support.sla import compute_due_at, sla_hours_for_priority
 
 User = get_user_model()
@@ -433,7 +439,20 @@ class SupportTicketingPhase2Tests(TestCase):
         self.assertEqual(assign.data["data"]["status"], SupportTicket.Status.IN_PROGRESS)
         self.assertEqual(str(assign.data["data"]["current_assignee"]), str(self.support_b.id))
 
-        # Reassign requires comment
+        # Original assigner is no longer the assignee — locked out
+        locked = self.client.post(
+            f"/support/tickets/{ticket_id}/transfer/",
+            {
+                "assignee_id": str(self.support_a.id),
+                "comment": "Taking it back",
+            },
+            format="json",
+        )
+        self.assertEqual(locked.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(locked.data["data"]["code"], "assignee_locked")
+
+        # Current assignee can reassign to any support user (no tier rules). Comment required.
+        self.client.force_authenticate(user=self.support_b)
         reassign_fail = self.client.post(
             f"/support/tickets/{ticket_id}/assign/",
             {"assignee_id": str(self.support_a.id)},
@@ -453,6 +472,7 @@ class SupportTicketingPhase2Tests(TestCase):
         self.assertEqual(str(reassign.data["data"]["current_assignee"]), str(self.support_a.id))
 
         # Cannot assign non-support user
+        self.client.force_authenticate(user=self.support_a)
         bad = self.client.post(
             f"/support/tickets/{ticket_id}/assign/",
             {
@@ -506,15 +526,16 @@ class SupportTicketingPhase2Tests(TestCase):
             format="json",
         )
         self.assertEqual(inv.status_code, status.HTTP_200_OK, inv.data)
-        self.assertEqual(inv.data["data"]["status"], SupportTicket.Status.INVALID)
-        self.assertEqual(inv.data["data"]["invalidation_reason"], "Duplicate of SP ticket")
+        self.assertEqual(inv.data["data"]["status"], SupportTicket.Status.REFERRED_BACK)
+        self.assertEqual(inv.data["data"]["referred_back_reason"], "Duplicate of SP ticket")
+        self.assertIsNone(inv.data["data"]["current_assignee"])
 
-        # Creator sees invalidation reason
+        # Creator sees the refer-back reason
         self.client.force_authenticate(user=self.requester)
         detail = self.client.get(f"/support/tickets/{ticket2}/")
         self.assertEqual(detail.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            detail.data["data"]["invalidation_reason"], "Duplicate of SP ticket"
+            detail.data["data"]["referred_back_reason"], "Duplicate of SP ticket"
         )
 
     def test_comments_public_vs_internal_visibility(self):
@@ -734,7 +755,7 @@ class SupportTicketingPhase3Tests(TestCase):
         self.assertEqual(inv.status_code, status.HTTP_200_OK, inv.data)
         self.assertTrue(
             NotificationLog.objects.filter(
-                type=TYPE_TICKET_INVALIDATED, user=self.requester
+                type=TYPE_TICKET_REFERRED_BACK, user=self.requester
             ).exists()
         )
 
@@ -2060,7 +2081,8 @@ class SupportTicketActionsApiTests(TestCase):
             user=self.support_a,
         )
         self.assertEqual(inv.status_code, status.HTTP_200_OK, inv.data)
-        self.assertEqual(inv.data["data"]["status"], SupportTicket.Status.INVALID)
+        self.assertEqual(inv.data["data"]["status"], SupportTicket.Status.REFERRED_BACK)
+        self.assertIsNone(inv.data["data"]["current_assignee"])
 
     def test_non_support_cannot_pickup_via_actions(self):
         data = self._create_ticket(self.requester)
@@ -2087,3 +2109,400 @@ class SupportTicketActionsApiTests(TestCase):
         self.assertIn("segments", durations)
         self.assertIn("total", durations)
         self.assertIn("open_to_assign", durations)
+
+
+class SupportTicketingWorkflowV2Tests(TestCase):
+    """Assignee lock, refer-back, creator close/reopen, my-list, auto-close, export history."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.location = Location.objects.create(name="Workflow V2 Org")
+        self.requester = User.objects.create_user(
+            email="v2-requester@example.com",
+            password="Password123!",
+            name="V2 Requester",
+            location=self.location,
+            role="admin",
+        )
+        self.guard = User.objects.create_user(
+            email="v2-guard@example.com",
+            password="Password123!",
+            name="V2 Guard",
+            location=self.location,
+            role="guard",
+        )
+        self.support_a = User.objects.create_user(
+            email="v2-support-a@example.com",
+            password="Password123!",
+            name="Agent Alpha",
+            role="support",
+        )
+        self.support_b = User.objects.create_user(
+            email="v2-support-b@example.com",
+            password="Password123!",
+            name="Agent Beta",
+            role="support",
+        )
+        self.super_admin = User.objects.create_superuser(
+            email="v2-super@example.com",
+            password="Password123!",
+            name="V2 Super",
+            role="superadmin",
+        )
+        self.category, _ = TicketCategory.objects.get_or_create(
+            name="Other",
+            defaults={"is_active": True, "sort_order": 100},
+        )
+
+    def _create(self, user=None, subject="V2 ticket"):
+        self.client.force_authenticate(user=user or self.guard)
+        res = self.client.post(
+            "/support/tickets/",
+            {
+                "subject": subject,
+                "description": "Workflow description for export.",
+                "category_id": str(self.category.id),
+                "priority": "MEDIUM",
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        return res.data["data"]
+
+    def _actions(self, ticket_id, payload, user):
+        self.client.force_authenticate(user=user)
+        return self.client.post(
+            f"/support/tickets/{ticket_id}/actions/",
+            payload,
+            format="json",
+        )
+
+    def test_support_cannot_raise_tickets(self):
+        self.client.force_authenticate(user=self.support_a)
+        res = self.client.post(
+            "/support/tickets/",
+            {
+                "subject": "Agent should not raise",
+                "description": "nope",
+                "category_id": str(self.category.id),
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_my_list_is_assigned_for_support_and_scoped_for_others(self):
+        mine = self._create(self.guard, subject="Guard ticket")
+        org_ticket = self._create(self.requester, subject="Admin ticket")
+
+        self.client.force_authenticate(user=self.guard)
+        guard_list = self.client.get("/support/tickets/my/")
+        guard_ids = {row["id"] for row in guard_list.data["data"]}
+        self.assertIn(mine["id"], guard_ids)
+        self.assertNotIn(org_ticket["id"], guard_ids)
+
+        self.client.force_authenticate(user=self.requester)
+        org_list = self.client.get("/support/tickets/my/")
+        org_ids = {row["id"] for row in org_list.data["data"]}
+        self.assertIn(mine["id"], org_ids)
+        self.assertIn(org_ticket["id"], org_ids)
+
+        self._actions(mine["id"], {"action": "pickup"}, self.support_a)
+        self.client.force_authenticate(user=self.support_a)
+        assigned = self.client.get("/support/tickets/my/")
+        self.assertEqual(
+            {row["id"] for row in assigned.data["data"]},
+            {mine["id"]},
+        )
+        self.client.force_authenticate(user=self.support_b)
+        other = self.client.get("/support/tickets/my/")
+        self.assertEqual(other.data["data"], [])
+
+        self.client.force_authenticate(user=self.support_b)
+        queue = self.client.get("/support/support/tickets/")
+        queue_ids = {row["id"] for row in queue.data["data"]}
+        self.assertIn(mine["id"], queue_ids)
+        self.assertIn(org_ticket["id"], queue_ids)
+
+    def test_assignee_lock_and_unassigned_open_pickup(self):
+        data = self._create(self.guard)
+        ticket_id = data["id"]
+
+        # Unassigned OPEN: another agent may still assign
+        assigned = self._actions(
+            ticket_id,
+            {"action": "assign", "assignee_id": str(self.support_a.id)},
+            self.support_b,
+        )
+        self.assertEqual(assigned.status_code, status.HTTP_200_OK, assigned.data)
+
+        locked = self._actions(
+            ticket_id,
+            {"action": "resolve", "resolution": "Not mine"},
+            self.support_b,
+        )
+        self.assertEqual(locked.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(locked.data["data"]["code"], "assignee_locked")
+
+        comment = self._actions(
+            ticket_id,
+            {"action": "comment", "body": "I can see this", "visibility": "PUBLIC"},
+            self.support_b,
+        )
+        self.assertEqual(comment.status_code, status.HTTP_403_FORBIDDEN)
+
+        # Assignee can still act; creator can still comment
+        creator_comment = self._actions(
+            ticket_id,
+            {"action": "comment", "body": "Still waiting", "visibility": "PUBLIC"},
+            self.guard,
+        )
+        self.assertEqual(creator_comment.status_code, status.HTTP_201_CREATED, creator_comment.data)
+
+        resolved = self._actions(
+            ticket_id,
+            {"action": "resolve", "resolution": "Fixed by assignee"},
+            self.support_a,
+        )
+        self.assertEqual(resolved.status_code, status.HTTP_200_OK, resolved.data)
+
+        # Super Admin bypasses the lock
+        reopened = self._actions(
+            ticket_id,
+            {"action": "reopen", "comment": "SA check", "target_status": "IN_PROGRESS"},
+            self.super_admin,
+        )
+        self.assertEqual(reopened.status_code, status.HTTP_200_OK, reopened.data)
+
+    def test_refer_back_clears_assignee_and_creator_can_close_or_reopen(self):
+        data = self._create(self.guard, subject="Refer me")
+        ticket_id = data["id"]
+        self._actions(ticket_id, {"action": "pickup"}, self.support_a)
+        self._actions(
+            ticket_id,
+            {
+                "action": "assign",
+                "assignee_id": str(self.support_b.id),
+                "comment": "Hop to beta",
+            },
+            self.support_a,
+        )
+        referred = self._actions(
+            ticket_id,
+            {"action": "refer_back", "reason": "Need a clearer photo"},
+            self.support_b,
+        )
+        self.assertEqual(referred.status_code, status.HTTP_200_OK, referred.data)
+        self.assertEqual(referred.data["data"]["status"], SupportTicket.Status.REFERRED_BACK)
+        self.assertIsNone(referred.data["data"]["current_assignee"])
+        self.assertEqual(
+            referred.data["data"]["referred_back_reason"], "Need a clearer photo"
+        )
+        self.assertEqual(
+            TicketAssignment.objects.filter(ticket_id=ticket_id).count(),
+            3,
+        )
+        self.assertTrue(
+            NotificationLog.objects.filter(
+                type=TYPE_TICKET_REFERRED_BACK, user=self.guard
+            ).exists()
+        )
+
+        # Other support cannot treat it as an open pickup
+        pickup = self._actions(ticket_id, {"action": "pickup"}, self.support_a)
+        self.assertEqual(pickup.status_code, status.HTTP_400_BAD_REQUEST)
+
+        closed = self.client.post(
+            f"/support/tickets/{ticket_id}/close/",
+            {"comment": "I will handle it offline"},
+            format="json",
+        )
+        # client is still support_a from pickup attempt; creator must close
+        self.assertNotEqual(closed.status_code, status.HTTP_200_OK)
+
+        self.client.force_authenticate(user=self.guard)
+        closed = self.client.post(
+            f"/support/tickets/{ticket_id}/close/",
+            {"comment": "Closing after refer back"},
+            format="json",
+        )
+        self.assertEqual(closed.status_code, status.HTTP_200_OK, closed.data)
+        self.assertEqual(closed.data["data"]["status"], SupportTicket.Status.CLOSED)
+        self.assertFalse(closed.data["data"]["auto_closed"])
+
+        # Fresh refer-back, creator reopens instead of closing
+        data2 = self._create(self.guard, subject="Reopen after refer")
+        ticket2 = data2["id"]
+        self._actions(
+            ticket2,
+            {"action": "refer_back", "reason": "Wrong site"},
+            self.support_a,
+        )
+        self.client.force_authenticate(user=self.guard)
+        reopened = self.client.post(
+            f"/support/tickets/{ticket2}/reopen/",
+            {"comment": "Added the right site"},
+            format="json",
+        )
+        self.assertEqual(reopened.status_code, status.HTTP_200_OK, reopened.data)
+        self.assertEqual(reopened.data["data"]["status"], SupportTicket.Status.OPEN)
+        self.assertIsNone(reopened.data["data"]["current_assignee"])
+
+        # Any support can pick the reopened unassigned ticket back up
+        pickup2 = self._actions(ticket2, {"action": "pickup"}, self.support_b)
+        self.assertEqual(pickup2.status_code, status.HTTP_200_OK, pickup2.data)
+        self.assertEqual(
+            str(pickup2.data["data"]["current_assignee"]), str(self.support_b.id)
+        )
+
+    def test_auto_close_after_24h_and_timer_resets_on_reentry(self):
+        stale = self._create(self.guard, subject="Stale resolved")
+        self._actions(stale["id"], {"action": "pickup"}, self.support_a)
+        resolved = self._actions(
+            stale["id"],
+            {"action": "resolve", "resolution": "Done"},
+            self.support_a,
+        )
+        self.assertEqual(resolved.status_code, status.HTTP_200_OK, resolved.data)
+
+        fresh = self._create(self.guard, subject="Fresh resolved")
+        self._actions(fresh["id"], {"action": "pickup"}, self.support_a)
+        self._actions(
+            fresh["id"],
+            {"action": "resolve", "resolution": "Done too"},
+            self.support_a,
+        )
+
+        referred = self._create(self.guard, subject="Stale referred")
+        self._actions(
+            referred["id"],
+            {"action": "refer_back", "reason": "Missing details"},
+            self.support_a,
+        )
+
+        reset = self._create(self.guard, subject="Timer reset")
+        self._actions(reset["id"], {"action": "pickup"}, self.support_a)
+        self._actions(
+            reset["id"],
+            {"action": "resolve", "resolution": "First pass"},
+            self.support_a,
+        )
+
+        past = timezone.now() - timedelta(hours=25)
+        SupportTicket.objects.filter(
+            id__in=[stale["id"], referred["id"], reset["id"]]
+        ).update(status_entered_at=past)
+
+        before_notes = NotificationLog.objects.filter(user=self.guard).count()
+        closed_count = auto_close_stale_tickets(now=timezone.now())
+        self.assertGreaterEqual(closed_count, 2)
+
+        stale_row = SupportTicket.objects.get(id=stale["id"])
+        referred_row = SupportTicket.objects.get(id=referred["id"])
+        fresh_row = SupportTicket.objects.get(id=fresh["id"])
+        self.assertEqual(stale_row.status, SupportTicket.Status.CLOSED)
+        self.assertTrue(stale_row.auto_closed)
+        self.assertEqual(referred_row.status, SupportTicket.Status.CLOSED)
+        self.assertTrue(referred_row.auto_closed)
+        self.assertEqual(fresh_row.status, SupportTicket.Status.RESOLVED)
+        self.assertFalse(fresh_row.auto_closed)
+        self.assertEqual(
+            NotificationLog.objects.filter(user=self.guard).count(),
+            before_notes,
+        )
+        self.assertTrue(
+            TicketActivityLog.objects.filter(
+                ticket_id=stale["id"], action="AUTO_CLOSED"
+            ).exists()
+        )
+
+        # Re-enter RESOLVED and the 24h clock starts over
+        reset_row = SupportTicket.objects.get(id=reset["id"])
+        self.assertEqual(reset_row.status, SupportTicket.Status.CLOSED)
+        self.client.force_authenticate(user=self.support_a)
+        reopen = self.client.post(
+            f"/support/tickets/{reset['id']}/reopen/",
+            {"comment": "Not actually done", "target_status": "IN_PROGRESS"},
+            format="json",
+        )
+        self.assertEqual(reopen.status_code, status.HTTP_200_OK, reopen.data)
+        again = self._actions(
+            reset["id"],
+            {"action": "resolve", "resolution": "Second pass"},
+            self.support_a,
+        )
+        self.assertEqual(again.status_code, status.HTTP_200_OK, again.data)
+        auto_close_stale_tickets(now=timezone.now())
+        reset_row.refresh_from_db()
+        self.assertEqual(reset_row.status, SupportTicket.Status.RESOLVED)
+        self.assertFalse(reset_row.auto_closed)
+
+    def test_invalid_rows_migrate_to_referred_back(self):
+        data = self._create(self.guard, subject="Legacy invalid")
+        SupportTicket.objects.filter(id=data["id"]).update(
+            status="INVALID",
+            invalidation_reason="Legacy duplicate",
+            referred_back_reason="",
+            referred_back_at=None,
+            status_entered_at=None,
+        )
+        updated = migrate_invalid_status_rows()
+        self.assertGreaterEqual(updated, 1)
+        ticket = SupportTicket.objects.get(id=data["id"])
+        self.assertEqual(ticket.status, SupportTicket.Status.REFERRED_BACK)
+        self.assertEqual(ticket.referred_back_reason, "Legacy duplicate")
+        self.assertIsNotNone(ticket.referred_back_at)
+        self.assertIsNotNone(ticket.status_entered_at)
+
+    def test_export_keeps_assignment_history_after_assignee_cleared(self):
+        data = self._create(self.guard, subject="History survives clear")
+        ticket_id = data["id"]
+        self._actions(ticket_id, {"action": "pickup"}, self.support_a)
+        self._actions(
+            ticket_id,
+            {
+                "action": "assign",
+                "assignee_id": str(self.support_b.id),
+                "comment": "Second hop",
+            },
+            self.support_a,
+        )
+        referred = self._actions(
+            ticket_id,
+            {"action": "refer_back", "reason": "Send it back"},
+            self.support_b,
+        )
+        self.assertIsNone(referred.data["data"]["current_assignee"])
+        self.assertEqual(TicketAssignment.objects.filter(ticket_id=ticket_id).count(), 3)
+
+        self.client.force_authenticate(user=self.support_a)
+        excel = self.client.get("/support/reports/export-excel/")
+        self.assertEqual(excel.status_code, status.HTTP_200_OK)
+        from openpyxl import load_workbook
+
+        book = load_workbook(BytesIO(excel.content))
+        sheet = book.active
+        headers = [cell.value for cell in sheet[1]]
+        self.assertIn("Assignment History", headers)
+        self.assertIn("Auto Closed", headers)
+        self.assertIn("Refer Back Reason", headers)
+        history_col = headers.index("Assignment History") + 1
+        reason_col = headers.index("Refer Back Reason") + 1
+        blob = list(sheet.iter_rows(min_row=2, values_only=True))
+        # Find the ticket row by subject column
+        subject_col = headers.index("Subject")
+        history_idx = history_col - 1
+        reason_idx = reason_col - 1
+        ticket_rows = [row for row in blob if row[subject_col] == "History survives clear"]
+        self.assertEqual(len(ticket_rows), 1)
+        history = ticket_rows[0][history_idx] or ""
+        self.assertIn("Agent Alpha", history)
+        self.assertIn("Agent Beta", history)
+        self.assertIn("REFER_BACK", history)
+        self.assertIn("Send it back", ticket_rows[0][reason_idx] or "")
+        assignee_idx = headers.index("Current Assignee")
+        self.assertFalse(ticket_rows[0][assignee_idx])
+
+        pdf = self.client.get("/support/reports/export-pdf/")
+        self.assertEqual(pdf.status_code, status.HTTP_200_OK)
+        self.assertTrue(pdf.content.startswith(b"%PDF"))
+        self.assertGreater(len(pdf.content), 500)

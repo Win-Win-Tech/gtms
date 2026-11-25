@@ -30,6 +30,7 @@ from .permissions import (
     can_view_ticket,
     is_organisation_admin,
     is_super_admin_user,
+    is_support_console_user,
     is_support_user,
 )
 from .sla import ACTIVE_SLA_STATUSES, compute_due_at
@@ -37,18 +38,22 @@ from .sla import ACTIVE_SLA_STATUSES, compute_due_at
 User = get_user_model()
 
 
-def visible_tickets_queryset(user, *, site_id=None):
-    """
-    List scope for GET /support/tickets/my/:
-
-    - Org Admin → all tickets for their organisation (optional site filter)
-    - Everyone else → tickets they created (optional site filter)
-
-    SUPPORT / Super Admin use GET /support/support/tickets/ for the global queue.
-    """
-    qs = SupportTicket.objects.select_related(
+def _ticket_base_queryset():
+    return SupportTicket.objects.select_related(
         "category", "organisation", "site", "created_by", "current_assignee"
     ).order_by("-created_on")
+
+
+def visible_tickets_queryset(user, *, site_id=None):
+    """
+    Tickets tab scope (not the support "assigned to me" list):
+
+    - Org Admin → tickets in their organisation
+    - Everyone else → tickets they created
+
+    SUPPORT / Super Admin use the global queue for the Tickets tab.
+    """
+    qs = _ticket_base_queryset()
 
     if is_organisation_admin(user):
         org_id = getattr(user, "location_id", None)
@@ -61,6 +66,19 @@ def visible_tickets_queryset(user, *, site_id=None):
     if site_id and str(site_id).lower() not in ("all", "null", "undefined"):
         qs = qs.filter(site_id=site_id)
     return qs
+
+
+def my_tickets_queryset(user):
+    """
+    GET /support/tickets/my/
+
+    - SUPPORT / Super Admin → currently assigned to this user only
+    - Org Admin → their organisation
+    - Everyone else → tickets they created
+    """
+    if is_support_console_user(user):
+        return _ticket_base_queryset().filter(current_assignee=user)
+    return visible_tickets_queryset(user)
 
 # Private attachment limits (Phase 3 + Phase 6 media parity)
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -260,6 +278,7 @@ def create_ticket(
         site=site,
         current_assignee=None,
         due_at=resolved_due,
+        status_entered_at=timezone.now(),
     )
     log_activity(
         ticket=ticket,
@@ -303,8 +322,60 @@ def _lock_ticket(ticket_id):
 
 
 def _require_support_actor(actor):
-    if not is_support_user(actor):
+    if not is_support_console_user(actor):
         raise TicketWorkflowError("SUPPORT role required.", http_status=403, code="forbidden")
+
+
+def _is_creator(actor, ticket):
+    return str(getattr(ticket, "created_by_id", "") or "") == str(getattr(actor, "id", "") or "")
+
+
+def assert_viewer_may_mutate(ticket, actor):
+    """
+    Once current_assignee is set, only that assignee or Super Admin may update.
+    Unassigned tickets stay open to any support user (pickup / first assign).
+    Creators may still comment, close, and reopen under the status rules.
+    """
+    if is_super_admin_user(actor):
+        return
+    if is_support_user(actor):
+        if (
+            ticket.current_assignee_id
+            and str(ticket.current_assignee_id) != str(actor.id)
+        ):
+            raise TicketWorkflowError(
+                "Only the current assignee or Super Admin can update this ticket.",
+                http_status=403,
+                code="assignee_locked",
+            )
+        return
+    if _is_creator(actor, ticket):
+        return
+    raise TicketWorkflowError(
+        "You can view this ticket but cannot update it.",
+        http_status=403,
+        code="view_only",
+    )
+
+
+def viewer_can_mutate(user, ticket):
+    """Boolean form of assert_viewer_may_mutate for API payloads."""
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    try:
+        assert_viewer_may_mutate(ticket, user)
+    except TicketWorkflowError:
+        return False
+    return True
+
+
+def _enter_status(ticket, new_status, *, now=None):
+    """Set status and restart status_entered_at when the status actually changes."""
+    now = now or timezone.now()
+    if ticket.status != new_status or not ticket.status_entered_at:
+        ticket.status_entered_at = now
+    ticket.status = new_status
+    return now
 
 
 def _get_support_assignee(user_id):
@@ -338,8 +409,11 @@ def pickup_ticket(*, ticket_id, actor):
     _require_support_actor(actor)
     ticket = _lock_ticket(ticket_id)
 
-    if ticket.status in (SupportTicket.Status.CLOSED, SupportTicket.Status.INVALID):
-        raise TicketWorkflowError("Cannot pick up a closed or invalid ticket.")
+    if ticket.status in (
+        SupportTicket.Status.CLOSED,
+        SupportTicket.Status.REFERRED_BACK,
+    ):
+        raise TicketWorkflowError("Cannot pick up a closed or referred-back ticket.")
 
     if ticket.status == SupportTicket.Status.RESOLVED:
         raise TicketWorkflowError("Resolved tickets cannot be picked up.")
@@ -363,8 +437,10 @@ def pickup_ticket(*, ticket_id, actor):
     old_status = ticket.status
     old_assignee = ticket.current_assignee_id
     ticket.current_assignee = actor
-    ticket.status = SupportTicket.Status.IN_PROGRESS
-    ticket.save(update_fields=["current_assignee", "status", "updated_on"])
+    _enter_status(ticket, SupportTicket.Status.IN_PROGRESS)
+    ticket.save(
+        update_fields=["current_assignee", "status", "status_entered_at", "updated_on"]
+    )
 
     _record_assignment(
         ticket=ticket,
@@ -397,10 +473,13 @@ def assign_ticket(*, ticket_id, actor, assignee_id, comment=""):
     _require_support_actor(actor)
     ticket = _lock_ticket(ticket_id)
     assignee = _get_support_assignee(assignee_id)
+    # Unassigned OPEN (and other unassigned active tickets): any support may assign.
+    # Once assigned, only the current assignee or Super Admin may reassign — any support user, no tier rules.
+    assert_viewer_may_mutate(ticket, actor)
 
     if ticket.status in (
         SupportTicket.Status.CLOSED,
-        SupportTicket.Status.INVALID,
+        SupportTicket.Status.REFERRED_BACK,
         SupportTicket.Status.RESOLVED,
     ):
         raise TicketWorkflowError(f"Cannot assign a ticket in status {ticket.status}.")
@@ -426,8 +505,10 @@ def assign_ticket(*, ticket_id, actor, assignee_id, comment=""):
 
     ticket.current_assignee = assignee
     if ticket.status == SupportTicket.Status.OPEN:
-        ticket.status = SupportTicket.Status.IN_PROGRESS
-    ticket.save(update_fields=["current_assignee", "status", "updated_on"])
+        _enter_status(ticket, SupportTicket.Status.IN_PROGRESS)
+    ticket.save(
+        update_fields=["current_assignee", "status", "status_entered_at", "updated_on"]
+    )
 
     _record_assignment(
         ticket=ticket,
@@ -471,41 +552,84 @@ def transfer_ticket(*, ticket_id, actor, assignee_id, comment):
 
 
 @transaction.atomic
-def invalidate_ticket(*, ticket_id, actor, reason):
-    """OPEN | IN_PROGRESS → INVALID. Reason is visible to the creator."""
+def refer_back_ticket(*, ticket_id, actor, reason):
+    """
+    OPEN | IN_PROGRESS → REFERRED_BACK.
+
+    Reason is required and visible to the creator. current_assignee is cleared;
+    TicketAssignment rows and activity history are kept (a REFER_BACK hop is appended).
+    """
     _require_support_actor(actor)
     ticket = _lock_ticket(ticket_id)
     reason = (reason or "").strip()
     if not reason:
-        raise TicketWorkflowError("Invalidation reason is required.")
+        raise TicketWorkflowError(
+            "A reason is required to refer a ticket back.",
+            code="reason_required",
+        )
 
     if ticket.status not in (
         SupportTicket.Status.OPEN,
         SupportTicket.Status.IN_PROGRESS,
     ):
         raise TicketWorkflowError(
-            f"Only OPEN or IN_PROGRESS tickets can be invalidated (current: {ticket.status})."
+            f"Only OPEN or IN_PROGRESS tickets can be referred back (current: {ticket.status})."
         )
 
+    assert_viewer_may_mutate(ticket, actor)
+
     old_status = ticket.status
-    ticket.status = SupportTicket.Status.INVALID
+    old_assignee = ticket.current_assignee
+    now = timezone.now()
+    _record_assignment(
+        ticket=ticket,
+        actor=actor,
+        to_user=None,
+        action=TicketAssignment.Action.REFER_BACK,
+        comment=reason,
+    )
+    _enter_status(ticket, SupportTicket.Status.REFERRED_BACK, now=now)
+    ticket.current_assignee = None
+    ticket.referred_back_reason = reason
     ticket.invalidation_reason = reason
-    ticket.save(update_fields=["status", "invalidation_reason", "updated_on"])
+    ticket.referred_back_at = now
+    ticket.auto_closed = False
+    ticket.save(
+        update_fields=[
+            "status",
+            "status_entered_at",
+            "current_assignee",
+            "referred_back_reason",
+            "invalidation_reason",
+            "referred_back_at",
+            "auto_closed",
+            "updated_on",
+        ]
+    )
 
     log_activity(
         ticket=ticket,
         actor=actor,
-        action="INVALIDATED",
+        action="REFERRED_BACK",
         old_value=old_status,
-        new_value=SupportTicket.Status.INVALID,
+        new_value=SupportTicket.Status.REFERRED_BACK,
         comment=reason,
-        metadata={"reason": reason},
+        metadata={
+            "reason": reason,
+            "from_assignee": str(old_assignee.id) if old_assignee else None,
+            "cleared_assignee": True,
+        },
         is_public=True,
     )
-    from .notifications import notify_ticket_invalidated
+    from .notifications import notify_ticket_referred_back
 
-    notify_ticket_invalidated(ticket)
+    notify_ticket_referred_back(ticket)
     return ticket
+
+
+def invalidate_ticket(*, ticket_id, actor, reason):
+    """Deprecated alias. Performs refer_back (status REFERRED_BACK)."""
+    return refer_back_ticket(ticket_id=ticket_id, actor=actor, reason=reason)
 
 
 @transaction.atomic
@@ -522,12 +646,23 @@ def resolve_ticket(*, ticket_id, actor, summary):
             f"Only IN_PROGRESS tickets can be resolved (current: {ticket.status})."
         )
 
+    assert_viewer_may_mutate(ticket, actor)
+
     old_status = ticket.status
-    ticket.status = SupportTicket.Status.RESOLVED
+    now = timezone.now()
+    _enter_status(ticket, SupportTicket.Status.RESOLVED, now=now)
     ticket.resolution_summary = summary
-    ticket.resolved_at = timezone.now()
+    ticket.resolved_at = now
+    ticket.auto_closed = False
     ticket.save(
-        update_fields=["status", "resolution_summary", "resolved_at", "updated_on"]
+        update_fields=[
+            "status",
+            "status_entered_at",
+            "resolution_summary",
+            "resolved_at",
+            "auto_closed",
+            "updated_on",
+        ]
     )
 
     log_activity(
@@ -556,17 +691,37 @@ def close_ticket(
     uploaded_file=None,
 ):
     """
-    RESOLVED → CLOSED (SUPPORT closes in v1).
+    Close a ticket.
 
-    Optional proof/evidence media (assets/audio) is attached in the same
-    transaction before status becomes CLOSED.
+    - Creator: RESOLVED or REFERRED_BACK (comment and media optional).
+    - Assignee or Super Admin: RESOLVED.
+    - Super Admin may also close REFERRED_BACK.
+
+    Optional proof/evidence media is attached in the same transaction.
+    Manual close sets auto_closed False. Celery auto-close does not use this path.
     """
-    _require_support_actor(actor)
     ticket = _lock_ticket(ticket_id)
-
-    if ticket.status != SupportTicket.Status.RESOLVED:
+    creator = _is_creator(actor, ticket)
+    support_actor = is_support_console_user(actor)
+    closable = (
+        SupportTicket.Status.RESOLVED,
+        SupportTicket.Status.REFERRED_BACK,
+    )
+    if ticket.status not in closable:
         raise TicketWorkflowError(
-            f"Only RESOLVED tickets can be closed (current: {ticket.status})."
+            f"Only RESOLVED or REFERRED_BACK tickets can be closed (current: {ticket.status})."
+        )
+    if creator and ticket.status in closable:
+        pass
+    elif support_actor and ticket.status == SupportTicket.Status.RESOLVED:
+        assert_viewer_may_mutate(ticket, actor)
+    elif is_super_admin_user(actor) and ticket.status == SupportTicket.Status.REFERRED_BACK:
+        pass
+    else:
+        raise TicketWorkflowError(
+            "Only the ticket creator, the current assignee, or Super Admin can close this ticket.",
+            http_status=403,
+            code="forbidden",
         )
 
     media_items = _normalize_media_uploads(
@@ -590,9 +745,19 @@ def close_ticket(
         attached_ids.append(str(att.id))
 
     old_status = ticket.status
-    ticket.status = SupportTicket.Status.CLOSED
-    ticket.closed_at = timezone.now()
-    ticket.save(update_fields=["status", "closed_at", "updated_on"])
+    now = timezone.now()
+    _enter_status(ticket, SupportTicket.Status.CLOSED, now=now)
+    ticket.closed_at = now
+    ticket.auto_closed = False
+    ticket.save(
+        update_fields=[
+            "status",
+            "status_entered_at",
+            "closed_at",
+            "auto_closed",
+            "updated_on",
+        ]
+    )
 
     log_activity(
         ticket=ticket,
@@ -613,54 +778,71 @@ def close_ticket(
 @transaction.atomic
 def reopen_ticket(*, ticket_id, actor, comment="", target_status=None):
     """
-    Reopen rules (Phase 7):
-    - Creator: RESOLVED → IN_PROGRESS (if assignee) or OPEN.
-    - SUPPORT / Super Admin: RESOLVED, CLOSED, or INVALID → OPEN or IN_PROGRESS
-      (CLOSED/INVALID require a comment). Optional target_status OPEN|IN_PROGRESS.
+    Reopen rules:
+    - Creator: RESOLVED or REFERRED_BACK → IN_PROGRESS (if assignee) or OPEN.
+      CLOSED stays blocked for the creator.
+    - Assignee or Super Admin: RESOLVED, REFERRED_BACK, or CLOSED.
+      CLOSED requires a comment. Optional target_status OPEN|IN_PROGRESS.
+    Re-entering a later RESOLVED / REFERRED_BACK state restarts status_entered_at.
     """
     ticket = _lock_ticket(ticket_id)
-    is_creator = str(ticket.created_by_id) == str(actor.id)
-    support_actor = is_support_user(actor)
+    is_creator = _is_creator(actor, ticket)
+    support_actor = is_support_console_user(actor)
     note = (comment or "").strip()
     old_status = ticket.status
 
-    if old_status == SupportTicket.Status.RESOLVED:
-        if not is_creator and not support_actor:
+    creator_may = is_creator and old_status in (
+        SupportTicket.Status.RESOLVED,
+        SupportTicket.Status.REFERRED_BACK,
+    )
+    support_may = support_actor and old_status in (
+        SupportTicket.Status.RESOLVED,
+        SupportTicket.Status.REFERRED_BACK,
+        SupportTicket.Status.CLOSED,
+    )
+
+    if old_status == SupportTicket.Status.CLOSED and is_creator and not support_actor:
+        raise TicketWorkflowError(
+            "Closed tickets can only be reopened by SUPPORT or Super Admin.",
+            http_status=400,
+            code="cannot_reopen_closed",
+        )
+
+    if not creator_may and not support_may:
+        if old_status == SupportTicket.Status.RESOLVED:
             raise TicketWorkflowError(
                 "Only the ticket creator or SUPPORT can reopen a resolved ticket.",
                 http_status=403,
                 code="forbidden",
             )
-        if not note:
-            note = (
-                "Ticket reopened by support"
-                if support_actor and not is_creator
-                else "Ticket reopened by creator"
-            )
-    elif old_status in (
-        SupportTicket.Status.CLOSED,
-        SupportTicket.Status.INVALID,
-    ):
-        if not support_actor:
-            code = (
-                "cannot_reopen_closed"
-                if old_status == SupportTicket.Status.CLOSED
-                else "cannot_reopen_invalid"
-            )
+        if old_status in (
+            SupportTicket.Status.REFERRED_BACK,
+            SupportTicket.Status.CLOSED,
+        ):
             raise TicketWorkflowError(
-                f"{old_status.title()} tickets can only be reopened by SUPPORT or Super Admin.",
-                http_status=403 if not is_creator else 400,
-                code=code if is_creator else "forbidden",
+                "You cannot reopen this ticket.",
+                http_status=403,
+                code="forbidden",
             )
-        if not note:
-            raise TicketWorkflowError(
-                "A comment is required when reopening a CLOSED or INVALID ticket.",
-                code="comment_required",
-            )
-    else:
         raise TicketWorkflowError(
-            f"Only RESOLVED, CLOSED, or INVALID tickets can be reopened (current: {old_status}).",
+            "Only RESOLVED, REFERRED_BACK, or CLOSED tickets can be reopened "
+            f"(current: {old_status}).",
             code="invalid_status",
+        )
+
+    if support_may and not creator_may:
+        assert_viewer_may_mutate(ticket, actor)
+
+    if old_status == SupportTicket.Status.CLOSED and support_actor and not note:
+        raise TicketWorkflowError(
+            "A comment is required when reopening a CLOSED ticket.",
+            code="comment_required",
+        )
+    if not note:
+        note = (
+            "Ticket reopened by support"
+            if support_actor and not is_creator
+            else "Ticket reopened by creator"
         )
 
     allowed_targets = {
@@ -692,9 +874,16 @@ def reopen_ticket(*, ticket_id, actor, comment="", target_status=None):
         ticket.current_assignee = actor
         assignee_changed = True
 
-    update_fields = ["status", "resolved_at", "updated_on"]
-    ticket.status = new_status
+    update_fields = [
+        "status",
+        "status_entered_at",
+        "resolved_at",
+        "auto_closed",
+        "updated_on",
+    ]
+    _enter_status(ticket, new_status)
     ticket.resolved_at = None
+    ticket.auto_closed = False
     if old_status == SupportTicket.Status.CLOSED:
         ticket.closed_at = None
         update_fields.append("closed_at")
@@ -737,7 +926,8 @@ def build_dashboard_metrics(*, actor, organisation_id=None, site_id=None):
 
     by_status = {s: 0 for s, _ in SupportTicket.Status.choices}
     for row in qs.values("status").annotate(count=Count("id")):
-        by_status[row["status"]] = row["count"]
+        if row["status"] in by_status:
+            by_status[row["status"]] = row["count"]
 
     by_priority = {p: 0 for p, _ in SupportTicket.Priority.choices}
     for row in qs.values("priority").annotate(count=Count("id")):
@@ -801,7 +991,8 @@ def build_dashboard_metrics(*, actor, organisation_id=None, site_id=None):
                 "by_status": {s: 0 for s, _ in SupportTicket.Status.choices},
             },
         )
-        entry["by_status"][row["status"]] = row["count"]
+        if row["status"] in entry["by_status"]:
+            entry["by_status"][row["status"]] = row["count"]
         entry["total"] += row["count"]
 
     for row in (
@@ -843,7 +1034,8 @@ def build_dashboard_metrics(*, actor, organisation_id=None, site_id=None):
                 "by_status": {s: 0 for s, _ in SupportTicket.Status.choices},
             },
         )
-        entry["by_status"][row["status"]] = row["count"]
+        if row["status"] in entry["by_status"]:
+            entry["by_status"][row["status"]] = row["count"]
         entry["total"] += row["count"]
 
     for row in site_qs.filter(**overdue_filter).values("site_id").annotate(count=Count("id")):
@@ -1222,7 +1414,7 @@ def _validate_attachment_file(uploaded, expected_kind=None):
 def add_ticket_attachment(*, ticket_id, actor, uploaded_file, comment_id=None):
     """
     Attach a private file to a ticket (creator, org admin of ticket org, or SUPPORT).
-    Blocked for CLOSED / INVALID tickets.
+    Blocked for CLOSED tickets. Assignee lock applies to support users.
     """
     ticket = _lock_ticket(ticket_id)
     if not can_view_ticket(actor, ticket):
@@ -1231,11 +1423,12 @@ def add_ticket_attachment(*, ticket_id, actor, uploaded_file, comment_id=None):
             http_status=403,
             code="forbidden",
         )
-    if ticket.status in (SupportTicket.Status.CLOSED, SupportTicket.Status.INVALID):
+    if ticket.status == SupportTicket.Status.CLOSED:
         raise TicketWorkflowError(
-            "Cannot attach files to a closed or invalid ticket.",
+            "Cannot attach files to a closed ticket.",
             code="ticket_closed",
         )
+    assert_viewer_may_mutate(ticket, actor)
 
     comment = None
     if comment_id:
@@ -1344,7 +1537,7 @@ def get_ticket_attachment(*, ticket_id, attachment_id, actor):
 def filtered_activity_qs(ticket, viewer):
     """Creator sees public activity only; SUPPORT sees all."""
     qs = ticket.activity_logs.select_related("actor").all()
-    if not is_support_user(viewer):
+    if not is_support_console_user(viewer):
         qs = qs.filter(is_public=True)
     return qs
 
@@ -1386,7 +1579,7 @@ def compute_ticket_durations(ticket, activity_rows=None):
     Server-side response-timeline durations (mirrors web computeTicketDurations).
 
     Uses model timestamps plus activity fallbacks for assign/pickup / resolve /
-    invalidate / close when fields are missing.
+    refer-back / close when fields are missing.
     """
     empty = {
         "open_to_assign": None,
@@ -1419,34 +1612,38 @@ def compute_ticket_durations(ticket, activity_rows=None):
         if ticket.resolved_at
         else _first_activity_ts(activity_rows, ["RESOLVED"])
     )
-    invalidated = _first_activity_ts(activity_rows, ["INVALIDATED"])
+    referred = (
+        int(ticket.referred_back_at.timestamp() * 1000)
+        if getattr(ticket, "referred_back_at", None)
+        else _first_activity_ts(activity_rows, ["REFERRED_BACK", "INVALIDATED"])
+    )
     closed = (
         int(ticket.closed_at.timestamp() * 1000)
         if ticket.closed_at
-        else _first_activity_ts(activity_rows, ["CLOSED"])
+        else _first_activity_ts(activity_rows, ["CLOSED", "AUTO_CLOSED"])
     )
 
-    is_invalid_path = invalidated is not None and (
-        resolved is None or invalidated <= resolved
+    is_refer_path = referred is not None and (
+        resolved is None or referred <= resolved
     )
-    if resolved is not None and invalidated is not None:
-        end_for_assign_resolve = min(resolved, invalidated)
+    if resolved is not None and referred is not None:
+        end_for_assign_resolve = min(resolved, referred)
     else:
-        end_for_assign_resolve = resolved if resolved is not None else invalidated
+        end_for_assign_resolve = resolved if resolved is not None else referred
     assign_to_resolve_label = None
     if end_for_assign_resolve is not None:
         assign_to_resolve_label = (
-            "Assign→Invalid" if is_invalid_path else "Assign→Resolve"
+            "Assign→Refer back" if is_refer_path else "Assign→Resolve"
         )
 
-    is_terminal = status in ("CLOSED", "RESOLVED", "INVALID")
+    is_terminal = status in ("CLOSED", "RESOLVED", "REFERRED_BACK")
     now_ms = int(timezone.now().timestamp() * 1000)
     if closed is not None:
         total_end = closed
     elif resolved is not None:
         total_end = resolved
-    elif invalidated is not None:
-        total_end = invalidated
+    elif referred is not None:
+        total_end = referred
     elif is_terminal and ticket.updated_on:
         total_end = int(ticket.updated_on.timestamp() * 1000)
     else:
@@ -1469,7 +1666,7 @@ def compute_ticket_durations(ticket, activity_rows=None):
     resolve_to_close_ms = (
         closed - resolved
         if (
-            not is_invalid_path
+            not is_refer_path
             and resolved is not None
             and closed is not None
             and closed >= resolved
@@ -1505,7 +1702,7 @@ def compute_ticket_durations(ticket, activity_rows=None):
     if assign_to_resolve_ms is not None:
         segments.append(
             {
-                "key": "assignInvalid" if is_invalid_path else "assignResolve",
+                "key": "assignRefer" if is_refer_path else "assignResolve",
                 "label": assign_to_resolve_label or "Assign→Resolve",
                 "ms": assign_to_resolve_ms,
                 "muted": False,
@@ -1531,7 +1728,7 @@ def compute_ticket_durations(ticket, activity_rows=None):
             }
         )
     elif (
-        not is_invalid_path
+        not is_refer_path
         and resolved is not None
         and closed is None
         and status == "RESOLVED"
@@ -1571,4 +1768,122 @@ def compute_ticket_durations(ticket, activity_rows=None):
         "segments": segments,
         "is_complete": is_terminal,
     }
+
+
+AUTO_CLOSE_AFTER = timedelta(hours=24)
+
+
+def migrate_invalid_status_rows():
+    """
+    Convert legacy INVALID rows to REFERRED_BACK and backfill status_entered_at.
+
+    Same rules as migration 0007. Safe to run more than once.
+    Returns the number of rows updated.
+    """
+    now = timezone.now()
+    updated = 0
+    qs = SupportTicket.objects.all().only(
+        "id",
+        "status",
+        "invalidation_reason",
+        "referred_back_reason",
+        "referred_back_at",
+        "status_entered_at",
+        "resolved_at",
+        "closed_at",
+        "created_on",
+        "updated_on",
+    )
+    for ticket in qs.iterator():
+        fields = []
+        if ticket.status == "INVALID":
+            ticket.status = SupportTicket.Status.REFERRED_BACK
+            fields.append("status")
+            if not (ticket.referred_back_reason or "").strip():
+                ticket.referred_back_reason = ticket.invalidation_reason or ""
+                fields.append("referred_back_reason")
+            if not ticket.referred_back_at:
+                ticket.referred_back_at = ticket.updated_on or ticket.created_on or now
+                fields.append("referred_back_at")
+        if not ticket.status_entered_at:
+            if ticket.status == SupportTicket.Status.CLOSED and ticket.closed_at:
+                ticket.status_entered_at = ticket.closed_at
+            elif ticket.status == SupportTicket.Status.RESOLVED and ticket.resolved_at:
+                ticket.status_entered_at = ticket.resolved_at
+            elif (
+                ticket.status == SupportTicket.Status.REFERRED_BACK
+                and ticket.referred_back_at
+            ):
+                ticket.status_entered_at = ticket.referred_back_at
+            else:
+                ticket.status_entered_at = ticket.created_on or now
+            fields.append("status_entered_at")
+        if fields:
+            ticket.save(update_fields=fields)
+            updated += 1
+    return updated
+
+
+def auto_close_stale_tickets(*, now=None, batch_size=500):
+    """
+    Close tickets that have sat in RESOLVED or REFERRED_BACK for 24 hours.
+
+    The clock is status_entered_at, so leaving and re-entering those statuses
+    resets the window. Sets auto_closed and writes AUTO_CLOSED activity.
+    Does not notify.
+    """
+    now = now or timezone.now()
+    cutoff = now - AUTO_CLOSE_AFTER
+    ids = list(
+        SupportTicket.objects.filter(
+            status__in=[
+                SupportTicket.Status.RESOLVED,
+                SupportTicket.Status.REFERRED_BACK,
+            ],
+            status_entered_at__isnull=False,
+            status_entered_at__lte=cutoff,
+        )
+        .order_by("status_entered_at")
+        .values_list("id", flat=True)[:batch_size]
+    )
+    closed = 0
+    for ticket_id in ids:
+        with transaction.atomic():
+            ticket = (
+                SupportTicket.objects.select_for_update().filter(pk=ticket_id).first()
+            )
+            if not ticket:
+                continue
+            if ticket.status not in (
+                SupportTicket.Status.RESOLVED,
+                SupportTicket.Status.REFERRED_BACK,
+            ):
+                continue
+            if not ticket.status_entered_at or ticket.status_entered_at > cutoff:
+                continue
+            old_status = ticket.status
+            _enter_status(ticket, SupportTicket.Status.CLOSED, now=now)
+            ticket.closed_at = now
+            ticket.auto_closed = True
+            ticket.save(
+                update_fields=[
+                    "status",
+                    "status_entered_at",
+                    "closed_at",
+                    "auto_closed",
+                    "updated_on",
+                ]
+            )
+            log_activity(
+                ticket=ticket,
+                actor=None,
+                action="AUTO_CLOSED",
+                old_value=old_status,
+                new_value=SupportTicket.Status.CLOSED,
+                comment=f"Auto-closed after 24 hours in {old_status}.",
+                metadata={"auto_closed": True, "from_status": old_status},
+                is_public=True,
+            )
+            closed += 1
+    return closed
 

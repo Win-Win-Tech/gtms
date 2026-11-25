@@ -12,8 +12,13 @@ from .models import (
     TicketCategory,
     TicketComment,
 )
-from .permissions import is_support_user
-from .services import TicketWorkflowError, compute_ticket_durations, create_ticket
+from .permissions import is_support_console_user
+from .services import (
+    TicketWorkflowError,
+    compute_ticket_durations,
+    create_ticket,
+    viewer_can_mutate,
+)
 from .sla import sla_hours_for_priority, ticket_is_overdue
 
 
@@ -235,6 +240,9 @@ class SupportTicketDetailSerializer(SupportTicketListSerializer):
     attachments = TicketAttachmentSerializer(many=True, read_only=True)
     resolution_summary = serializers.CharField(read_only=True)
     invalidation_reason = serializers.CharField(read_only=True)
+    referred_back_reason = serializers.CharField(read_only=True)
+    auto_closed = serializers.BooleanField(read_only=True)
+    can_act = serializers.SerializerMethodField()
 
     class Meta(SupportTicketListSerializer.Meta):
         fields = SupportTicketListSerializer.Meta.fields + [
@@ -245,13 +253,23 @@ class SupportTicketDetailSerializer(SupportTicketListSerializer):
             "attachments",
             "resolution_summary",
             "invalidation_reason",
+            "referred_back_reason",
+            "referred_back_at",
+            "auto_closed",
+            "status_entered_at",
+            "can_act",
             "resolved_at",
             "closed_at",
         ]
 
     def _viewer_is_support(self):
         request = self.context.get("request")
-        return bool(request and is_support_user(request.user))
+        return bool(request and is_support_console_user(request.user))
+
+    def get_can_act(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        return viewer_can_mutate(user, obj)
 
     def _filtered_activity_qs(self, obj):
         qs = obj.activity_logs.select_related("actor").all()
@@ -283,7 +301,7 @@ class SupportTicketDetailSerializer(SupportTicketListSerializer):
         # Parent already localized due_at/created_on/updated_on; localize terminal stamps.
         return _localize_dt_fields(
             data,
-            ["resolved_at", "closed_at"],
+            ["resolved_at", "closed_at", "referred_back_at", "status_entered_at"],
             self.context.get("request"),
         )
 
